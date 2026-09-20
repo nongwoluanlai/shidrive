@@ -223,6 +223,8 @@ fn main() {
             commands::settings_get,
             commands::settings_set,
             commands::setup_status,
+            commands::clipboard_write_text,
+            commands::clipboard_read_text,
             commands::ui_log,
             commands::data_export,
             commands::data_import,

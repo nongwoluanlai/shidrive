@@ -443,24 +443,24 @@
       const d = Math.max(0, depth[i] < 0 ? 0 : depth[i]);
       (perLayer[d] = perLayer[d] || []).push(i);
     }
-    // 纵向排布：第一层在画布顶部；层沿 Y 轴向下逐层展开，行内节点围绕
-    // 父层节点的平均 x 横向居中（连线自上而下，端口上下相对）
-    for (const d of Object.keys(perLayer).map(Number).sort((a, b) => a - b)) {
+    // 全局中心对齐规则：以最宽的一行决定内容水平中心，其余每行（单块或并行）
+    // 累加块宽+间隙得到行宽，围绕同一中心对称摆放——单链的中线自然对齐，
+    // 并行行的中心与上一行的中心重合，开始节点随全局中心定位。
+    const GAP = 70;
+    const layers = Object.keys(perLayer).map(Number).sort((a, b) => a - b);
+    const rowWidth = (idxs: number[]) =>
+      idxs.reduce((acc, i) => acc + nodeW(w.steps[i]), 0) + (idxs.length - 1) * GAP;
+    const maxRow = Math.max(...layers.map((d) => rowWidth(perLayer[d])));
+    layers.forEach((d) => {
       const idxs = perLayer[d];
-      let center = 480;
-      if (d > 0) {
-        const parents = idxs
-          .map((i) => w.edges.filter((e) => e.to === i).map((e) => e.from))
-          .flat()
-          .filter((i) => w.steps[i]?.x !== undefined);
-        if (parents.length) center = parents.reduce((acc, i) => acc + w.steps[i].x + nodeW(w.steps[i]) / 2, 0) / parents.length;
-      }
-      const span = (idxs.length - 1) * (NODE_W + 70);
-      idxs.forEach((i, k) => {
+      const rowW = rowWidth(idxs);
+      let x = 60 + Math.round((maxRow - rowW) / 2);
+      idxs.forEach((i) => {
+        w.steps[i].x = x;
         w.steps[i].y = 40 + d * (NODE_H + 90);
-        w.steps[i].x = Math.max(40, Math.round(center - span / 2 + k * (NODE_W + 70)));
+        x += nodeW(w.steps[i]) + GAP;
       });
-    }
+    });
   }
 
   function canvasContextMenu(e: MouseEvent) {

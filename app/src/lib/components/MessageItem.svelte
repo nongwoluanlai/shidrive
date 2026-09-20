@@ -83,16 +83,50 @@
     }
   });
   const thoughtHtml = $derived(item.kind === "thought" ? html : "");
+
+  // ---------- 正文交互：双击 URL 打开浏览器；右键 复制/打开路径目录 ----------
+  import ContextMenu from "./ContextMenu.svelte";
+  import type { MenuItem } from "./menu-item";
+  let ctxMenu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
+
+  function onBubbleDblclick(e: MouseEvent) {
+    const a = (e.target as HTMLElement).closest?.("a[href]") as HTMLAnchorElement | null;
+    const href = a?.getAttribute("href");
+    if (!href) return;
+    e.preventDefault();
+    void api.fsOpenDefault(href).catch((err) => toast("error", String(err)));
+  }
+
+  function onBubbleContext(e: MouseEvent) {
+    const target = e.target as HTMLElement;
+    const items: MenuItem[] = [];
+    // 选中文字 → 复制选中；否则 → 复制整条消息
+    const sel = window.getSelection()?.toString().trim() ?? "";
+    if (sel) {
+      items.push({ label: "⧉ 复制选中", run: () => void api.clipboardWriteText(sel).then(() => toast("ok", "已复制选中内容")) });
+    }
+    const fileSpan = target.closest(".md-file") as HTMLElement | null;
+    const path = fileSpan?.dataset.path;
+    if (path) {
+      items.push(
+        { label: "📂 打开所在目录", run: () => void api.fsOpenExplorer(path).catch((err) => toast("error", String(err))) },
+        { label: "🚀 打开文件/目录", run: () => void api.fsOpenDefault(path).catch((err) => toast("error", String(err))) },
+      );
+    }
+    items.push({ label: "⧉ 复制全文", run: () => void api.clipboardWriteText(item.text).then(() => toast("ok", "已复制全文")) });
+    e.preventDefault();
+    ctxMenu = { x: e.clientX, y: e.clientY, items };
+  }
 </script>
 
 {#if item.kind === "user"}
   <div class="row user">
-    <div class="bubble user-bubble content">{@html html}</div>
+    <div class="bubble user-bubble content" ondblclick={onBubbleDblclick} oncontextmenu={onBubbleContext}>{@html html}</div>
   </div>
 {:else if item.kind === "assistant"}
   <div class="row">
     <div class="avatar ai">AI</div>
-    <div class="bubble ai-bubble content" class:streaming={item.streaming}>{@html html}</div>
+    <div class="bubble ai-bubble content" class:streaming={item.streaming} ondblclick={onBubbleDblclick} oncontextmenu={onBubbleContext}>{@html html}</div>
   </div>
 {:else if item.kind === "thought"}
   <div class="row">
@@ -159,6 +193,10 @@
     {/each}
     {/if}
   </div>
+{/if}
+
+{#if ctxMenu}
+  <ContextMenu x={ctxMenu.x} y={ctxMenu.y} items={ctxMenu.items} onclose={() => (ctxMenu = null)} />
 {/if}
 
 <style>

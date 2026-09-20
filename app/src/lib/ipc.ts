@@ -130,6 +130,8 @@ export const api = {
   nodeStatus: () => invoke<NodeStat>("node_status"),
   dataExport: () => invoke<string>("data_export"),
   dataImport: (path: string) => invoke<string>("data_import", { path }),
+  clipboardWriteText: (text: string) => invoke<void>("clipboard_write_text", { text }),
+  clipboardReadText: () => invoke<string>("clipboard_read_text"),
   uiLog: (kind: string, text: string) => invoke<void>("ui_log", { kind, text }).catch(() => {}),
   nodeDownload: () => invoke<string>("node_download"),
   agentConfigGet: (agent_type: string) => invoke<AgentLaunch>("agent_config_get", { agentType: agent_type }),

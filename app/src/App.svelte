@@ -59,6 +59,9 @@
   });
 
   function blockMenu(e: MouseEvent) {
+    // 组件内已自行处理的自定义菜单（画布/文件树/正文等）会先 preventDefault，
+    // 冒泡到这里时直接放行；其余场景仍拦截浏览器默认右键菜单
+    if (e.defaultPrevented) return;
     e.preventDefault();
   }
 

@@ -4,6 +4,7 @@
 import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { api } from "../ipc";
   import MessageItem from "./MessageItem.svelte";
+  import ContextMenu from "./ContextMenu.svelte";
   import ChatTimeline from "./ChatTimeline.svelte";
   import type { AgentType, SessionReadyInfo } from "../types";
 
@@ -444,6 +445,35 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     searchIdx = -1;
   }
 
+  // ---------- 输入框右键粘贴 ----------
+  let pasteMenu = $state<{ x: number; y: number } | null>(null);
+  function onInputContext(e: MouseEvent) {
+    e.preventDefault();
+    pasteMenu = { x: e.clientX, y: e.clientY };
+  }
+  async function pasteIntoInput() {
+    pasteMenu = null;
+    try {
+      const text = await api.clipboardReadText();
+      if (!text) return;
+      const ta = document.querySelector(".input-row textarea") as HTMLTextAreaElement | null;
+      if (!ta) {
+        input = (input ? input + "\n" : "") + text;
+        return;
+      }
+      const start = ta.selectionStart ?? input.length;
+      const end = ta.selectionEnd ?? input.length;
+      input = input.slice(0, start) + text + input.slice(end);
+      setTimeout(() => {
+        ta.focus();
+        const pos = start + text.length;
+        ta.setSelectionRange(pos, pos);
+      }, 0);
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
   // ---------- 发送快捷键（默认 Enter 换行 / Ctrl+Enter 发送，设置可切换） ----------
   $effect(() => {
     void api
@@ -678,6 +708,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       bind:value={input}
       onkeydown={onKeydown}
       onpaste={onPaste}
+      oncontextmenu={onInputContext}
     ></textarea>
     {#if streaming}
       <button class="btn danger" onclick={stop}>■ 停止</button>
@@ -687,6 +718,9 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     </div>
   </div>
 </div>
+  {#if pasteMenu}
+    <ContextMenu x={pasteMenu.x} y={pasteMenu.y} items={[{ label: "📋 粘贴", run: () => void pasteIntoInput() }]} onclose={() => (pasteMenu = null)} />
+  {/if}
 
 <style>
   .chat {

@@ -456,7 +456,9 @@ impl Engine {
                     joined.clone()
                 };
                 display = effective.clone();
-                cmd.args(["/C", &effective]);
+                // /d 跳过 AutoRun（注册表里的 cmd 自启动脚本可能切换工作目录，
+                // 导致 TortoiseGit 这类相对路径工具报"路径在仓库外"）
+                cmd.args(["/d", "/C", &effective]);
             }
         }
         self.log(run_id, &format!("$ {display}   （目录：{dir}）"));

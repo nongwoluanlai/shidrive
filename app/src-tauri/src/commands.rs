@@ -446,6 +446,18 @@ pub async fn setup_status(agents: AgentsState<'_>) -> Result<SetupStatus, String
     Ok(agents.setup_status())
 }
 
+/// 写文本到系统剪贴板。
+#[tauri::command]
+pub async fn clipboard_write_text(text: String) -> Result<(), String> {
+    crate::fsops::copy_text_to_clipboard(&text)
+}
+
+/// 读系统剪贴板文本。
+#[tauri::command]
+pub async fn clipboard_read_text() -> Result<String, String> {
+    crate::fsops::read_text_from_clipboard()
+}
+
 /// 导出项目/上下文/条目/工作流到桌面 JSON 备份，返回文件路径。
 #[tauri::command]
 pub async fn data_export(db: DbState<'_>) -> Result<String, String> {

@@ -207,6 +207,36 @@ pub fn open_default(path: &str) -> Result<(), String> {
     open::that(path).map_err(|e| format!("打开失败: {e}"))
 }
 
+/// 写文本到系统剪贴板（PowerShell Set-Clipboard）。
+pub fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    let cleaned: String = text.chars().filter(|ch| *ch != '\r').collect();
+    let script = format!("Set-Clipboard -Value '{}'", cleaned.replace('\'', "''"));
+    let mut c = std::process::Command::new("powershell");
+    let out = hide_window(&mut c)
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|e| format!("执行失败: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("复制失败: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
+/// 读系统剪贴板文本（PowerShell Get-Clipboard）。
+pub fn read_text_from_clipboard() -> Result<String, String> {
+    let mut c = std::process::Command::new("powershell");
+    let out = hide_window(&mut c)
+        .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
+        .output()
+        .map_err(|e| format!("执行失败: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim_end_matches(['\r', '\n']).to_string())
+    } else {
+        Err(format!("读取剪贴板失败: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
 /// Current user's Desktop folder path.
 pub fn desktop_dir() -> Result<String, String> {
     let mut c = std::process::Command::new("powershell");

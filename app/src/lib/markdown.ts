@@ -21,9 +21,17 @@ function ensureLinkHook() {
 export function md(src: string): string {
   if (!src) return "";
   ensureLinkHook();
-  const html = marked.parse(src, { async: false }) as string;
+  // 磁盘路径（C:\xx\yy 与 \\unc）包成可交互的 md-file span：反斜杠以 HTML
+  // 实体携带，避免被 marked 当转义符吃掉；行尾标点不归入路径
+  const withPaths = src.replace(/(?:[A-Za-z]:\\|\\\\)[^\s<>"'`|*?]+/g, (m) => {
+    const clean = m.replace(/[.,;:)\]】」]+$/, "");
+    const tail = m.slice(clean.length);
+    const esc = clean.replace(/\\/g, "&#92;").replace(/"/g, "&quot;");
+    return `<span class="md-file" data-path="${esc}">${esc}</span>${tail}`;
+  });
+  const html = marked.parse(withPaths, { async: false }) as string;
   return DOMPurify.sanitize(html, {
-    ADD_ATTR: ["target"],
+    ADD_ATTR: ["target", "data-path"],
     FORBID_TAGS: ["style"],
   });
 }
