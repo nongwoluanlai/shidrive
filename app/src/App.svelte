@@ -21,6 +21,7 @@
   import DialogHost from "./lib/components/DialogHost.svelte";
   import Icon from "./lib/components/Icon.svelte";
   import logo from "./assets/logo.png";
+  import { t } from "./lib/i18n";
 
   $effect(() => {
     applyTheme(app.theme);
@@ -58,6 +59,11 @@
     };
   });
 
+  // 皮肤应用：body[data-skin] 驱动 themes.css；非内置皮肤注入其变量/图片
+  $effect(() => {
+    document.body.dataset.skin = app.skin;
+  });
+
   function blockMenu(e: MouseEvent) {
     // 组件内已自行处理的自定义菜单（画布/文件树/正文等）会先 preventDefault，
     // 冒泡到这里时直接放行；其余场景仍拦截浏览器默认右键菜单
@@ -77,6 +83,11 @@
     }
     const port = await api.settingsGet("mcp.port").catch(() => null);
     if (port) app.mcpPort = Number(port) || 8345;
+    // 界面语言与皮肤
+    const locale = await api.settingsGet("ui.locale").catch(() => null);
+    if (locale === "en" || locale === "zh") app.locale = locale;
+    const skin = await api.settingsGet("ui.skin").catch(() => null);
+    app.skin = skin ?? "";
     // 加载启用的 agent（顺序即会话页 tab 顺序）与缓存能力
     const enabled = await api.agentsEnabledGet().catch(() => [] as string[]);
     const reg = await api.agentsRegistry().catch(() => []);
@@ -120,10 +131,10 @@
           <header class="tabsbar">
             <nav class="tabs">
               <button class="tab" class:active={app.tab === "chat"} disabled={!app.contextId} onclick={() => (app.tab = "chat")}>
-                <Icon name="chat" size={14} /> 聊天
+                <Icon name="chat" size={14} /> {t("聊天")}
               </button>
               <button class="tab" class:active={app.tab === "workflows"} disabled={!app.projectId} onclick={() => (app.tab = "workflows")}>
-                <Icon name="workflow" size={14} /> 工作流
+                <Icon name="workflow" size={14} /> {t("工作流")}
               </button>
             </nav>
             <div class="crumb">
@@ -135,7 +146,7 @@
               <button
                 class="btn ghost sm"
                 class:active={app.tab === "context"}
-                title="共享上下文"
+                title={t("共享上下文")}
                 onclick={() => (app.tab = app.tab === "context" ? "chat" : "context")}
               >
                 <Icon name="context" size={15} />
@@ -144,7 +155,7 @@
             {#if app.projectId}
               <button
                 class="btn ghost sm"
-                title={app.fileTreeOpen ? "隐藏文件树" : "显示文件树"}
+                title={app.fileTreeOpen ? t("隐藏文件树") : t("显示文件树")}
                 onclick={() => (app.fileTreeOpen = !app.fileTreeOpen)}
               >
                 <Icon name="tree" size={15} />
@@ -162,12 +173,20 @@
           {:else}
             <div class="empty welcome">
               <img src={logo} alt="使驾" class="wlogo" />
-              <h2>欢迎来到使驾 ShiDrive</h2>
+              <h2>{t("欢迎来到使驾 ShiDrive")}</h2>
               <p>One Context. Any Harness. —— 让 Harness 并驾齐驱</p>
               <p class="hint">统一管理项目、工作上下文、AI Agent 会话与工作流 · 左侧选择或创建一个项目开始</p>
             </div>
           {/if}
         </div>
+        {#if app.skin}
+          <img
+            class="skin-character"
+            src={app.skin === "steins-gate" ? "/skins/steins-gate/character.png" : app.skin === "hell" ? "/skins/hell/character.png" : ""}
+            alt=""
+            draggable="false"
+          />
+        {/if}
       </main>
       {#if editorVisible}
         <div class="editor-pane half">

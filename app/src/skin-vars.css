@@ -1,0 +1,34 @@
+/* 皮肤主题变量（独立文件：避免与后代规则同文件时的打包问题） */
+body[data-skin="steins-gate"] {
+  --bg: #080c0f;
+  --bg-panel: #0d1317f2;
+  --bg-elev: #111a1fe8;
+  --border: #2a3b33;
+  --border-soft: #1e2c27;
+  --text: #cfe6cf;
+  --text-dim: #8fb09a;
+  --text-faint: #5d7a67;
+  --accent: #b7d36b;
+  --accent-soft: #b7d36b26;
+  --danger: #d83b3b;
+  --code-bg: #0a1114;
+  --mono: "Consolas", "Cascadia Mono", ui-monospace, monospace;
+  --radius: 4px;
+  font-family: var(--mono);
+}
+
+body[data-skin="hell"] {
+  --bg: #14171a;
+  --bg-panel: #1a1e22f0;
+  --bg-elev: #20252af0;
+  --border: #3a3436;
+  --border-soft: #2b2729;
+  --text: #e8e4dc;
+  --text-dim: #b3aca0;
+  --text-faint: #7d766c;
+  --accent: #b52a2a;
+  --accent-soft: #b52a2a26;
+  --code-bg: #101315;
+  --radius: 6px;
+}
+

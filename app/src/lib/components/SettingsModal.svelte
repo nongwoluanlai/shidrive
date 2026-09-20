@@ -4,6 +4,7 @@
   import { ACCENTS } from "../theme";
   import { isEnabled as autoStartEnabled, enable as autoStartEnable, disable as autoStartDisable } from "@tauri-apps/plugin-autostart";
   import AgentsAdmin from "./AgentsAdmin.svelte";
+  import { t } from "../i18n";
   import type { AgentEnvStatusItem, NodeStat } from "../types";
 
   let tab = $state<"agents" | "theme" | "paths">("agents");
@@ -55,6 +56,78 @@
     toast("ok", on ? "已切换：Enter 发送，Shift+Enter 换行" : "已切换：Enter 换行，Ctrl+Enter 发送");
   }
 
+  async function setLocale(l: "zh" | "en") {
+    app.locale = l;
+    await api.settingsSet("ui.locale", l).catch(() => {});
+  }
+
+  // ---------- 皮肤插件 ----------
+  const builtinSkins = [
+    { id: "steins-gate", name: "命运石之门", preview: "/skins/steins-gate/bg.png" },
+    { id: "hell", name: "地狱乐", preview: "/skins/hell/bg.png" },
+  ];
+  let lastSkin = $state("steins-gate");
+  let customSkinList = $state<{ id: string; name: string; dir: string }[]>([]);
+
+  async function setSkin(id: string) {
+    if (!id) {
+      // 关闭皮肤：清掉自定义注入
+      document.getElementById("skin-custom-css")?.remove();
+      for (const k of ["--skin-bg", "--skin-character"]) document.body.style.removeProperty(k);
+    }
+    app.skin = id;
+    if (id) lastSkin = id;
+    await api.settingsSet("ui.skin", id).catch(() => {});
+  }
+
+  async function loadCustomSkins() {
+    const list = await api.skinsList().catch(() => []);
+    customSkinList = list.map((v: any) => ({ id: v.id, name: v.name ?? v.id, dir: v.dir }));
+  }
+
+  async function applyCustomSkin(sk: { id: string; name: string; dir: string }) {
+    await setSkin(sk.id);
+    // 注入自定义皮肤资源与变量
+    try {
+      const manifest = (await api.skinsList().catch(() => [])).find((v: any) => v.id === sk.id);
+      const root = document.body;
+      if (manifest?.background) {
+        const url = await api.skinAssetData(sk.dir, String(manifest.background));
+        root.style.setProperty("--skin-bg", `url("${url}")`);
+      }
+      if (manifest?.character) {
+        const url = await api.skinAssetData(sk.dir, String(manifest.character));
+        root.style.setProperty("--skin-character", `url("${url}")`);
+      }
+      const vars = (manifest?.vars ?? {}) as Record<string, string>;
+      for (const [k, v] of Object.entries(vars)) root.style.setProperty(k, v);
+      // 可选的自定义 CSS（skin.json 的 css 字段）
+      document.getElementById("skin-custom-css")?.remove();
+      const css = String(manifest?.css ?? "").trim();
+      if (css) {
+        const style = document.createElement("style");
+        style.id = "skin-custom-css";
+        style.textContent = css;
+        document.head.appendChild(style);
+      }
+      toast("ok", `已应用皮肤：${sk.name}`);
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
+  async function importSkin() {
+    const path = await import("../dialog.svelte").then((m) => m.promptDialog({ title: "导入皮肤包", label: "皮肤 zip 路径", initial: "" }));
+    if (path === null || !path.trim()) return;
+    try {
+      const manifest = await api.skinImport(path.trim());
+      await loadCustomSkins();
+      toast("ok", `皮肤「${manifest.name ?? manifest.id}」导入成功`);
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
   async function toggleAutoStart(v: boolean) {
     try {
       if (v) await autoStartEnable();
@@ -100,6 +173,7 @@
     }
     void loadNodeStatus();
     void loadAutoStart();
+    void loadCustomSkins();
     pathsLoaded = true;
   }
 
@@ -163,9 +237,9 @@
     <div class="modal settings">
       <header>设置 <button class="btn ghost sm" onclick={close}>✕</button></header>
       <div class="tabs">
-        <button class:active={tab === "agents"} onclick={() => { tab = "agents"; void loadRegistry(); }}>Agent 管理</button>
-        <button class:active={tab === "paths"} onclick={() => (tab = "paths")}>环境与路径</button>
-        <button class:active={tab === "theme"} onclick={() => (tab = "theme")}>外观主题</button>
+        <button class:active={tab === "agents"} onclick={() => { tab = "agents"; void loadRegistry(); }}>{t("Agent 管理")}</button>
+        <button class:active={tab === "paths"} onclick={() => (tab = "paths")}>{t("环境与路径")}</button>
+        <button class:active={tab === "theme"} onclick={() => (tab = "theme")}>{t("外观主题")}</button>
       </div>
 
       <div class="body">
@@ -203,6 +277,36 @@
             <input type="range" min="0" max="18" value={app.theme.radius} oninput={onRadius} />
             <h3>字体大小 {app.theme.font_size}px</h3>
             <input type="range" min="12" max="18" value={app.theme.font_size} oninput={onFontSize} />
+          </div>
+          <div class="sec">
+            <h3>语言 / Language</h3>
+            <select class="lang-sel" value={app.locale} onchange={(e) => setLocale((e.target as HTMLSelectElement).value as "zh" | "en")}>
+              <option value="zh">简体中文</option>
+              <option value="en">English</option>
+            </select>
+          </div>
+          <div class="sec">
+            <h3>皮肤插件</h3>
+            <label class="check"><input type="checkbox" checked={app.skin !== ""} onchange={(e) => setSkin((e.target as HTMLInputElement).checked ? lastSkin || "steins-gate" : "")} /> 使用皮肤插件（关闭时按当前主题配色显示）</label>
+            {#if app.skin !== ""}
+              <div class="skin-cards">
+                {#each builtinSkins as sk (sk.id)}
+                  <button class="skin-card" class:on={app.skin === sk.id} onclick={() => setSkin(sk.id)}>
+                    <img src={sk.preview} alt={sk.name} />
+                    <span>{sk.name}</span>
+                  </button>
+                {/each}
+                {#each customSkinList as sk (sk.id)}
+                  <button class="skin-card" class:on={app.skin === sk.id} onclick={() => applyCustomSkin(sk)}>
+                    <span class="skin-fallback">{sk.name}</span>
+                  </button>
+                {/each}
+              </div>
+              <div class="rowbtns">
+                <button class="btn sm" onclick={importSkin}>导入皮肤包（zip）</button>
+                <a class="guide-link" href="https://github.com/nongwoluanlai/shidrive/blob/main/docs/skin-guide.md" target="_blank" rel="noopener noreferrer">皮肤开发指南 ↗</a>
+              </div>
+            {/if}
           </div>
         {:else if tab === "agents"}
           <AgentsAdmin bind:registry loadRegistry={loadRegistry} />
@@ -299,6 +403,45 @@
   }
   .sec .field label {
     color: var(--text-dim);
+  }
+  .lang-sel {
+    max-width: 200px;
+  }
+  .skin-cards {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .skin-card {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    border: 2px solid var(--border);
+    border-radius: 8px;
+    padding: 6px;
+    background: var(--bg-elev);
+    color: var(--text-dim);
+    font-size: 0.85em;
+    cursor: pointer;
+  }
+  .skin-card img {
+    width: 132px;
+    height: 74px;
+    object-fit: cover;
+    border-radius: 4px;
+  }
+  .skin-card.on {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .skin-fallback {
+    padding: 28px 12px;
+    text-align: center;
+  }
+  .guide-link {
+    font-size: 0.85em;
+    color: var(--accent);
+    align-self: center;
   }
   .check {
     display: flex;

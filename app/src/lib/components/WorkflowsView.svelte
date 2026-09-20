@@ -1,5 +1,5 @@
 <script lang="ts">
-  // 图形化工作流：SVG 节点画布（并行分支、自由连线）+ 触发按钮 + 运行历史右列。
+  // 图形化工作流：SVG 节点画布（并行分支、自由连线）+ 触发按钮 + {t("运行历史")}右列。
   import { onMount, untrack } from "svelte";
   import { app, currentProject, refreshWorkflows, toast } from "../state.svelte";
   import { api } from "../ipc";
@@ -8,6 +8,7 @@
   import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { firstLineOf } from "./wf-firstline";
   import ContextMenu from "./ContextMenu.svelte";
+  import { t } from "../i18n";
   import type { MenuItem } from "./menu-item";
 
   const project = $derived(currentProject());
@@ -39,7 +40,7 @@
     }
   });
 
-  // 选中变化时重载运行历史 + 重置自动保存基线
+  // 选中变化时重载{t("运行历史")} + 重置自动保存基线
   let savedSnap = $state("");
   function snapOf(w: Workflow | null): string {
     if (!w) return "";
@@ -142,7 +143,7 @@
   }
 
   async function del() {
-    if (!selected || !(await confirmDialog({ title: "删除工作流", message: `删除工作流「${selected.name}」？运行历史将一并删除。`, danger: true, confirmText: "删除" }))) return;
+    if (!selected || !(await confirmDialog({ title: "删除工作流", message: `删除工作流「${selected.name}」？{t("运行历史")}将一并删除。`, danger: true, confirmText: "删除" }))) return;
     try {
       await api.workflowDelete(selected.id);
       app.workflowSelected = null;
@@ -651,7 +652,7 @@
           {#if running}
             <button class="btn danger" onclick={stopRun}>■ 停止</button>
           {:else}
-            <button class="btn primary" onclick={runNow}>▶ 运行</button>
+            <button class="btn primary" onclick={runNow}>▶ {t("运行")}</button>
           {/if}
           <button class="btn" onclick={save}>保存</button>
           <button class="btn danger" onclick={del}>删除</button>
@@ -663,11 +664,11 @@
               <span class="spacer"></span>
               <button class="btn sm" onclick={() => addStep("start")}>🚩 开始</button>
               <button class="btn sm" onclick={() => addStep("note")}>📝 注释</button>
-              <button class="btn sm" onclick={() => addStep("shell")}>＋ 命令</button>
+              <button class="btn sm" onclick={() => addStep("shell")}>＋ {t("命令")}</button>
               <button class="btn sm" onclick={() => addStep("agent")}>＋ Agent</button>
               <button class="btn sm" onclick={() => addStep("delay")}>＋ 等待</button>
               <button class="btn sm" onclick={() => addStep("env")}>＋ 变量</button>
-              <button class="btn sm" onclick={() => addStep("balloon")}>🔔 气泡</button>
+              <button class="btn sm" onclick={() => addStep("balloon")}>🔔 {t("气泡")}</button>
             </div>
             <div
               class="canvas"
@@ -771,7 +772,7 @@
 
           <aside class="runs-col">
             <section class="card runs">
-              <h3>运行历史</h3>
+              <h3>{t("运行历史")}</h3>
               <div class="runlist">
                 {#each runs as r (r.id)}
                   <div class="run">
@@ -786,7 +787,7 @@
                     {/if}
                   </div>
                 {:else}
-                  <p class="none">暂无运行记录</p>
+                  <p class="none">{t("暂无运行记录")}</p>
                 {/each}
               </div>
             </section>

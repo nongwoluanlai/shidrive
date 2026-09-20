@@ -4,6 +4,7 @@
 import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { api } from "../ipc";
   import MessageItem from "./MessageItem.svelte";
+  import { t } from "../i18n";
   import ContextMenu from "./ContextMenu.svelte";
   import ChatTimeline from "./ChatTimeline.svelte";
   import type { AgentType, SessionReadyInfo } from "../types";
@@ -664,7 +665,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   </div>
 
   <div class="composer">
-    <button class="btn ghost sm up" title="回到最新" onclick={() => { stickToBottom = true; if (listEl) listEl.scrollTop = listEl.scrollHeight; }}>↓</button>
+    <button class="btn ghost sm up" title={t("回到最新")} onclick={() => { stickToBottom = true; if (listEl) listEl.scrollTop = listEl.scrollHeight; }}>↓</button>
     {#if pendingImages.length}
       <div class="thumbs">
         {#each pendingImages as img, i}
@@ -677,7 +678,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     {/if}
     {#if searchOpen}
     <div class="chat-search">
-      <input placeholder="搜索正文…" bind:value={searchQuery} oninput={runSearch} onkeydown={onSearchKeydown} />
+      <input placeholder={t("搜索正文…")} bind:value={searchQuery} oninput={runSearch} onkeydown={onSearchKeydown} />
       <span class="count">{searchHits.length ? `${searchIdx + 1}/${searchHits.length}` : searchQuery ? "0/0" : ""}</span>
       <button class="btn ghost sm" title="上一个（Shift+Enter）" onclick={() => stepSearch(-1)}>↑</button>
       <button class="btn ghost sm" title="下一个（Enter）" onclick={() => stepSearch(1)}>↓</button>
@@ -711,9 +712,9 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       oncontextmenu={onInputContext}
     ></textarea>
     {#if streaming}
-      <button class="btn danger" onclick={stop}>■ 停止</button>
+      <button class="btn danger" onclick={stop}>■ {t("停止")}</button>
     {:else}
-      <button class="btn primary" disabled={(!input.trim() && !pendingImages.length) || sending || !ctx} onclick={send}>发送 ➤</button>
+      <button class="btn primary" disabled={(!input.trim() && !pendingImages.length) || sending || !ctx} onclick={send}>{t("发送")} ➤</button>
     {/if}
     </div>
   </div>

@@ -1,0 +1,140 @@
+/*
+ * 皮肤插件（内置预设）。应用方式：body[data-skin] 选择器。
+ * 结构：
+ *   背景 —— body::before 固定全屏背景图（随主题变暗以保证可读性）
+ *   人物看板 —— .skin-character（App 布局右下角固定，仅聊天/工作流视图显示）
+ *   主题变量 —— 覆盖背景、面板、边框、文本等核心变量与局部样式
+ *   装饰与动效 —— 各皮肤自定义（扫描线 / 花瓣等）
+ * 自定义皮肤：skin.json（vars + assets）由前端注入同名变量与元素。
+ */
+
+/* ============ 命运石之门（复古 CRT 实验室终端） ============ */
+
+body[data-skin="steins-gate"] .root::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: url("/skins/steins-gate/bg.png") center / cover no-repeat;
+  opacity: 0.30;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* 扫描线 + 轻微噪点 */
+body[data-skin="steins-gate"] .root::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  background:
+    repeating-linear-gradient(0deg, rgba(183, 211, 107, 0.035) 0 1px, transparent 1px 3px),
+    radial-gradient(ellipse at center, transparent 60%, rgba(0, 0, 0, 0.35));
+  animation: sg-flicker 6s infinite;
+}
+
+@keyframes sg-flicker {
+  0%, 100% { opacity: 0.85; }
+  48% { opacity: 0.9; }
+  50% { opacity: 0.72; }
+  52% { opacity: 0.88; }
+}
+
+body[data-skin="steins-gate"] .sidebar,
+body[data-skin="steins-gate"] .main,
+body[data-skin="steins-gate"] .titlebar,
+body[data-skin="steins-gate"] .editor-pane {
+  background: color-mix(in srgb, #0d1317 88%, transparent) !important;
+  border-color: var(--border-soft) !important;
+}
+
+body[data-skin="steins-gate"] .btn {
+  border-radius: 3px;
+}
+
+/* 世界线状态装饰（标题栏左侧小字） */
+body[data-skin="steins-gate"] .titlebar .skin-badge::before {
+  content: "Worldline 1.048596 ❖ EL PSY KONGROO";
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+  opacity: 0.75;
+}
+
+/* ============ 地狱乐（和风妖异 · 蓬莱仙境） ============ */
+
+body[data-skin="hell"] .root::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: url("/skins/hell/bg.png") center / cover no-repeat;
+  opacity: 0.35;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* 幽蓝雾气流动 */
+body[data-skin="hell"] .root::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  background:
+    radial-gradient(ellipse 80% 50% at 20% 100%, rgba(80, 120, 140, 0.10), transparent),
+    radial-gradient(ellipse 70% 40% at 80% 0%, rgba(181, 42, 42, 0.06), transparent);
+  animation: hell-mist 14s ease-in-out infinite alternate;
+}
+
+@keyframes hell-mist {
+  from { transform: translateX(-2%); opacity: 0.8; }
+  to { transform: translateX(2%); opacity: 1; }
+}
+
+body[data-skin="hell"] .sidebar,
+body[data-skin="hell"] .titlebar {
+  background: color-mix(in srgb, #1a1e22 90%, transparent) !important;
+}
+
+body[data-skin="hell"] .btn {
+  border-radius: 4px;
+}
+
+body[data-skin="hell"] .titlebar .skin-badge::before {
+  content: "天國 ▪ 佛蘭西屋敷 ▪ 蓬莱";
+  font-size: 10px;
+  letter-spacing: 0.3em;
+  color: #b3aca0;
+  opacity: 0.8;
+}
+
+/* ============ 人物看板（两套皮肤共用布局） ============ */
+.skin-character {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  height: min(52vh, 620px);
+  width: auto;
+  pointer-events: none;
+  z-index: 2;
+  filter: drop-shadow(0 6px 24px rgba(0, 0, 0, 0.45));
+  user-select: none;
+}
+body[data-skin="steins-gate"] .skin-character {
+  opacity: 0.88;
+  mask-image: linear-gradient(to right, transparent 0, #000 14%);
+}
+body[data-skin="hell"] .skin-character {
+  opacity: 0.92;
+  mask-image: linear-gradient(to right, transparent 0, #000 16%);
+}
+
+/* 自定义皮肤：变量由前端注入 body.style；背景/看板由 --skin-bg / --skin-character 提供 */
+body[data-skin]:not([data-skin=""]):not([data-skin="steins-gate"]):not([data-skin="hell"]):not([data-skin="none"]) .root::before {
+  background: var(--skin-bg, none) center / cover no-repeat;
+  opacity: var(--skin-bg-opacity, 0.3);
+}
+body[data-skin]:not([data-skin=""]):not([data-skin="steins-gate"]):not([data-skin="hell"]) .skin-character {
+  background: var(--skin-character, none) right bottom / contain no-repeat;
+  width: min(40vw, 560px);
+}

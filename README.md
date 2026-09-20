@@ -1,6 +1,6 @@
 # 使驾 ShiDrive
 
-English | [中文](README.md)
+[English](README_EN.md) | 中文
 
 > **One Context. Any Harness.** —— 让 Harness 并驾齐驱。
 

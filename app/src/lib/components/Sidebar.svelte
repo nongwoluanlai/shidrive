@@ -6,6 +6,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   import Icon from "./Icon.svelte";
   import type { MenuItem } from "./menu-item";
   import { scheduleText } from "./wf-shared";
+  import { t } from "../i18n";
 
   let showNewContext = $state(false);
   let projectName = $state("");
@@ -252,7 +253,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
 <aside class="sidebar">
   <!-- project switcher -->
   <div class="proj">
-    <button class="btn sm projbtn add" onclick={openNewProject}><Icon name="plus" size={14} /> 添加项目</button>
+    <button class="btn sm projbtn add" onclick={openNewProject}><Icon name="plus" size={14} /> {t("添加项目")}</button>
     <div class="selrow">
       <select
         class="psel"
@@ -279,7 +280,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   {#if !isNoProject(app.projectId)}
   <div class="sec">
     <div class="sec-head">
-      <Icon name="context" size={13} /> 上下文 <span class="spacer"></span>
+      <Icon name="context" size={13} /> {t("上下文")} <span class="spacer"></span>
       <button class="btn ghost sm" title="新建上下文" disabled={!app.projectId} onclick={() => (showNewContext = true)}><Icon name="plus" size={13} /></button>
     </div>
     <div class="list ctx-list">
@@ -298,7 +299,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
           <span class="iname">{c.name}</span>
         </div>
       {:else}
-        <div class="none">{app.projectId ? "还没有上下文" : "先选择项目"}</div>
+        <div class="none">{app.projectId ? t("还没有上下文") : t("先选择项目")}</div>
       {/each}
     </div>
   </div>
@@ -308,7 +309,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   <!-- workflows (bottom half) -->
   <div class="sec grow">
     <div class="sec-head">
-      <Icon name="workflow" size={13} /> 工作流 <span class="spacer"></span>
+      <Icon name="workflow" size={13} /> {t("工作流")} <span class="spacer"></span>
       <button
         class="btn ghost sm"
         title="新建工作流"
@@ -353,11 +354,11 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
           <span class="iname">{w.name}</span>
           <span class="imeta">
             {#if w.trigger_type === "schedule" && w.enabled}<span class="badge accent">⏰ {scheduleText(w.schedule)}</span>{:else}<span class="badge">手动</span>{/if}
-            <span class="dim">{w.steps.length} 节点</span>
+            <span class="dim">{w.steps.length} {t("节点")}</span>
           </span>
         </div>
       {:else}
-        <div class="none">{app.projectId ? "还没有工作流" : "先选择项目"}</div>
+        <div class="none">{app.projectId ? t("还没有工作流") : t("先选择项目")}</div>
       {/each}
     </div>
   </div>

@@ -87,6 +87,12 @@ export const app = $state({
   treeRev: 0,
   /** Enter 发送消息（默认关闭：Enter 换行、Ctrl+Enter 发送） */
   enterSend: false,
+  /** 界面语言：zh 简体中文（默认）/ en English */
+  locale: "zh" as "zh" | "en",
+  /** 皮肤插件：空 = 不使用 */
+  skin: "",
+  /** 已导入的自定义皮肤（id → 名称） */
+  customSkins: {} as Record<string, string>,
   /** open editor panel (file preview/edit) */
   editor: null as FileEditorState | null,
   /** workflows of the current project (sidebar bottom half) */
