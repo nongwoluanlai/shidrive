@@ -1,0 +1,185 @@
+// ---------- workflow MCP tools ----------
+
+/// Resolve the target project: explicit project_name → context_id's project → 无项目.
+fn resolve_project_id(state: &McpState, args: &Value) -> Result<String, String> {
+    if let Some(name) = args.get("project_name").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+        let projects = state.db.list_projects()?;
+        return projects
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.id.clone())
+            .ok_or_else(|| format!("项目「{name}」不存在。可先在使驾界面创建，或用 workflow_list 查看现有项目的工作流。"));
+    }
+    if let Some(cid) = args.get("context_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(c) = state.db.get_context_row(cid) {
+            return Ok(c.project_id);
+        }
+        return Err(format!("共享上下文 {cid} 不存在。可改用 project_name 参数直接指定项目。"));
+    }
+    Ok(crate::models::NO_PROJECT_ID.to_string())
+}
+
+fn find_workflow_by_name_or_id(state: &McpState, project_id: &str, key: &str) -> Result<Option<Workflow>, String> {
+    let list = state.db.list_workflows(project_id)?;
+    Ok(list.into_iter().find(|w| w.id == key || w.name == key))
+}
+
+fn wf_public(w: &Workflow) -> Value {
+    json!({
+        "id": w.id,
+        "name": w.name,
+        "description": w.description,
+        "enabled": w.enabled,
+        "trigger_type": w.trigger_type,
+        "schedule": w.schedule,
+        "steps": w.steps,
+        "edges": w.edges,
+        "env": w.env,
+        "next_run_at": w.next_run_at,
+        "last_run_at": w.last_run_at,
+    })
+}
+
+fn parse_steps(raw: &Value) -> Result<Vec<WorkflowStep>, String> {
+    match raw {
+        Value::Array(_) => serde_json::from_value::<Vec<WorkflowStep>>(raw.clone()).map_err(|e| {
+            format!("steps 格式不正确：{e}。每个步骤形如 {{\"type\":\"shell\",\"name\":\"构建\",\"command\":\"pnpm build\",\"cwd\":\"\",\"shell\":\"cmd\"}}；可选 type: start/agent/delay/env。")
+        }),
+        _ => Err("steps 必须是数组。".into()),
+    }
+}
+
+fn call_workflow_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, String> {
+    let project_id = resolve_project_id(state, args)?;
+    match name {
+        "workflow_list" => {
+            let list = state.db.list_workflows(&project_id)?;
+            let projects = state.db.list_projects()?;
+            let pname = projects.iter().find(|p| p.id == project_id).map(|p| p.name.clone()).unwrap_or_default();
+            let items: Vec<Value> = list
+                .iter()
+                .map(|w| {
+                    json!({
+                        "id": w.id,
+                        "name": w.name,
+                        "trigger": if w.trigger_type == "schedule" && w.enabled { "schedule" } else { "manual" },
+                        "steps": w.steps.len(),
+                        "next_run_at": w.next_run_at,
+                    })
+                })
+                .collect();
+            Ok(json_bytes(&json!({ "project": pname, "workflows": items })))
+        }
+        "workflow_get" => {
+            let key = args.get("name").or_else(|| args.get("id")).and_then(|v| v.as_str()).unwrap_or_default();
+            if key.is_empty() {
+                return tool_error("缺少参数 name（工作流名称或 id）。".into());
+            }
+            let w = find_workflow_by_name_or_id(state, &project_id, key)?
+                .ok_or_else(|| format!("工作流「{key}」不存在于该项目。可用 workflow_list 查看。"))?;
+            Ok(json_bytes(&wf_public(&w)))
+        }
+        "workflow_create" => {
+            let wname = args.get("name").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string();
+            if wname.is_empty() {
+                return tool_error("缺少参数 name（工作流名称）。".into());
+            }
+            if find_workflow_by_name_or_id(state, &project_id, &wname)?.is_some() {
+                return tool_error(format!("工作流「{wname}」已存在。如需修改请用 workflow_update，或换一个名称。"));
+            }
+            let steps = match args.get("steps") {
+                Some(raw) => parse_steps(raw)?,
+                None => Vec::new(),
+            };
+            let edges: Vec<Edge> = args.get("edges").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+            let n = steps.len();
+            if edges.iter().any(|e| e.from as usize >= n || e.to as usize >= n) {
+                return tool_error(format!("edges 引用了不存在的步骤索引（共 {n} 个步骤）。"));
+            }
+            let env: std::collections::BTreeMap<String, String> = args
+                .get("env")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let schedule: Option<ScheduleConfig> = args.get("schedule").and_then(|v| serde_json::from_value(v.clone()).ok());
+            let trigger_type = args.get("trigger_type").and_then(|v| v.as_str()).unwrap_or(if schedule.is_some() { "schedule" } else { "manual" });
+            let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            let description = args.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            // 自动布局：无坐标时按索引排一列
+            let mut steps = steps;
+            for (i, st) in steps.iter_mut().enumerate() {
+                let m = st.meta();
+                if m.x == 0.0 && m.y == 0.0 {
+                    st.set_pos(60.0, 30.0 + i as f64 * 100.0);
+                }
+            }
+            let w = state.db.create_workflow(&project_id, &wname, &description, enabled, trigger_type, schedule.as_ref(), &steps, &env, &edges)?;
+            Ok(json_bytes(&json!({ "created": true, "workflow": wf_public(&w) })))
+        }
+        "workflow_update" => {
+            let key = args.get("name").or_else(|| args.get("id")).and_then(|v| v.as_str()).unwrap_or_default();
+            if key.is_empty() {
+                return tool_error("缺少参数 name（工作流名称或 id）。".into());
+            }
+            let mut w = find_workflow_by_name_or_id(state, &project_id, key)?
+                .ok_or_else(|| format!("工作流「{key}」不存在。"))?;
+            if let Some(v) = args.get("new_name").and_then(|v| v.as_str()) {
+                w.name = v.to_string();
+            }
+            if let Some(v) = args.get("description").and_then(|v| v.as_str()) {
+                w.description = v.to_string();
+            }
+            if let Some(raw) = args.get("steps") {
+                w.steps = parse_steps(raw)?;
+            }
+            if let Some(raw) = args.get("edges") {
+                w.edges = serde_json::from_value(raw.clone()).map_err(|e| format!("edges 格式不正确：{e}"))?;
+                let n = w.steps.len();
+                if w.edges.iter().any(|e| e.from as usize >= n || e.to as usize >= n) {
+                    return tool_error(format!("edges 引用了不存在的步骤索引（共 {n} 个步骤）。"));
+                }
+            }
+            if let Some(raw) = args.get("env") {
+                w.env = serde_json::from_value(raw.clone()).map_err(|e| format!("env 格式不正确：{e}"))?;
+            }
+            if let Some(raw) = args.get("schedule") {
+                w.schedule = serde_json::from_value(raw.clone()).ok();
+                if w.schedule.is_some() && w.trigger_type != "schedule" {
+                    w.trigger_type = "schedule".into();
+                }
+            }
+            if let Some(v) = args.get("trigger_type").and_then(|v| v.as_str()) {
+                w.trigger_type = v.to_string();
+            }
+            if let Some(v) = args.get("enabled").and_then(|v| v.as_bool()) {
+                w.enabled = v;
+            }
+            state.db.update_workflow(&w)?;
+            Ok(json_bytes(&json!({ "updated": true, "workflow": wf_public(&w) })))
+        }
+        "workflow_delete" => {
+            let key = args.get("name").or_else(|| args.get("id")).and_then(|v| v.as_str()).unwrap_or_default();
+            if key.is_empty() {
+                return tool_error("缺少参数 name（工作流名称或 id）。".into());
+            }
+            let w = find_workflow_by_name_or_id(state, &project_id, key)?
+                .ok_or_else(|| format!("工作流「{key}」不存在。"))?;
+            state.db.delete_workflow(&w.id)?;
+            Ok(json_bytes(&json!({ "deleted": true, "name": w.name })))
+        }
+        "workflow_run" => {
+            let key = args.get("name").or_else(|| args.get("id")).and_then(|v| v.as_str()).unwrap_or_default();
+            if key.is_empty() {
+                return tool_error("缺少参数 name（工作流名称或 id）。".into());
+            }
+            let w = find_workflow_by_name_or_id(state, &project_id, key)?
+                .ok_or_else(|| format!("工作流「{key}」不存在。"))?;
+            if let Some(engine) = state.engine.get() {
+                engine.run_now(&w.id)?;
+                Ok(json_bytes(&json!({ "started": true, "name": w.name, "hint": "运行日志见使驾「工作流」页的运行历史，或右上角「运行中任务」。" })))
+            } else {
+                tool_error("工作流引擎尚未就绪。".into())
+            }
+        }
+        _ => tool_error(format!("未知工具 {name}。")),
+    }
+}

@@ -1,0 +1,27 @@
+# 依赖与构建产物
+node_modules/
+dist/
+target/
+gen/
+*.pyc
+__pycache__/
+
+# 本地工具链与测试产物
+.tools/
+.portable-test/
+.shots/
+.testproj/
+.zcode/
+.cm-test.txt
+
+# 第三方参考资料（含其它项目源码）
+参考/
+
+# 项目内部文档
+ShiDrive/
+
+# 运行时数据
+*.db
+*.db-shm
+*.db-wal
+*.log
