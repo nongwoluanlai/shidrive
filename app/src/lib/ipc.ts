@@ -85,6 +85,7 @@ export const api = {
   fsOpenTerminal: (path: string) => invoke<void>("fs_open_terminal", { path }),
   fsOpenDefault: (path: string) => invoke<void>("fs_open_default", { path }),
   fsOpenCmd: (path: string) => invoke<void>("fs_open_cmd", { path }),
+  fsOpenVscode: (path: string) => invoke<void>("fs_open_vscode", { path }),
   fsCopyToClipboard: (paths: string[]) => invoke<void>("fs_copy_to_clipboard", { paths }),
   fsPasteFromClipboard: (dest_dir: string) => invoke<void>("fs_paste_from_clipboard", { destDir: dest_dir }),
   fsDesktopDir: () => invoke<string>("fs_desktop_dir"),
@@ -127,6 +128,7 @@ export const api = {
   settingsSet: (key: string, value: string) => invoke<void>("settings_set", { key, value }),
   setupStatus: () => invoke<SetupStatus>("setup_status"),
   nodeStatus: () => invoke<NodeStat>("node_status"),
+  uiLog: (kind: string, text: string) => invoke<void>("ui_log", { kind, text }).catch(() => {}),
   nodeDownload: () => invoke<string>("node_download"),
   agentConfigGet: (agent_type: string) => invoke<AgentLaunch>("agent_config_get", { agentType: agent_type }),
   agentConfigSet: (agent_type: string, launch: AgentLaunch | null) =>

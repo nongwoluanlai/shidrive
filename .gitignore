@@ -25,3 +25,4 @@ ShiDrive/
 *.db-shm
 *.db-wal
 *.log
+ShiDrive-portable-*.zip

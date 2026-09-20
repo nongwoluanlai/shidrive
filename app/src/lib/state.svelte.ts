@@ -83,6 +83,8 @@ export const app = $state({
   streaming: {} as Record<string, boolean>,
   /** right-dock file tree visible */
   fileTreeOpen: true,
+  /** 回合结束后自增，目录树监听它自动刷新 */
+  treeRev: 0,
   /** open editor panel (file preview/edit) */
   editor: null as FileEditorState | null,
   /** workflows of the current project (sidebar bottom half) */
@@ -108,6 +110,8 @@ export const currentContext = () => app.contexts.find((c) => c.id === app.contex
 export function toast(kind: Toast["kind"], text: string) {
   const id = Date.now() + Math.random();
   app.toasts.push({ id, kind, text });
+  // 错误/警告气泡同步写入日志文件，便于排查其它设备上的问题
+  if (kind === "error" || kind === "warn") void api.uiLog(kind, text);
   setTimeout(() => {
     const i = app.toasts.findIndex((t) => t.id === id);
     if (i >= 0) app.toasts.splice(i, 1);

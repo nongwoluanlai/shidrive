@@ -12,6 +12,7 @@ pub struct Tools {
     node_override: Option<PathBuf>,
     zcode_override: Option<PathBuf>,
     python_override: Option<PathBuf>,
+    vscode_override: Option<PathBuf>,
 }
 
 fn first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
@@ -54,6 +55,7 @@ impl Tools {
             node_override: setting(db, "tools.node").map(PathBuf::from).filter(|p| p.exists()),
             zcode_override: setting(db, "tools.zcode_cli").map(PathBuf::from).filter(|p| p.exists()),
             python_override: setting(db, "tools.python").map(PathBuf::from).filter(|p| p.exists()),
+            vscode_override: setting(db, "tools.vscode").map(PathBuf::from).filter(|p| p.exists()),
         }
     }
 
@@ -110,6 +112,24 @@ impl Tools {
             return p.clone();
         }
         which("python.exe").or_else(|| which("python3.exe")).unwrap_or_else(|| PathBuf::from("python"))
+    }
+
+    /// VS Code 的 code.cmd / code：设置覆盖 → PATH → 标准安装位置。
+    pub fn vscode_exe(&self) -> Option<PathBuf> {
+        if let Some(v) = &self.vscode_override {
+            return Some(v.clone());
+        }
+        if let Some(p) = which("code.cmd").or_else(|| which("code")) {
+            return Some(p);
+        }
+        let mut candidates = vec![];
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(&local).join("Programs").join("Microsoft VS Code").join("bin").join("code.cmd"));
+        }
+        if let Some(pf) = std::env::var("ProgramFiles").ok() {
+            candidates.push(PathBuf::from(pf).join("Microsoft VS Code").join("bin").join("code.cmd"));
+        }
+        first_existing(&candidates)
     }
 
     pub fn codex_adapter(&self) -> PathBuf {

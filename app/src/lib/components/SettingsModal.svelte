@@ -6,7 +6,7 @@
   import AgentsAdmin from "./AgentsAdmin.svelte";
   import type { AgentEnvStatusItem, NodeStat } from "../types";
 
-  let tab = $state<"agents" | "theme" | "paths">("theme");
+  let tab = $state<"agents" | "theme" | "paths">("agents");
   let registry = $state<AgentEnvStatusItem[]>([]);
 
   // --- paths / ports editing state ---
@@ -14,6 +14,7 @@
   let pythonPath = $state("");
   let nodePath = $state("");
   let proxy = $state("");
+  let vscodePath = $state("");
   let pathsLoaded = $state(false);
   let nodeStat = $state<NodeStat | null>(null);
   let nodeBusy = $state(false);
@@ -61,6 +62,7 @@
     pythonPath = (await api.settingsGet("tools.python").catch(() => null)) ?? "";
     nodePath = (await api.settingsGet("tools.node").catch(() => null)) ?? "";
     proxy = (await api.settingsGet("network.proxy").catch(() => null)) ?? "";
+    vscodePath = (await api.settingsGet("tools.vscode").catch(() => null)) ?? "";
     void loadNodeStatus();
     void loadAutoStart();
     pathsLoaded = true;
@@ -78,12 +80,14 @@
             ["tools.python", ""],
             ["tools.node", ""],
             ["network.proxy", ""],
+            ["tools.vscode", ""],
           ]
         : [
             ["mcp.port", mcpPort.trim()],
             ["tools.python", pythonPath.trim()],
             ["tools.node", nodePath.trim()],
             ["network.proxy", proxy.trim()],
+            ["tools.vscode", vscodePath.trim()],
           ];
       for (const [k, v] of pairs) await api.settingsSet(k, v);
       if (!clear && mcpPort.trim()) app.mcpPort = Number(mcpPort.trim()) || app.mcpPort;
@@ -124,9 +128,9 @@
     <div class="modal settings">
       <header>设置 <button class="btn ghost sm" onclick={close}>✕</button></header>
       <div class="tabs">
-        <button class:active={tab === "theme"} onclick={() => (tab = "theme")}>外观主题</button>
         <button class:active={tab === "agents"} onclick={() => { tab = "agents"; void loadRegistry(); }}>Agent 管理</button>
         <button class:active={tab === "paths"} onclick={() => (tab = "paths")}>环境与路径</button>
+        <button class:active={tab === "theme"} onclick={() => (tab = "theme")}>外观主题</button>
       </div>
 
       <div class="body">
@@ -176,6 +180,7 @@
             <h3>服务与解释器（保存后部分需重启使驾生效）</h3>
             <div class="field"><label>MCP 服务端口（共享上下文 /skills 与 /mcp）</label><input bind:value={mcpPort} placeholder="8345" /></div>
             <div class="field"><label>Python 解释器路径（工作流 python 节点使用，留空自动检测）</label><input bind:value={pythonPath} placeholder="自动检测" /></div>
+            <div class="field"><label>VS Code 路径（code.cmd / code，目录树「在 VS Code 中打开」使用，留空自动检测）</label><input bind:value={vscodePath} placeholder="自动检测" /></div>
           </div>
           <div class="sec">
             <h3>Node 运行时（适配器安装与启动使用，需 ≥ 22）</h3>

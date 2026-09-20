@@ -62,6 +62,13 @@ export async function wireEvents() {
     }
   });
 
+  // 回合结束（完成/中断）后自增目录树版本号 → FileTree 自动刷新，及时看到 Agent 产出的文件
+  await listen<{ contextId: string; agentType: string; status: string }>("acp://binding-status", (e) => {
+    if (e.payload.status === "completed" || e.payload.status === "interrupted") {
+      app.treeRev++;
+    }
+  });
+
   // workflow run log/status: global so the 运行中 view keeps state across tab switches
   await listen<{ runId: string; line: string }>("wf://log", (e) => {
     const { runId, line } = e.payload;

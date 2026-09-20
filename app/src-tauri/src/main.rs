@@ -26,6 +26,7 @@ fn init_logger(debug: bool) {
 
     struct FileLogger {
         file: Option<Mutex<std::fs::File>>,
+        stderr: bool,
         level: LevelFilter,
     }
     impl Log for FileLogger {
@@ -43,14 +44,15 @@ fn init_logger(debug: bool) {
                     let _ = writeln!(g, "{line}");
                 }
             }
-            if cfg!(debug_assertions) || std::env::var("SHIDRIVE_DEBUG").as_deref() == Ok("1") {
+            if self.stderr {
                 eprintln!("{line}");
             }
         }
         fn flush(&self) {}
     }
 
-    let file = if debug {
+    // 文件日志常开（Info 级）：无论是否 --debug 都能排查问题；--debug 额外输出 stderr
+    let file = {
         let dir = std::env::var("APPDATA")
             .map(|a| std::path::PathBuf::from(a).join("com.shidrive.desktop").join("logs"))
             .unwrap_or_default();
@@ -61,14 +63,13 @@ fn init_logger(debug: bool) {
             .open(dir.join("shidrive.log"))
             .ok()
             .map(Mutex::new)
-    } else {
-        None
     };
     let _ = log::set_boxed_logger(Box::new(FileLogger {
         file,
-        level: if debug { LevelFilter::Info } else { LevelFilter::Warn },
+        stderr: debug,
+        level: LevelFilter::Info,
     }));
-    log::set_max_level(if debug { LevelFilter::Info } else { LevelFilter::Warn });
+    log::set_max_level(LevelFilter::Info);
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -202,6 +203,7 @@ fn main() {
             commands::fs_open_explorer,
             commands::fs_open_terminal,
             commands::fs_open_cmd,
+            commands::fs_open_vscode,
             commands::fs_open_default,
             commands::fs_copy_to_clipboard,
             commands::fs_paste_from_clipboard,
@@ -216,6 +218,7 @@ fn main() {
             commands::settings_get,
             commands::settings_set,
             commands::setup_status,
+            commands::ui_log,
             commands::node_status,
             commands::node_download,
             commands::agent_config_get,

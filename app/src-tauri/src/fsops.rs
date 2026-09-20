@@ -131,6 +131,21 @@ pub fn open_in_cmd(path: &str) -> Result<(), String> {
         .map_err(|e| format!("打开 cmd 失败: {e}"))
 }
 
+/// 在 VS Code 中打开目录（code.cmd 是批处理，经 cmd /C 调起并隐藏控制台窗）。
+pub fn open_in_vscode(code_path: &str, dir: &str) -> Result<(), String> {
+    let mut c = std::process::Command::new("cmd");
+    let out = hide_window(&mut c)
+        .args(["/C", &format!("\"{}\" \"{}\"", code_path, dir)])
+        .output()
+        .map_err(|e| format!("启动 VS Code 失败: {e}"))?;
+    if out.status.success() || code_path.to_ascii_lowercase().ends_with(".cmd") {
+        // code.cmd 通过 cmd 调起后立即返回，VS Code 窗口异步拉起
+        Ok(())
+    } else {
+        Err(format!("VS Code 返回非零: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
 /// 后台执行的控制台程序不弹窗（CREATE_NO_WINDOW）。
 #[cfg(windows)]
 fn hide_window(cmd: &mut std::process::Command) -> &mut std::process::Command {

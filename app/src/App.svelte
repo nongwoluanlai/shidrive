@@ -128,6 +128,15 @@
               {#if currentContext()}<span class="sep">/</span><span class="ctx">{currentContext()?.name}</span>{/if}
             </div>
             <div class="spacer"></div>
+            {#if app.tab === "chat" && currentContext()}
+              <button
+                class="btn ghost sm"
+                title="共享上下文"
+                onclick={() => (app.tab = app.tab === "context" ? "chat" : "context")}
+              >
+                <Icon name="context" size={15} />
+              </button>
+            {/if}
             {#if app.projectId}
               <button
                 class="btn ghost sm"

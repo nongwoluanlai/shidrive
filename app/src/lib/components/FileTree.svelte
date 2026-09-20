@@ -23,15 +23,17 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   let renameValue = $state("");
 
   $effect(() => {
-    if (root) void refresh();
+    // 依赖 treeRev：回合结束后自动刷新（保留展开状态）；首次加载复位展开
+    void app.treeRev;
+    if (root) void refresh(app.treeRev > 0);
     else closeEditor();
   });
 
-  async function refresh() {
+  async function refresh(keepExpansion = false) {
     if (!root) return;
     try {
       tree = await api.fsList(root);
-      expanded = {};
+      if (!keepExpansion) expanded = {};
     } catch (e) {
       toast("error", String(e));
     }
@@ -188,10 +190,9 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     <Icon name="folder" size={14} />
     <span class="title" title={root}>{project?.name ?? "文件"}</span>
     <span class="spacer"></span>
-    <button class="btn ghost sm" title="新建文件" onclick={() => { void (async () => { const name = await promptDialog({ title: "新建文件", label: "文件名 *" }); if (name === null || !name.trim()) return; try { await api.fsCreateFile(root + "\\" + name); await refresh(); } catch (e) { toast("error", String(e)); } })(); }}><Icon name="file" size={13} /></button>
-    <button class="btn ghost sm" title="新建文件夹" onclick={() => { void (async () => { const name = await promptDialog({ title: "新建文件夹", label: "文件夹名 *" }); if (name === null || !name.trim()) return; try { await api.fsCreateDir(root + "\\" + name); await refresh(); } catch (e) { toast("error", String(e)); } })(); }}><Icon name="folder" size={13} /></button>
-    <button class="btn ghost sm" title="刷新" onclick={refresh}><Icon name="refresh" size={13} /></button>
+    <button class="btn ghost sm" title="刷新" onclick={() => refresh()}><Icon name="refresh" size={13} /></button>
     <button class="btn ghost sm" title="资源管理器" onclick={() => api.fsOpenExplorer(root).catch((e) => toast("error", String(e)))}>↗</button>
+    <button class="btn ghost sm" title="在 VS Code 中打开" onclick={() => api.fsOpenVscode(root).catch((e) => toast("error", String(e)))}><Icon name="code" size={13} /></button>
   </div>
   <div class="tree">
     {#each tree as node (node.path)}

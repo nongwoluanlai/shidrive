@@ -362,21 +362,6 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     </div>
   </div>
 
-  <!-- bottom-left: context button follows project -->
-  <div class="bottom">
-    <button
-      class="ctx-btn"
-      class:active={app.tab === "context"}
-      disabled={!app.contextId}
-      onclick={() => {
-        app.tab = app.tab === "context" ? "chat" : "context";
-      }}
-    >
-      <Icon name="context" size={15} />
-      <span>上下文</span>
-      <span class="ctxname">{app.contexts.find((c) => c.id === app.contextId)?.name ?? ""}</span>
-    </button>
-  </div>
 </aside>
 
 
@@ -511,7 +496,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     flex-direction: column;
     min-height: 0;
     flex: none;
-    max-height: 38%;
+    max-height: 52%;
   }
   .sec.grow {
     flex: 1;
@@ -541,7 +526,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   }
   .ctx-list {
     flex: none;
-    max-height: 240px;
+    max-height: 360px;
   }
   .wf-list {
     flex: 1;
@@ -586,37 +571,6 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     text-align: center;
     padding: 14px 6px;
     font-size: 0.85em;
-  }
-  .bottom {
-    border-top: 1px solid var(--border-soft);
-    padding: 8px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .ctx-btn {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    padding: 9px 12px;
-    border-radius: calc(var(--radius) - 2px);
-    border: 1px solid var(--border);
-    color: var(--text-dim);
-    font-size: 0.92em;
-  }
-  .ctx-btn:hover:not(:disabled) {
-    background: var(--bg-elev);
-    color: var(--text);
-  }
-  .ctx-btn.active {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
-  }
-  .ctx-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
   }
   .ctxname {
     margin-left: auto;

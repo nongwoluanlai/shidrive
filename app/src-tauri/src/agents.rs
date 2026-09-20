@@ -220,11 +220,15 @@ pub fn bootstrap_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> R
         ));
     }
     let proxy = proxy.map(|p| p.trim()).filter(|p| !p.is_empty());
-    let run = |registry: Option<&str>| -> std::io::Result<std::process::Output> {
+    let run = |registry: Option<&str>, ignore_scripts: bool| -> std::io::Result<std::process::Output> {
         let mut c = std::process::Command::new(&node);
         let out = hide_console(&mut c)
             .arg(npm_cli.to_string_lossy().to_string())
             .args(["install", "--omit=optional", "--no-audit", "--no-fund"]);
+        if ignore_scripts {
+            // 跳过依赖包的 postinstall（如 zcode 依赖的联网升级检查脚本）
+            out.arg("--ignore-scripts");
+        }
         if let Some(p) = proxy {
             out.args(["--proxy", p, "--https-proxy", p]);
         }
@@ -233,12 +237,13 @@ pub fn bootstrap_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> R
         }
         out.arg(npm_pkg).current_dir(&acp_dir).output()
     };
-    let out = run(None).map_err(|e| format!("npm 启动失败: {e}"))?;
+    let out = run(None, false).map_err(|e| format!("npm 启动失败: {e}"))?;
+    // 常规安装失败 → 跳过 postinstall 脚本重试一次（镜像源）
     let out = if out.status.success() {
         out
     } else {
-        // 默认源失败（网络受限）→ npmmirror 镜像重试
-        run(Some("https://registry.npmmirror.com")).map_err(|e| format!("npm 启动失败: {e}"))?
+        run(Some("https://registry.npmmirror.com"), true)
+            .map_err(|e| format!("npm 启动失败: {e}"))?
     };
     if out.status.success() {
         Ok(format!("已安装 {npm_pkg}"))

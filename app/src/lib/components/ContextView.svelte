@@ -35,6 +35,58 @@
     }
   }
 
+  // 导出全部提交版本为 Markdown（写到系统"下载"目录）
+  async function exportMarkdown() {
+    if (!ctx) return;
+    const esc = (s: string) => s.replaceAll("|", "\\|").replaceAll("\r\n", "\n");
+    const lines: string[] = [];
+    lines.push(`# 共享上下文：${ctx.name}`);
+    lines.push("");
+    lines.push(`- 项目：${app.projects.find((p) => p.id === ctx.project_id)?.name ?? ctx.project_id}`);
+    lines.push(`- 导出时间：${new Date().toLocaleString()}`);
+    lines.push(`- 提交版本：v1 ~ v${commits.length ? Math.max(...commits.map((c) => c.seq)) : 0}（共 ${commits.length} 条）`);
+    lines.push("");
+    for (const c of [...commits].sort((a, b) => a.seq - b.seq)) {
+      lines.push(`---`);
+      lines.push("");
+      lines.push(`## v${c.seq} · ${c.created_at}`);
+      const who = [c.agent_type, c.session_id ? `会话 ${c.session_id.slice(0, 8)}` : ""].filter(Boolean).join(" · ");
+      if (who) lines.push(`> ${who}`);
+      lines.push("");
+      if (c.summary) lines.push(`**摘要**：${esc(c.summary)}`, "");
+      const files = parseFiles(c.files);
+      if (files.length) lines.push("**涉及文件**：", "", ...files.map((f) => `- ${f}`), "");
+      try {
+        const snap = JSON.parse(c.snapshot || "{}") as Record<string, unknown>;
+        const sections: [string, unknown][] = [
+          ["概述", snap.overview],
+          ["条目", snap.todos ?? snap.entries],
+          ["进展", snap.progress],
+          ["备注", snap.notes],
+          ["约束", snap.constraints],
+        ];
+        for (const [name, val] of sections) {
+          if (val === undefined || val === null || val === "") continue;
+          lines.push(`**${name}**：`, "");
+          if (Array.isArray(val)) for (const it of val) lines.push(`- ${esc(String(it))}`);
+          else lines.push(esc(String(val)));
+          lines.push("");
+        }
+      } catch {
+        /* snapshot 损坏时跳过 */
+      }
+    }
+    const name = `context-${ctx.name.replace(/[\\/:*?"<>|]/g, "_")}-${new Date().toISOString().slice(0, 10)}.md`;
+    try {
+      const dir = await api.fsDesktopDir();
+      const path = `${dir}\\${name}`;
+      await api.fsWrite(path, lines.join("\n"));
+      toast("ok", `已导出到 ${path}`);
+    } catch (e) {
+      toast("error", "导出失败: " + String(e));
+    }
+  }
+
   interface Snap {
     overview?: string;
     todos?: { content: string; status?: string }[];
@@ -215,7 +267,7 @@
       </div>
 
       <section class="card commits">
-        <h3>🕘 提交历史 <span class="ver">当前 v{commits[0]?.seq ?? 0}</span><span class="spacer"></span><button class="btn ghost sm" title="刷新" onclick={refreshCommits}>⟳</button></h3>
+        <h3>🕘 提交历史 <span class="ver">当前 v{commits[0]?.seq ?? 0}</span><span class="spacer"></span><button class="btn ghost sm" title="导出全部版本为 Markdown（保存到桌面）" onclick={exportMarkdown}>导出 MD</button><button class="btn ghost sm" title="刷新" onclick={refreshCommits}>⟳</button></h3>
         <div class="commit-list">
           {#each commits as c (c.seq)}
             <div class="commit">

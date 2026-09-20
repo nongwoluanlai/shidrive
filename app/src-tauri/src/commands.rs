@@ -446,6 +446,27 @@ pub async fn setup_status(agents: AgentsState<'_>) -> Result<SetupStatus, String
     Ok(agents.setup_status())
 }
 
+/// 前端气泡提示落日志文件（error/warn 记录详情，便于远程排查）。
+#[tauri::command]
+pub async fn ui_log(kind: String, text: String) -> Result<(), String> {
+    match kind.as_str() {
+        "error" => log::error!("[ui] {text}"),
+        "warn" => log::warn!("[ui] {text}"),
+        _ => log::info!("[ui] {text}"),
+    }
+    Ok(())
+}
+
+/// 在 VS Code 中打开目录（路径可在设置 → 环境与路径指定，留空自动检测）。
+#[tauri::command]
+pub async fn fs_open_vscode(agents: AgentsState<'_>, path: String) -> Result<(), String> {
+    let code = agents
+        .tools
+        .vscode_exe()
+        .ok_or_else(|| "未找到 VS Code：请在「设置 → 环境与路径」填写 code 路径".to_string())?;
+    fsops::open_in_vscode(&code.to_string_lossy(), &path)
+}
+
 /// Node 运行时探测结果（版本 / 来源 / 是否满足 ≥22）。
 #[tauri::command]
 pub async fn node_status(agents: AgentsState<'_>) -> Result<crate::node_rt::NodeStatus, String> {

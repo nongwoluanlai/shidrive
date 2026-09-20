@@ -100,6 +100,10 @@ impl AgentManager {
                 }
                 args = vec!["--disable-warning=ExperimentalWarning".into(), adapter.to_string_lossy().to_string()];
                 if let Some(codex) = self.tools.codex_exe() {
+                    // 适配器优先读 CODEX_PATH（完整路径）；不设它时适配器在 PATH 上
+                    // 找不到裸 "codex" 会回退到内置 CLI，而内置 CLI 因 --omit=optional
+                    // 缺平台二进制而报 "Missing optional dependency"。
+                    env.insert("CODEX_PATH".to_string(), codex.to_string_lossy().to_string());
                     if let Some(dir) = codex.parent() {
                         env.insert("PATH".to_string(), dir.to_string_lossy().to_string());
                     }

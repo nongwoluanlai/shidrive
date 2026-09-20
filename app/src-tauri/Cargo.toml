@@ -3,6 +3,7 @@ name = "shidrive"
 version = "0.1.0"
 edition = "2021"
 description = "使驾 ShiDrive — AI 开发工作台"
+default-run = "shidrive"
 
 [features]
 # tauri build 默认携带该 feature：release 下使用内嵌 frontendDist 资源而非 devUrl
