@@ -118,6 +118,13 @@ impl Db {
         "#;
         self.with(|c| {
             c.execute_batch(sql)?;
+            // 列迁移紧跟建表执行（幂等）：全新库的基础 schema 是历史形态，
+            // 若先跑种子数据（用到 env/edges 列）会直接失败 → 启动闪退
+            let _ = c.execute_batch("ALTER TABLE workflows ADD COLUMN env TEXT NOT NULL DEFAULT '{}'");
+            let _ = c.execute_batch("ALTER TABLE workflows ADD COLUMN edges TEXT NOT NULL DEFAULT '[]'");
+            let _ = c.execute_batch("ALTER TABLE workflows ADD COLUMN sort INTEGER NOT NULL DEFAULT 0");
+            let _ = c.execute_batch("ALTER TABLE agent_bindings ADD COLUMN status TEXT NOT NULL DEFAULT ''");
+            let _ = c.execute_batch("ALTER TABLE agent_bindings ADD COLUMN model TEXT NOT NULL DEFAULT ''");
             // 内置「无项目」常驻
             c.execute(
                 "INSERT OR IGNORE INTO projects (id,name,root_path,description,sort,created_at,updated_at) VALUES (?1,?2,'','存放便捷工作流与本地服务，不绑定目录',-1,?3,?3)",
@@ -195,12 +202,6 @@ Start-Process -FilePath '{{env.__app__}}' -ArgumentList $cli -WindowStyle Hidden
                     )?;
                 }
             }
-            // migrations for existing databases
-            let _ = c.execute_batch("ALTER TABLE workflows ADD COLUMN env TEXT NOT NULL DEFAULT '{}'");
-            let _ = c.execute_batch("ALTER TABLE workflows ADD COLUMN edges TEXT NOT NULL DEFAULT '[]'");
-            let _ = c.execute_batch("ALTER TABLE workflows ADD COLUMN sort INTEGER NOT NULL DEFAULT 0");
-            let _ = c.execute_batch("ALTER TABLE agent_bindings ADD COLUMN status TEXT NOT NULL DEFAULT ''");
-            let _ = c.execute_batch("ALTER TABLE agent_bindings ADD COLUMN model TEXT NOT NULL DEFAULT ''");
             // guard against duplicate seq from concurrent commits; ignore failure on legacy dup data
             let _ = c.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_sc_ctx_seq ON sc_commits(context_id, seq)");
 
@@ -802,6 +803,73 @@ Start-Process -FilePath '{{env.__app__}}' -ArgumentList $cli -WindowStyle Hidden
             Ok(())
         })
     }
+
+/// 全量导出（按表 → 行对象数组）。
+pub fn export_backup(&self) -> Result<serde_json::Value, String> {
+    self.with(|c| {
+        let mut out = serde_json::Map::new();
+        for (table, cols) in BACKUP_TABLES {
+            let sql = format!("SELECT {} FROM {table}", cols.join(","));
+            let mut st = c.prepare(&sql)?;
+            let names: Vec<String> = st.column_names().into_iter().map(|s| s.to_string()).collect();
+            let mut rows = st.query([])?;
+            let mut arr = Vec::new();
+            while let Some(r) = rows.next()? {
+                let mut obj = serde_json::Map::new();
+                for (i, name) in names.iter().enumerate() {
+                    let v: serde_json::Value = match r.get_ref(i)? {
+                        rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                        rusqlite::types::ValueRef::Integer(n) => serde_json::json!(n),
+                        rusqlite::types::ValueRef::Real(f) => serde_json::json!(f),
+                        rusqlite::types::ValueRef::Text(t) | rusqlite::types::ValueRef::Blob(t) => {
+                            serde_json::json!(String::from_utf8_lossy(t).to_string())
+                        }
+                    };
+                    obj.insert(name.clone(), v);
+                }
+                arr.push(serde_json::Value::Object(obj));
+            }
+            out.insert(table.to_string(), serde_json::Value::Array(arr));
+        }
+        out.insert("app".into(), serde_json::json!("shidrive"));
+        out.insert("exported_at".into(), serde_json::json!(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()));
+        Ok(serde_json::Value::Object(out))
+    })
+}
+
+/// 导入（INSERT OR REPLACE，按 id 覆盖）。返回各表写入行数。
+pub fn import_backup(&self, data: &serde_json::Value) -> Result<Vec<(String, usize)>, String> {
+    self.with(|c| {
+        let mut counts = Vec::new();
+        for (table, cols) in BACKUP_TABLES {
+            let Some(rows) = data.get(*table).and_then(|v| v.as_array()) else { continue };
+            let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "INSERT OR REPLACE INTO {table} ({}) VALUES ({})",
+                cols.join(","),
+                placeholders.join(",")
+            );
+            let mut n = 0;
+            for row in rows {
+                let vals: Vec<rusqlite::types::Value> = cols
+                    .iter()
+                    .map(|col| match row.get(*col) {
+                        Some(serde_json::Value::String(s)) => rusqlite::types::Value::Text(s.clone()),
+                        Some(serde_json::Value::Number(num)) => num
+                            .as_i64()
+                            .map(rusqlite::types::Value::Integer)
+                            .unwrap_or(rusqlite::types::Value::Real(num.as_f64().unwrap_or(0.0))),
+                        _ => rusqlite::types::Value::Null,
+                    })
+                    .collect();
+                c.execute(&sql, rusqlite::params_from_iter(vals.iter()))?;
+                n += 1;
+            }
+            counts.push((table.to_string(), n));
+        }
+        Ok(counts)
+    })
+}
 }
 
 fn row_project(r: &Row) -> rusqlite::Result<Project> {
@@ -904,4 +972,29 @@ fn row_run(r: &Row) -> rusqlite::Result<WorkflowRun> {
         started_at: r.get(5)?,
         finished_at: r.get(6)?,
     })
+
 }
+
+// ---------- backup: export / import (projects + contexts + entries + workflows) ----------
+
+const BACKUP_TABLES: &[(&str, &[&str])] = &[
+    (
+        "projects",
+        &["id", "name", "root_path", "description", "sort", "created_at", "updated_at"],
+    ),
+    (
+        "contexts",
+        &["id", "project_id", "name", "overview", "constraints", "sort", "created_at", "updated_at"],
+    ),
+    (
+        "context_entries",
+        &["id", "context_id", "kind", "content", "status", "sort", "created_at", "updated_at"],
+    ),
+    (
+        "workflows",
+        &[
+            "id", "project_id", "name", "description", "enabled", "trigger_type", "schedule",
+            "steps", "last_run_at", "next_run_at", "created_at", "updated_at", "env", "edges",
+        ],
+    ),
+];

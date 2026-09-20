@@ -128,6 +128,8 @@ export const api = {
   settingsSet: (key: string, value: string) => invoke<void>("settings_set", { key, value }),
   setupStatus: () => invoke<SetupStatus>("setup_status"),
   nodeStatus: () => invoke<NodeStat>("node_status"),
+  dataExport: () => invoke<string>("data_export"),
+  dataImport: (path: string) => invoke<string>("data_import", { path }),
   uiLog: (kind: string, text: string) => invoke<void>("ui_log", { kind, text }).catch(() => {}),
   nodeDownload: () => invoke<string>("node_download"),
   agentConfigGet: (agent_type: string) => invoke<AgentLaunch>("agent_config_get", { agentType: agent_type }),
@@ -137,4 +139,5 @@ export const api = {
   agentsEnabledGet: () => invoke<string[]>("agents_enabled_get"),
   agentsEnabledSet: (ids: string[]) => invoke<void>("agents_enabled_set", { ids }),
   agentsBootstrap: (id: string) => invoke<string>("agents_bootstrap", { id }),
+  agentsUninstall: (id: string) => invoke<string>("agents_uninstall", { id }),
 };

@@ -111,6 +111,11 @@ fn main() {
             let open = MenuItem::with_id(app, "open", "打开主页面", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &quit])?;
+            // 托盘用独立的 32px 原生渲染图标：默认图标是 128px，被系统缩到
+            // 16/20px 会产生锯齿；32px 原生绘制在小尺寸下边缘干净得多
+            let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
+                .ok()
+                .or_else(|| app.default_window_icon().cloned());
             let mut tray = TrayIconBuilder::with_id("main-tray")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
@@ -129,8 +134,8 @@ fn main() {
                         show_main_window(tray.app_handle());
                     }
                 });
-            if let Some(icon) = app.default_window_icon() {
-                tray = tray.icon(icon.clone());
+            if let Some(icon) = tray_icon {
+                tray = tray.icon(icon);
             }
             tray.build(app)?;
 
@@ -219,6 +224,8 @@ fn main() {
             commands::settings_set,
             commands::setup_status,
             commands::ui_log,
+            commands::data_export,
+            commands::data_import,
             commands::node_status,
             commands::node_download,
             commands::agent_config_get,
@@ -227,6 +234,7 @@ fn main() {
             commands::agents_enabled_get,
             commands::agents_enabled_set,
             commands::agents_bootstrap,
+            commands::agents_uninstall,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -163,8 +163,9 @@ impl Tools {
         which("codex.exe")
     }
 
-    /// zcode.cjs shipped inside the ZCode desktop app. Standard install locations
-    /// only — custom setups use the `tools.zcode_cli` setting.
+    /// zcode.cjs shipped inside the ZCode desktop app. Discovery: settings
+    /// override → standard locations → a bounded walk over Programs dirs
+    /// (install folder names and layouts vary across versions).
     pub fn zcode_cli(&self) -> Option<PathBuf> {
         if let Some(z) = &self.zcode_override {
             return Some(z.clone());
@@ -177,7 +178,43 @@ impl Tools {
         if let Some(pf) = std::env::var("ProgramFiles").ok() {
             candidates.push(PathBuf::from(pf).join("ZCode").join("resources").join("glm").join("zcode.cjs"));
         }
-        first_existing(&candidates)
+        if let Some(p) = first_existing(&candidates) {
+            return Some(p);
+        }
+        self.walk_for_zcode_cli()
+    }
+
+    /// 在 %LOCALAPPDATA%\Programs 与 Program Files 下逐应用目录探测 zcode.cjs
+    ///（安装目录名与内部布局随版本变化，不做硬编码假设）。
+    fn walk_for_zcode_cli(&self) -> Option<PathBuf> {
+        let mut roots: Vec<PathBuf> = vec![];
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            roots.push(PathBuf::from(local).join("Programs"));
+        }
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            roots.push(PathBuf::from(pf));
+        }
+        for root in roots {
+            let Ok(apps) = std::fs::read_dir(&root) else { continue };
+            for app in apps.flatten() {
+                let res = app.path().join("resources");
+                if !res.is_dir() {
+                    continue;
+                }
+                let rels = [
+                    std::path::Path::new("glm").join("zcode.cjs"),
+                    std::path::Path::new("app").join("glm").join("zcode.cjs"),
+                    std::path::PathBuf::from("zcode.cjs"),
+                ];
+                for rel in rels {
+                    let cand = res.join(&rel);
+                    if cand.exists() {
+                        return Some(cand);
+                    }
+                }
+            }
+        }
+        None
     }
 }
 

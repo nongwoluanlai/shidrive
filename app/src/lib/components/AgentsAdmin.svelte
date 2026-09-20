@@ -43,12 +43,13 @@
     return drafts[r.id] ?? { command: r.manual_command ?? "", args: "", env: "" };
   }
 
-  // 挂载时拉一次启用顺序（设置页可能直接落在该 tab）
+  // 挂载时拉启用顺序与注册表（默认 tab 即 Agent 管理时也必须加载）
   $effect(() => {
     void api
       .agentsEnabledGet()
       .then((e: string[]) => (enabledOrder = e))
       .catch(() => {});
+    void loadRegistry();
   });
 
   // 展开行渲染完成后异步补全草稿（先取 override，再同步远端完整配置）
@@ -141,6 +142,22 @@
     }
   }
 
+  async function uninstall(r: AgentEnvStatusItem) {
+    if (!r.npm) return;
+    busy = r.id;
+    toast("info", `正在卸载 ${r.npm}…`);
+    try {
+      const msg = await api.agentsUninstall(r.id);
+      toast("ok", msg);
+      await loadRegistry();
+      await refreshEnabled();
+    } catch (e) {
+      toast("error", String(e));
+    } finally {
+      busy = null;
+    }
+  }
+
   async function saveConfig(r: AgentEnvStatusItem) {
     const d = draftOf(r);
     const env: Record<string, string> = {};
@@ -208,6 +225,13 @@
                   {busy === r.id ? "安装中…" : "安装适配器"}
                 </button>
                 <span class="pend">安装后即可连接（npm：{r.npm}）</span>
+              </div>
+            {:else if r.npm && r.adapter_ready}
+              <div class="cfg-line">
+                <button class="btn sm" disabled={busy === r.id} onclick={() => uninstall(r)}>
+                  {busy === r.id ? "卸载中…" : "卸载适配器"}
+                </button>
+                <span class="pend">卸载后需重新安装才能连接</span>
               </div>
             {/if}
             <div class="field"><label>命令（{r.npm ? "覆盖自动检测，留空=自动" : "必填：可执行文件完整路径"}）</label>

@@ -133,6 +133,11 @@ input {
   transition: background 0.15s, border-color 0.15s, opacity 0.15s;
   white-space: nowrap;
 }
+.btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
 .btn:hover {
   background: var(--bg-elev2);
   border-color: var(--text-faint);

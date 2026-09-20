@@ -28,6 +28,33 @@
     autoStart = await autoStartEnabled().catch(() => false);
   }
 
+  async function exportData() {
+    try {
+      const path = await api.dataExport();
+      toast("ok", `已导出到 ${path}`);
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
+  async function importData() {
+    const path = await import("../dialog.svelte").then((m) => m.promptDialog({ title: "导入数据", label: "备份 JSON 路径", initial: "" }));
+    if (path === null || !path.trim()) return;
+    try {
+      const msg = await api.dataImport(path.trim());
+      toast("ok", msg + "（部分界面刷新或重启后完全生效）");
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
+  async function toggleEnterSend(e: Event) {
+    const on = (e.target as HTMLInputElement).checked;
+    app.enterSend = on;
+    await api.settingsSet("chat.enter_send", on ? "1" : "0").catch(() => {});
+    toast("ok", on ? "已切换：Enter 发送，Shift+Enter 换行" : "已切换：Enter 换行，Ctrl+Enter 发送");
+  }
+
   async function toggleAutoStart(v: boolean) {
     try {
       if (v) await autoStartEnable();
@@ -175,6 +202,11 @@
           <div class="sec">
             <h3>通用</h3>
             <label class="check"><input type="checkbox" checked={autoStart} onchange={(e) => toggleAutoStart((e.target as HTMLInputElement).checked)} /> 开机自动启动使驾（最小化到托盘运行）</label>
+            <label class="check"><input type="checkbox" checked={app.enterSend} onchange={toggleEnterSend} /> Enter 发送消息（默认关闭：Enter 换行，Ctrl+Enter 发送）</label>
+            <div class="rowbtns">
+              <button class="btn sm" onclick={exportData}>导出数据（项目/上下文/工作流 → 桌面）</button>
+              <button class="btn sm" onclick={importData}>导入数据（备份 JSON）</button>
+            </div>
           </div>
           <div class="sec">
             <h3>服务与解释器（保存后部分需重启使驾生效）</h3>

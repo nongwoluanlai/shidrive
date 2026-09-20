@@ -110,6 +110,11 @@ impl AgentManager {
                 }
             }
             "zcode" => {
+                // 提前校验：适配器内部对 zcode CLI 的探测更窄，找不到时会以
+                // "backend dead / zcode list failed" 这类含混报错收场
+                if self.tools.zcode_cli().is_none() {
+                    return Err("未找到 ZCode 桌面端的 zcode.cjs：请确认已安装 ZCode 桌面版；若安装在非标准位置，请在「设置 → Agent 管理」展开 ZCode，在环境变量里配置 ZCODE_BIN=<zcode.cjs 完整路径>".to_string());
+                }
                 let adapter = self.tools.zcode_adapter();
                 if !adapter.exists() {
                     return Err(format!("未找到 zcode 适配器：请在「设置 → Agent 管理」展开 ZCode 后点「安装适配器」。"));

@@ -128,9 +128,10 @@
               {#if currentContext()}<span class="sep">/</span><span class="ctx">{currentContext()?.name}</span>{/if}
             </div>
             <div class="spacer"></div>
-            {#if app.tab === "chat" && currentContext()}
+            {#if (app.tab === "chat" || app.tab === "context") && currentContext()}
               <button
                 class="btn ghost sm"
+                class:active={app.tab === "context"}
                 title="共享上下文"
                 onclick={() => (app.tab = app.tab === "context" ? "chat" : "context")}
               >

@@ -85,6 +85,8 @@ export const app = $state({
   fileTreeOpen: true,
   /** 回合结束后自增，目录树监听它自动刷新 */
   treeRev: 0,
+  /** Enter 发送消息（默认关闭：Enter 换行、Ctrl+Enter 发送） */
+  enterSend: false,
   /** open editor panel (file preview/edit) */
   editor: null as FileEditorState | null,
   /** workflows of the current project (sidebar bottom half) */

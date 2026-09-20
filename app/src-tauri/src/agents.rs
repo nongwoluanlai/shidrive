@@ -153,15 +153,23 @@ fn adapter_script_in(nm: &std::path::Path, npm_pkg: &str) -> Option<PathBuf> {
     let rel: String = match bin {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Object(m) => {
-            // 取与包名同名的 bin，否则任取第一个
-            m.get(npm_pkg)
-                .or_else(|| m.values().next())
-                .and_then(|x| x.as_str())
+            // 取与包名同名的 bin；serde_json Map 按键排序，不能取"第一个"，
+            // 按包名最后一段后缀匹配（如 @qoder-ai/qodercli → qodercli）
+            let short = npm_pkg.rsplit('/').next().unwrap_or(npm_pkg);
+            m.iter()
+                .find(|(k, _)| k.as_str() == npm_pkg || k.as_str().ends_with(short))
+                .or_else(|| m.iter().next())
+                .and_then(|(_, x)| x.as_str())
                 .map(|s| s.to_string())?
         }
         _ => return None,
     };
-    let script = pkg_dir.join(rel);
+    // bin 字段常写 "./bin/cline" 这类 POSIX 风格路径，统一按分隔符拆分重组，
+    // 避免 "pkg\./bin/cline" 混合斜杠出现在界面与命令行里
+    let script = rel
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != ".")
+        .fold(pkg_dir, |acc, seg| acc.join(seg));
     if script.exists() {
         Some(script)
     } else {
@@ -252,6 +260,63 @@ pub fn bootstrap_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> R
             "npm install 失败: {}",
             String::from_utf8_lossy(&out.stderr).trim().chars().take(300).collect::<String>()
         ))
+    }
+}
+
+/// 卸载 npm 适配器：在托管目录与 .tools/acp 中所有存在该包的位置执行
+/// npm uninstall（--ignore-scripts 防卸载钩子联网）。返回可读结果。
+pub fn uninstall_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> Result<String, String> {
+    let node = tools.node_exe();
+    let npm_cli = tools.npm_cli();
+    if npm_cli.as_os_str() == "npm" || !npm_cli.exists() {
+        return Err("未找到 npm（应随 Node 运行时发行）。请先在「环境与路径」配置可用的 Node。".into());
+    }
+    let mut targets: Vec<PathBuf> = vec![tools.acp_dir()];
+    if let Some(m) = managed_acp_dir() {
+        targets.push(m);
+    }
+    let mut removed = 0usize;
+    let mut last_err = String::new();
+    for dir in targets {
+        let nm = dir.join("node_modules");
+        let pkg_dir = npm_pkg
+            .split('/')
+            .fold(nm.clone(), |acc, seg| acc.join(seg));
+        if !pkg_dir.exists() {
+            continue;
+        }
+        let pj = dir.join("package.json");
+        if !pj.exists() {
+            std::fs::write(&pj, "{\"name\":\"shidrive-acp\",\"private\":true}\n").ok();
+        }
+        let mut c = std::process::Command::new(&node);
+        let cmd = hide_console(&mut c)
+            .arg(npm_cli.to_string_lossy().to_string())
+            .args(["uninstall", "--ignore-scripts", "--no-audit", "--no-fund"]);
+        if let Some(p) = proxy.map(|p| p.trim()).filter(|p| !p.is_empty()) {
+            cmd.args(["--proxy", p, "--https-proxy", p]);
+        }
+        let out = cmd
+            .arg(npm_pkg)
+            .current_dir(&dir)
+            .output()
+            .map_err(|e| format!("npm 启动失败: {e}"))?;
+        // 双重保险：npm 失败时直接移除包目录（幂等）
+        if out.status.success() || !pkg_dir.exists() {
+            if pkg_dir.exists() {
+                std::fs::remove_dir_all(&pkg_dir).ok();
+            }
+            removed += 1;
+        } else {
+            last_err = String::from_utf8_lossy(&out.stderr).trim().chars().take(200).collect();
+        }
+    }
+    if removed > 0 {
+        Ok(format!("已卸载 {npm_pkg}（{removed} 处）"))
+    } else if last_err.is_empty() {
+        Err(format!("{npm_pkg} 未安装"))
+    } else {
+        Err(format!("卸载失败: {last_err}"))
     }
 }
 

@@ -444,6 +444,14 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     searchIdx = -1;
   }
 
+  // ---------- 发送快捷键（默认 Enter 换行 / Ctrl+Enter 发送，设置可切换） ----------
+  $effect(() => {
+    void api
+      .settingsGet("chat.enter_send")
+      .then((v) => (app.enterSend = v === "1"))
+      .catch(() => {});
+  });
+
   // ---------- 输入框高度拖拽 ----------
   let composerH = $state(Number(localStorage.getItem("shidrive.composer.h")) || 0);
 
@@ -481,7 +489,15 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       openSearch();
       return;
     }
-    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    if (e.key !== "Enter" || e.isComposing) return;
+    // 默认：Enter 换行、Ctrl+Enter 发送；可在设置切换为 Enter 发送 / Shift+Enter 换行
+    const enterSend = app.enterSend;
+    if (enterSend) {
+      if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        void send();
+      }
+    } else if (e.ctrlKey || e.metaKey) {
       e.preventDefault();
       void send();
     }
@@ -658,7 +674,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     <textarea
       rows="3"
       style={composerH ? `height:${composerH}px` : ""}
-      placeholder="给 {agentLabel(app.agent)} 下达任务…（Enter 发送，Shift+Enter 换行，可粘贴图片）"
+      placeholder="给 {agentLabel(app.agent)} 下达任务…（{app.enterSend ? "Enter 发送，Shift+Enter 换行" : "Enter 换行，Ctrl+Enter 发送"}，可粘贴图片）"
       bind:value={input}
       onkeydown={onKeydown}
       onpaste={onPaste}

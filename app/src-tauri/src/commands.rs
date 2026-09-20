@@ -446,6 +446,35 @@ pub async fn setup_status(agents: AgentsState<'_>) -> Result<SetupStatus, String
     Ok(agents.setup_status())
 }
 
+/// 导出项目/上下文/条目/工作流到桌面 JSON 备份，返回文件路径。
+#[tauri::command]
+pub async fn data_export(db: DbState<'_>) -> Result<String, String> {
+    let data = db.export_backup()?;
+    let desktop = crate::fsops::desktop_dir()?;
+    let path = std::path::PathBuf::from(desktop)
+        .join(format!("shidrive-backup-{}.json", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    let json = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| format!("写入失败: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 从备份 JSON 导入（INSERT OR REPLACE，按 id 覆盖），返回写入摘要。
+#[tauri::command]
+pub async fn data_import(db: DbState<'_>, path: String) -> Result<String, String> {
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取失败: {e}"))?;
+    let data: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("解析失败: {e}"))?;
+    if data.get("app").and_then(|v| v.as_str()) != Some("shidrive") {
+        return Err("不是使驾的备份文件（缺少 app 标识）".into());
+    }
+    let counts = db.import_backup(&data)?;
+    let summary = counts
+        .iter()
+        .map(|(t, n)| format!("{t}×{n}"))
+        .collect::<Vec<_>>()
+        .join("，");
+    Ok(format!("导入完成：{summary}"))
+}
+
 /// 前端气泡提示落日志文件（error/warn 记录详情，便于远程排查）。
 #[tauri::command]
 pub async fn ui_log(kind: String, text: String) -> Result<(), String> {
@@ -465,6 +494,24 @@ pub async fn fs_open_vscode(agents: AgentsState<'_>, path: String) -> Result<(),
         .vscode_exe()
         .ok_or_else(|| "未找到 VS Code：请在「设置 → 环境与路径」填写 code 路径".to_string())?;
     fsops::open_in_vscode(&code.to_string_lossy(), &path)
+}
+
+/// 卸载 npm 适配器（托管目录与 .tools/acp 中所有安装位置）。
+#[tauri::command]
+pub async fn agents_uninstall(agents: AgentsState<'_>, db: DbState<'_>, id: String) -> Result<String, String> {
+    let sp = crate::agents::spec(&id).ok_or_else(|| format!("未知的 Agent：{id}"))?;
+    let pkg = sp.npm.as_ref().ok_or_else(|| format!("{} 为二进制发行，无需卸载适配器。", sp.name))?;
+    let proxy = db
+        .get_setting("network.proxy")
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let tools = agents.tools.clone();
+    let pkg2 = pkg.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::agents::uninstall_adapter(&tools, &pkg2, proxy.as_deref()))
+        .await
+        .map_err(|e| format!("卸载任务失败: {e}"))?
 }
 
 /// Node 运行时探测结果（版本 / 来源 / 是否满足 ≥22）。
