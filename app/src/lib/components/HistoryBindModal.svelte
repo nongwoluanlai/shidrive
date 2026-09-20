@@ -124,7 +124,8 @@
 
 <style>
   .modal.wide {
-    min-width: 780px;
+    min-width: 980px;
+    max-width: 94vw;
     max-height: 80vh;
   }
   .body {

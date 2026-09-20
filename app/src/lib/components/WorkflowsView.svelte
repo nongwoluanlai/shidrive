@@ -443,25 +443,23 @@
       const d = Math.max(0, depth[i] < 0 ? 0 : depth[i]);
       (perLayer[d] = perLayer[d] || []).push(i);
     }
-    // 纵向居中：第一层以画布纵向中心为基准；之后每层围绕上一层的平均 y 居中
-    const CENTER_Y = 340;
-    let prevCenter = CENTER_Y;
+    // 纵向排布：第一层在画布顶部；层沿 Y 轴向下逐层展开，行内节点围绕
+    // 父层节点的平均 x 横向居中（连线自上而下，端口上下相对）
     for (const d of Object.keys(perLayer).map(Number).sort((a, b) => a - b)) {
       const idxs = perLayer[d];
-      const span = (idxs.length - 1) * (NODE_H + 60);
-      let center = prevCenter;
+      let center = 480;
       if (d > 0) {
         const parents = idxs
           .map((i) => w.edges.filter((e) => e.to === i).map((e) => e.from))
           .flat()
-          .filter((i) => w.steps[i]?.y !== undefined);
-        if (parents.length) center = parents.reduce((acc, i) => acc + w.steps[i].y + NODE_H / 2, 0) / parents.length;
+          .filter((i) => w.steps[i]?.x !== undefined);
+        if (parents.length) center = parents.reduce((acc, i) => acc + w.steps[i].x + nodeW(w.steps[i]) / 2, 0) / parents.length;
       }
+      const span = (idxs.length - 1) * (NODE_W + 70);
       idxs.forEach((i, k) => {
-        w.steps[i].x = 60 + d * 310;
-        w.steps[i].y = Math.max(40, Math.round(center - span / 2 + k * (NODE_H + 60)));
+        w.steps[i].y = 40 + d * (NODE_H + 90);
+        w.steps[i].x = Math.max(40, Math.round(center - span / 2 + k * (NODE_W + 70)));
       });
-      prevCenter = idxs.reduce((acc, i) => acc + w.steps[i].y + NODE_H / 2, 0) / idxs.length;
     }
   }
 

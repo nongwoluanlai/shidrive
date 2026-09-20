@@ -52,19 +52,26 @@
     void loadRegistry();
   });
 
-  // 展开行渲染完成后异步补全草稿（先取 override，再同步远端完整配置）
+  // 展开行渲染完成后异步补全草稿（先取 override + 自动探测环境变量预填，
+  // 再同步远端完整配置覆盖）
   $effect(() => {
     const id = expanded;
     if (!id || drafts[id]) return;
     const r = registry.find((x) => x.id === id);
-    drafts[id] = { command: r?.manual_command ?? "", args: "", env: "" };
+    // 环境变量草稿预填自动探测值（ZCODE_BIN/ZCODE_NODE/CODEX_PATH…），可编辑后保存
+    const autoEnv = Object.entries(r?.auto_env ?? {})
+      .map(([k, v]) => `${k}=${v}`)
+      .join("\n");
+    drafts[id] = { command: r?.manual_command ?? "", args: "", env: autoEnv };
     void api
       .agentConfigGet(id)
       .then((l) => {
         drafts[id] = {
           command: l.command ?? "",
           args: (l.args ?? []).join("\n"),
-          env: Object.entries(l.env ?? {}).map(([k, v]) => `${k}=${v}`).join("\n"),
+          env: l.env && Object.keys(l.env).length
+            ? Object.entries(l.env ?? {}).map(([k, v]) => `${k}=${v}`).join("\n")
+            : autoEnv,
         };
       })
       .catch(() => {});
@@ -166,9 +173,10 @@
       if (i > 0) env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
     }
     try {
+      const hasEnv = Object.keys(env).length > 0;
       await api.agentConfigSet(
         r.id,
-        d.command.trim()
+        d.command.trim() || hasEnv
           ? { command: d.command.trim(), args: d.args.split("\n").map((x) => x.trim()).filter(Boolean), env }
           : null,
       );
@@ -218,10 +226,7 @@
         </div>
         {#if expanded === r.id}
           <div class="row-body">
-            <p class="help-text">{r.help}</p>
-            {#if r.auto_env && Object.keys(r.auto_env).length}
-              <p class="help-text">自动注入的环境变量（连接时生效）：{Object.entries(r.auto_env).map(([k, v]) => `${k}=${v}`).join("　·　")}</p>
-            {/if}
+<p class="help-text">{r.help}</p>
             {#if r.npm && !r.adapter_ready}
               <div class="cfg-line">
                 <button class="btn sm primary" disabled={busy === r.id} onclick={() => install(r)}>

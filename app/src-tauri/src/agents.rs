@@ -243,7 +243,9 @@ pub fn bootstrap_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> R
         if let Some(r) = registry {
             out.args(["--registry", r]);
         }
-        out.arg(npm_pkg).current_dir(&acp_dir).output()
+        // @latest：安装/重装都取最新版（旧版适配器缺少新版 CLI 需要的
+        // ZCODE_BUILTIN_PROVIDER_CONFIG_FILE 注入，会导致 provider 配置报错）
+        out.arg(format!("{npm_pkg}@latest")).current_dir(&acp_dir).output()
     };
     let out = run(None, false).map_err(|e| format!("npm 启动失败: {e}"))?;
     // 常规安装失败 → 跳过 postinstall 脚本重试一次（镜像源）

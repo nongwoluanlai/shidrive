@@ -116,7 +116,10 @@ impl AgentManager {
         let node = self.tools.node_exe();
         let mut cmd = tokio::process::Command::new(&node);
         cmd.arg(zc)
-            .stdin(std::process::Stdio::null())
+            // 与适配器真实启动完全一致：zcode app-server --stdio
+            // （裸启动会进 TUI 分支，误报 @zcode/tui 缺失）
+            .args(["app-server", "--stdio"])
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
         #[cfg(windows)]
