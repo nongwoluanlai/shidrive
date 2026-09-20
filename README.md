@@ -1,8 +1,10 @@
 # 使驾 ShiDrive
 
-> AI 是发动机，Agent 是车辆，使驾是驾驶席。
+English | [中文](README.md)
 
-使驾（ShiDrive）是一款基于 **Tauri 2** 的本地 AI 开发工作台：把项目、工作上下文、AI Agent 会话与工作流放在同一驾驶席上统一管理。它不是又一个 AI 编码工具，而是让你"驾驶"多个 ACP Agent（Codex / ZCode / Claude / Cline / Cursor / Qoder …）完成日常开发工作。
+> **One Context. Any Harness.** —— 让 Harness 并驾齐驱。
+
+使驾（ShiDrive）是一款基于 **Tauri 2** 的本地 AI 开发工作台：把项目、工作上下文、AI Agent 会话与工作流放在同一驾驶席上统一管理。它不是又一个 AI 编码工具，而是让你"驾驶"多个 ACP Agent（Codex / ZCode / Claude / Cline / Cursor / Qoder …）完成日常开发工作——同一份上下文，驱动任意 Harness。
 
 ## 功能一览
 
@@ -13,7 +15,8 @@
 - **共享上下文 MCP**：本地 HTTP MCP 服务（默认 `127.0.0.1:8345`），把项目上下文以 git 式提交模型开放给 Agent——`context_get/update/history/search` + 工作流六工具，带版本冲突检测与字节限额。
 - **Coding MCP（独立模式）**：`shidrive.exe --coding-mcp` 以独立进程暴露文件与命令工具（路径越界防护、Token/Basic 认证、执行开关）。
 - **文件树与编辑器**：目录树、系统剪贴板互操作、终端/资源管理器打开、内置编辑器。
-- **自定义主题**：深浅色、强调色、圆角、字号；自定义标题栏与对话框，无系统弹窗。
+- **桌面集成**：自定义标题栏与对话框、深浅色主题；关闭窗口最小化到托盘常驻（右键打开/退出）、开机自启可选。
+- **免环境依赖**：Node 运行时（≥22）自动检测，或一键下载便携版到用户数据目录（不影响系统环境）；适配器按需安装，全程可配代理。
 
 ## 架构
 
@@ -43,18 +46,28 @@ pnpm tauri build --no-bundle   # 仅产出 target/release/shidrive.exe
 
 要求：Rust 1.88+、Node ≥ 20（构建）；Windows 10/11（WebView2）。详细说明见 [app/README.md](app/README.md)。
 
-## 发布结构（免环境依赖）
+## 运行时与适配器（免环境依赖）
 
-```
-ShiDrive/
-├── shidrive.exe
-└── .tools/
-    └── node22/        # Node ≥22 便携版（含 npm），适配器安装与启动使用
-```
-
-- 各 ACP 工具的 CLI（codex.exe / zcode.cjs / claude 等）按标准路径自动发现。
-- 适配器在「设置 → Agent 管理」中按需安装到用户数据目录，可用代理加速。
+- **Node 运行时**：自动检测系统 Node（≥22 才自动采用）；不满足时可在设置中一键下载便携版
+  node22（约 35MB）到用户数据目录，或自行指定路径——不影响系统 Node 环境。
+  随包分发时把 node22 放在 `shidrive.exe` 旁的 `.tools\node22\` 即可被自动发现。
+- **适配器**：在「设置 → Agent 管理」展开对应工具点「安装适配器」，自动 `npm install` 到
+  用户数据目录 `%APPDATA%\com.shidrive.desktop\tools\acp`（`--omit=optional` 跳过大体积
+  平台二进制；默认源失败自动改用 npmmirror 镜像；代理仅作用于使驾自身的下载）。
+- **各工具 CLI**（codex.exe / zcode.cjs / claude 等）按标准路径自动发现，按需登录。
 - `--debug` 启动写文件日志到 `%APPDATA%\com.shidrive.desktop\logs\shidrive.log`。
+
+## 参考与致谢
+
+- [Zed](https://github.com/zed-industries/zed) —— ACP 连接层（`agent_servers`/`acp.rs`）与
+  "适配器按需安装到数据目录"的托管形式参考。
+- [Agent Client Protocol](https://agentclientprotocol.com) /
+  [agentclientprotocol/registry](https://github.com/agentclientprotocol/registry) —— 协议规范
+  与 Agent 注册表；适配器清单参考其 registry 数据。
+- 适配器包：[@agentclientprotocol/codex-acp](https://www.npmjs.com/package/@agentclientprotocol/codex-acp)、
+  [zcode-acp-server](https://www.npmjs.com/package/zcode-acp-server)、
+  [@zed-industries/claude-code-acp](https://www.npmjs.com/package/@zed-industries/claude-code-acp)。
+- [Tauri](https://tauri.app) / [Svelte](https://svelte.dev)。
 
 ## 状态
 

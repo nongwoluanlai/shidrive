@@ -446,6 +446,29 @@ pub async fn setup_status(agents: AgentsState<'_>) -> Result<SetupStatus, String
     Ok(agents.setup_status())
 }
 
+/// Node 运行时探测结果（版本 / 来源 / 是否满足 ≥22）。
+#[tauri::command]
+pub async fn node_status(agents: AgentsState<'_>) -> Result<crate::node_rt::NodeStatus, String> {
+    let tools = agents.tools.clone();
+    tauri::async_runtime::spawn_blocking(move || Ok(crate::node_rt::node_status(&tools)))
+        .await
+        .map_err(|e| format!("探测失败: {e}"))?
+}
+
+/// 下载 node22 便携版到用户数据目录（仅 Windows；代理只作用于本次下载）。
+#[tauri::command]
+pub async fn node_download(db: DbState<'_>) -> Result<String, String> {
+    let proxy = db
+        .get_setting("network.proxy")
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    tauri::async_runtime::spawn_blocking(move || crate::node_rt::download_node22(proxy.as_deref()))
+        .await
+        .map_err(|e| format!("下载任务失败: {e}"))?
+}
+
 #[tauri::command]
 pub async fn agent_config_get(agents: AgentsState<'_>, agent_type: String) -> Result<AgentLaunch, String> {
     agents.launch_for(&agent_type).await

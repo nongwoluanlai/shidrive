@@ -314,3 +314,11 @@ export interface SessionReadyInfo {
     [k: string]: unknown;
   };
 }
+
+export interface NodeStat {
+  path: string;
+  version: string;
+  major: number;
+  ok: boolean;
+  source: string;
+}

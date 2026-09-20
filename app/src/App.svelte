@@ -150,8 +150,8 @@
             <div class="empty welcome">
               <img src={logo} alt="使驾" class="wlogo" />
               <h2>欢迎来到使驾 ShiDrive</h2>
-              <p>统一管理项目、工作上下文、AI Agent 会话与工作流</p>
-              <p class="hint">左侧选择或创建一个项目开始 · AI 是发动机，Agent 是车辆，使驾是驾驶席</p>
+              <p>One Context. Any Harness. —— 让 Harness 并驾齐驱</p>
+              <p class="hint">统一管理项目、工作上下文、AI Agent 会话与工作流 · 左侧选择或创建一个项目开始</p>
             </div>
           {/if}
         </div>

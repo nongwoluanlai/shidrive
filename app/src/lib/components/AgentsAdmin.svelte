@@ -21,13 +21,35 @@
   }
   let expanded = $state<string | null>(null);
   let busy = $state<string | null>(null);
+  // 启用顺序（决定行的显示顺序：启用的在前按优先级排，停用的按注册表顺序跟在后面）
+  let enabledOrder = $state<string[]>([]);
   // 手动配置草稿（id → {command,args,env}）
   let drafts = $state<Record<string, Draft>>({});
+
+  const sortedRegistry = $derived.by(() => {
+    const rank = new Map(enabledOrder.map((id, i) => [id, i]));
+    return [...registry].sort((a, b) => {
+      const ia = rank.get(a.id);
+      const ib = rank.get(b.id);
+      if (ia !== undefined && ib !== undefined) return ia - ib;
+      if (ia !== undefined) return -1;
+      if (ib !== undefined) return 1;
+      return 0;
+    });
+  });
 
   // 渲染期只读；缺省草稿不写状态，交给下方 $effect 补齐
   function draftOf(r: AgentEnvStatusItem): Draft {
     return drafts[r.id] ?? { command: r.manual_command ?? "", args: "", env: "" };
   }
+
+  // 挂载时拉一次启用顺序（设置页可能直接落在该 tab）
+  $effect(() => {
+    void api
+      .agentsEnabledGet()
+      .then((e: string[]) => (enabledOrder = e))
+      .catch(() => {});
+  });
 
   // 展开行渲染完成后异步补全草稿（先取 override，再同步远端完整配置）
   $effect(() => {
@@ -77,6 +99,7 @@
 
   async function refreshEnabled() {
     const enabled: string[] = await api.agentsEnabledGet().catch((): string[] => []);
+    enabledOrder = enabled;
     const reg = await api.agentsRegistry().catch(() => []);
     registry = reg;
     app.agents = enabled
@@ -148,7 +171,7 @@
 <div class="agents-admin">
   <p class="hint">默认全部停用。启用后会话页顶部出现对应 Agent 标签；顺序即标签顺序（用 ↑↓ 调整）。npm 类工具：展开该行点「安装适配器」自动下载到用户数据目录（跳过大体积平台二进制，可配代理）；二进制类（Cursor/OpenCode）手动填命令路径。</p>
   <div class="rows">
-    {#each registry as r (r.id)}
+    {#each sortedRegistry as r (r.id)}
       <div class="agent-row" class:open={expanded === r.id} class:on={r.enabled}>
         <div class="row-head">
           <input

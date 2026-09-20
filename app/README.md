@@ -74,13 +74,14 @@ app/
 - Rust 1.88+、Node ≥ 20 构建；**运行 ZCode 桥接需要 Node ≥ 22**（未随包内置以控制体积；
   在 `.tools/node22` 放置便携版即可被自动发现，或在设置中指定路径）。
 - Windows 10/11（WebView2）。
+- **Node 运行时**：自动检测系统 Node（≥22 才自动采用）；不满足时可在「设置 → 环境与路径」
+  一键下载便携版 node22（Windows x64，解压到用户数据目录，不影响系统环境），或手动指定路径。
+  随包分发时放在 `shidrive.exe` 旁的 `.tools\node22\` 也会被自动发现。
 - 适配器（Zed 式按需安装，无需手动准备）：在「设置 → Agent 管理」展开对应工具点
   「安装适配器」，自动 `npm install` 到用户数据目录 `%APPDATA%\com.shidrive.desktop\tools\acp`
   （`--omit=optional` 跳过大体积平台二进制；默认源失败自动改用 npmmirror 镜像；
   可在「环境与路径」配置仅用于此处的 HTTP 代理）。
   `.tools/acp` 下的手工安装仍然优先被识别。
-- **发布结构（免环境依赖）**：`shidrive.exe` 旁放 `.tools\node22\`（Node ≥22 便携版，
-  含自带 npm）即可在无 Node 的机器上安装适配器；Node 也可在设置中手动指定。
 - Codex CLI / ZCode 桌面端按标准路径自动发现；ZCode CLI 路径可在「Agent 管理」的
   环境变量里用 `ZCODE_BIN` 指定。
 

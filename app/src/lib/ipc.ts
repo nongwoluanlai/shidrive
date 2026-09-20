@@ -16,6 +16,7 @@ import type {
   ScheduleConfig,
   SessionInfo,
   SetupStatus,
+  NodeStat,
   Workflow,
   WorkflowRun,
   WorkflowStep,
@@ -125,6 +126,8 @@ export const api = {
   settingsGet: (key: string) => invoke<string | null>("settings_get", { key }),
   settingsSet: (key: string, value: string) => invoke<void>("settings_set", { key, value }),
   setupStatus: () => invoke<SetupStatus>("setup_status"),
+  nodeStatus: () => invoke<NodeStat>("node_status"),
+  nodeDownload: () => invoke<string>("node_download"),
   agentConfigGet: (agent_type: string) => invoke<AgentLaunch>("agent_config_get", { agentType: agent_type }),
   agentConfigSet: (agent_type: string, launch: AgentLaunch | null) =>
     invoke<void>("agent_config_set", { agentType: agent_type, launch }),

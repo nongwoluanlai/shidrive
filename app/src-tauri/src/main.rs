@@ -10,6 +10,7 @@ mod fsops;
 mod mcp;
 mod manager;
 mod models;
+mod node_rt;
 mod setup;
 
 use std::sync::Arc;
@@ -70,6 +71,14 @@ fn init_logger(debug: bool) {
     log::set_max_level(if debug { LevelFilter::Info } else { LevelFilter::Warn });
 }
 
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
 fn main() {
     // 独立模式：shidrive.exe --coding-mcp [--port N] [--root DIR] [--token T] [--bind ADDR]
     let argv: Vec<String> = std::env::args().collect();
@@ -82,13 +91,48 @@ fn main() {
     std::env::set_var("SHIDRIVE_DEBUG", if debug_mode { "1" } else { "0" });
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
+            use tauri::{
+                menu::{Menu, MenuItem},
+                tray::{TrayIconBuilder, TrayIconEvent},
+            };
             if std::env::var("SHIDRIVE_DEBUG").as_deref() == Ok("1") {
                 #[cfg(debug_assertions)]
                 if let Some(win) = app.get_webview_window("main") {
                     let _ = win.open_devtools();
                 }
             }
+            // 托盘常驻：左键恢复主窗，右键菜单 打开主页面 / 退出
+            let open = MenuItem::with_id(app, "open", "打开主页面", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let mut tray = TrayIconBuilder::with_id("main-tray")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "open" => show_main_window(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
+                    }
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            tray.build(app)?;
+
             let data_dir = app.path().app_data_dir().expect("no app data dir");
             std::fs::create_dir_all(&data_dir).ok();
             let db_path = data_dir.join("shidrive.db");
@@ -107,6 +151,13 @@ fn main() {
             app.manage(agents);
             app.manage(engine);
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // 关闭即隐藏到托盘，保持后台运行（MCP / 定时工作流不中断）
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::projects_list,
@@ -165,6 +216,8 @@ fn main() {
             commands::settings_get,
             commands::settings_set,
             commands::setup_status,
+            commands::node_status,
+            commands::node_download,
             commands::agent_config_get,
             commands::agent_config_set,
             commands::agents_registry,

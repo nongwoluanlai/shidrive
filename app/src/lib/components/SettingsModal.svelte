@@ -2,8 +2,9 @@
   import { app, toast, saveTheme } from "../state.svelte";
   import { api } from "../ipc";
   import { ACCENTS } from "../theme";
+  import { isEnabled as autoStartEnabled, enable as autoStartEnable, disable as autoStartDisable } from "@tauri-apps/plugin-autostart";
   import AgentsAdmin from "./AgentsAdmin.svelte";
-  import type { AgentEnvStatusItem } from "../types";
+  import type { AgentEnvStatusItem, NodeStat } from "../types";
 
   let tab = $state<"agents" | "theme" | "paths">("theme");
   let registry = $state<AgentEnvStatusItem[]>([]);
@@ -14,6 +15,42 @@
   let nodePath = $state("");
   let proxy = $state("");
   let pathsLoaded = $state(false);
+  let nodeStat = $state<NodeStat | null>(null);
+  let nodeBusy = $state(false);
+  let autoStart = $state(false);
+
+  async function loadNodeStatus() {
+    nodeStat = await api.nodeStatus().catch(() => null);
+  }
+
+  async function loadAutoStart() {
+    autoStart = await autoStartEnabled().catch(() => false);
+  }
+
+  async function toggleAutoStart(v: boolean) {
+    try {
+      if (v) await autoStartEnable();
+      else await autoStartDisable();
+      autoStart = v;
+      toast("ok", v ? "已开启开机自动启动" : "已关闭开机自动启动");
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
+  async function downloadNode() {
+    nodeBusy = true;
+    toast("info", "正在下载 node22 便携版（Windows x64）…");
+    try {
+      const msg = await api.nodeDownload();
+      toast("ok", msg);
+      await loadNodeStatus();
+    } catch (e) {
+      toast("error", String(e));
+    } finally {
+      nodeBusy = false;
+    }
+  }
 
   async function loadRegistry() {
     registry = await api.agentsRegistry().catch(() => []);
@@ -24,6 +61,8 @@
     pythonPath = (await api.settingsGet("tools.python").catch(() => null)) ?? "";
     nodePath = (await api.settingsGet("tools.node").catch(() => null)) ?? "";
     proxy = (await api.settingsGet("network.proxy").catch(() => null)) ?? "";
+    void loadNodeStatus();
+    void loadAutoStart();
     pathsLoaded = true;
   }
 
@@ -130,23 +169,35 @@
           <AgentsAdmin bind:registry loadRegistry={loadRegistry} />
         {:else}
           <div class="sec">
+            <h3>通用</h3>
+            <label class="check"><input type="checkbox" checked={autoStart} onchange={(e) => toggleAutoStart((e.target as HTMLInputElement).checked)} /> 开机自动启动使驾（最小化到托盘运行）</label>
+          </div>
+          <div class="sec">
             <h3>服务与解释器（保存后部分需重启使驾生效）</h3>
             <div class="field"><label>MCP 服务端口（共享上下文 /skills 与 /mcp）</label><input bind:value={mcpPort} placeholder="8345" /></div>
             <div class="field"><label>Python 解释器路径（工作流 python 节点使用，留空自动检测）</label><input bind:value={pythonPath} placeholder="自动检测" /></div>
           </div>
           <div class="sec">
-            <h3>Node 运行时（适配器安装与启动使用）</h3>
-            <div class="field"><label>Node 路径（发布包内置 node22，留空即用内置）</label><input bind:value={nodePath} placeholder="内置" /></div>
-            <p class="note">发布结构：shidrive.exe 旁的 .tools\node22（含 npm）。也可指向系统安装的 Node ≥ 22。</p>
+            <h3>Node 运行时（适配器安装与启动使用，需 ≥ 22）</h3>
+            <div class="field"><label>Node 路径（node.exe，留空自动检测）</label>
+              <input bind:value={nodePath} placeholder={nodeStat?.ok ? `已自动使用 ${nodeStat.version}（${nodeStat.source}）` : "请指定 Node 路径或点击下载"} />
+            </div>
+            {#if nodeStat && !nodeStat.ok}
+              <p class="note warn">{nodeStat.source === "未找到" ? "未检测到可用的 Node（≥ 22）" : `检测到 ${nodeStat.version || "不可用的 Node"}（${nodeStat.source}），版本过低或不可用`}</p>
+            {/if}
+            <div class="rowbtns">
+              <button class="btn sm" disabled={nodeBusy} onclick={downloadNode}>{nodeBusy ? "下载中…" : "下载 node22（Windows x64）"}</button>
+            </div>
+            <p class="note">下载解压到用户数据目录 tools\node22，不影响系统 Node 环境；GitHub 较慢可先在下方填写代理。也可自行指定系统安装的 Node ≥ 22 路径。</p>
           </div>
           <div class="sec">
             <h3>网络代理（仅使驾自身依赖安装使用）</h3>
             <div class="field"><label>HTTP 代理（如 http://127.0.0.1:10809）</label><input bind:value={proxy} placeholder="留空=直连" /></div>
-            <p class="note">只影响「安装适配器」等使驾自身的下载；工作流、ACP 会话、MCP 均不走此代理。</p>
+            <p class="note">只影响「安装适配器」与 node22 下载；工作流、ACP 会话、MCP 均不走此代理。</p>
           </div>
           <div class="rowbtns">
             <button class="btn sm primary" onclick={() => savePaths()}>保存路径与端口</button>
-            <button class="btn sm" onclick={() => savePaths(true)}>清除自定义（恢复内置 / 自动检测）</button>
+            <button class="btn sm" onclick={() => savePaths(true)}>清除自定义（恢复自动检测）</button>
           </div>
         {/if}
       </div>
@@ -203,6 +254,20 @@
   }
   .sec .field label {
     color: var(--text-dim);
+  }
+  .check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.9em;
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+  .check input {
+    accent-color: var(--accent);
+  }
+  .note.warn {
+    color: var(--danger);
   }
   .note {
     color: var(--text-faint);

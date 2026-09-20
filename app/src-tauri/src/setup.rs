@@ -57,9 +57,20 @@ impl Tools {
         }
     }
 
+    pub fn node_override(&self) -> Option<&PathBuf> {
+        self.node_override.as_ref()
+    }
+
     pub fn node_exe(&self) -> PathBuf {
         if let Some(n) = &self.node_override {
             return n.clone();
+        }
+        // 用户数据目录的 node22（「下载」按钮落位处）
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let p = PathBuf::from(appdata).join("com.shidrive.desktop").join("tools").join("node22").join("node.exe");
+            if p.exists() {
+                return p;
+            }
         }
         let portable = self.tools_dir.join("node22").join("node.exe");
         if portable.exists() {

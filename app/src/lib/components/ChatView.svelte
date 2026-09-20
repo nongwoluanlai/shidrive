@@ -444,6 +444,26 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     searchIdx = -1;
   }
 
+  // ---------- 输入框高度拖拽 ----------
+  let composerH = $state(Number(localStorage.getItem("shidrive.composer.h")) || 0);
+
+  function startResize(e: PointerEvent) {
+    e.preventDefault();
+    const startY = e.clientY;
+    const ta = document.querySelector(".input-row textarea") as HTMLElement | null;
+    const startH = composerH || ta?.offsetHeight || 84;
+    const move = (ev: PointerEvent) => {
+      composerH = Math.min(460, Math.max(52, Math.round(startH - (ev.clientY - startY))));
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      localStorage.setItem("shidrive.composer.h", String(composerH));
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }
+
   function onSearchKeydown(e: KeyboardEvent) {
     if (e.key === "Enter") {
       e.preventDefault();
@@ -633,9 +653,11 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
         {/each}
       </div>
     {/if}
+    <div class="grow-handle" title="拖拽调整输入框高度" onpointerdown={startResize}><span></span></div>
     <div class="input-row">
     <textarea
       rows="3"
+      style={composerH ? `height:${composerH}px` : ""}
       placeholder="给 {agentLabel(app.agent)} 下达任务…（Enter 发送，Shift+Enter 换行，可粘贴图片）"
       bind:value={input}
       onkeydown={onKeydown}
@@ -907,10 +929,29 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   }
   .input-row textarea {
     flex: 1;
-    max-height: 200px;
+    max-height: 460px;
     background: transparent;
     border: none;
     padding: 6px 4px;
+    resize: none;
+  }
+  .grow-handle {
+    height: 8px;
+    cursor: ns-resize;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    touch-action: none;
+  }
+  .grow-handle span {
+    width: 42px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--border);
+  }
+  .grow-handle:hover span {
+    background: var(--text-faint);
   }
   .up {
     position: absolute;
