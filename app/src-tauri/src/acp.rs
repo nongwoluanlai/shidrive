@@ -544,17 +544,32 @@ impl AcpConnection {
     }
 
     /// List sessions known to the adapter (session/list). Returns normalized entries.
+    /// 支持游标分页：循环拉取直到没有 nextCursor（上限 50 页），避免会话列表不完整。
     pub async fn session_list(&self) -> Result<Vec<crate::models::SessionInfo>, String> {
-        let res = self
-            .request("session/list", json!({}), Some(Duration::from_secs(20)))
-            .await?;
-        let arr = if let Some(a) = res.get("sessions").and_then(|s| s.as_array()) {
-            a.clone()
-        } else if let Some(a) = res.as_array() {
-            a.clone()
-        } else {
-            Vec::new()
-        };
+        let mut arr: Vec<serde_json::Value> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _page in 0..50 {
+            let mut params = json!({});
+            if let Some(c) = &cursor {
+                params["cursor"] = json!(c);
+            }
+            let res = self
+                .request("session/list", params, Some(Duration::from_secs(30)))
+                .await?;
+            if let Some(a) = res.get("sessions").and_then(|s| s.as_array()) {
+                arr.extend(a.iter().cloned());
+            } else if let Some(a) = res.as_array() {
+                arr.extend(a.iter().cloned());
+            }
+            cursor = res
+                .get("nextCursor")
+                .or_else(|| res.get("next_cursor"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if cursor.is_none() {
+                break;
+            }
+        }
         let mut out = Vec::new();
         for item in arr {
             let sid = item

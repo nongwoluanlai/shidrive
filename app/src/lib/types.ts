@@ -14,6 +14,7 @@ export interface AgentEnvStatusItem {
   manual_command: string;
   node_ready: boolean;
   node_path: string;
+  auto_env: Record<string, string>;
 }
 
 export interface Project {
@@ -221,6 +222,7 @@ export interface SetupStatus {
   codex_adapter_path: string;
   zcode_adapter_path: string;
   python_path: string;
+  vscode_path: string;
   tools_dir: string;
   data_dir: string;
   mcp_port: number;

@@ -90,6 +90,14 @@
     nodePath = (await api.settingsGet("tools.node").catch(() => null)) ?? "";
     proxy = (await api.settingsGet("network.proxy").catch(() => null)) ?? "";
     vscodePath = (await api.settingsGet("tools.vscode").catch(() => null)) ?? "";
+    // 检测到 VS Code 而设置里没填 → 自动填入（保存后持久化）
+    if (!vscodePath.trim()) {
+      const det = await api.setupStatus().then((st) => st.vscode_path).catch(() => "");
+      if (det) {
+        vscodePath = det;
+        void api.settingsSet("tools.vscode", det).catch(() => {});
+      }
+    }
     void loadNodeStatus();
     void loadAutoStart();
     pathsLoaded = true;

@@ -219,6 +219,9 @@
         {#if expanded === r.id}
           <div class="row-body">
             <p class="help-text">{r.help}</p>
+            {#if r.auto_env && Object.keys(r.auto_env).length}
+              <p class="help-text">自动注入的环境变量（连接时生效）：{Object.entries(r.auto_env).map(([k, v]) => `${k}=${v}`).join("　·　")}</p>
+            {/if}
             {#if r.npm && !r.adapter_ready}
               <div class="cfg-line">
                 <button class="btn sm primary" disabled={busy === r.id} onclick={() => install(r)}>

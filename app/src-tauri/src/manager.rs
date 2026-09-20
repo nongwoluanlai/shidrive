@@ -80,6 +80,36 @@ impl AgentManager {
     }
 
     /// Effective launch config: user override or auto-discovered default (registry-driven).
+    /// zcode.cjs 拷贝不完整时，从完整桌面安装复制 provider 目录过来。
+    fn zcode_repair_provider(&self, zc: &std::path::Path) -> Result<String, String> {
+        let glm = zc.parent().ok_or("无法定位 zcode.cjs 目录")?;
+        let dst = glm.join("provider");
+        if dst.join("zcode-builtin.json").exists() {
+            return Ok("provider 配置已存在".to_string());
+        }
+        for src in self.tools.zcode_desktop_glm_dirs() {
+            let src_provider = src.join("provider");
+            if !src_provider.join("zcode-builtin.json").exists() {
+                continue;
+            }
+            std::fs::create_dir_all(&dst).map_err(|e| format!("创建 provider 目录失败: {e}"))?;
+            let mut copied = 0;
+            if let Ok(entries) = std::fs::read_dir(&src_provider) {
+                for f in entries.flatten() {
+                    if f.path().is_file() {
+                        if std::fs::copy(f.path(), dst.join(f.file_name())).is_ok() {
+                            copied += 1;
+                        }
+                    }
+                }
+            }
+            if copied > 0 {
+                return Ok(format!("已从 {} 复制 {copied} 个 provider 配置文件到 {}", src_provider.display(), dst.display()));
+            }
+        }
+        Err("本机没有找到完整的 ZCode 桌面安装（含 provider 配置）可复制。请重装/修复 ZCode 桌面版，或把完整安装的 resources\\glm\\provider 目录补到 zcode.cjs 旁边".to_string())
+    }
+
     /// zcode 后端预检：用与适配器相同的方式（ZCODE_NODE + zcode.cjs）拉起后端 3 秒探活。
     /// 启动即退（非 0）时把真实 stderr 返回给用户，替代含混的 "backend dead"。
     async fn zcode_preflight(&self, zc: &std::path::Path) -> Result<(), String> {
@@ -156,7 +186,21 @@ impl AgentManager {
                     None => return Err("未找到 ZCode 桌面端的 zcode.cjs：请确认已安装 ZCode 桌面版；若安装在非标准位置，请在「设置 → Agent 管理」展开 ZCode，在环境变量里配置 ZCODE_BIN=<zcode.cjs 完整路径>".to_string()),
                 };
                 log::info!("[zcode] cli resolved: {}", zc.display());
-                self.zcode_preflight(&zc).await?;
+                if let Err(e) = self.zcode_preflight(&zc).await {
+                    // zcode.cjs 拷贝不完整（缺 provider 配置）时，尝试从完整桌面安装
+                    // 自动补全 provider 目录并重试一次
+                    let missing = e.contains("Provider Config") || e.contains("无法定位");
+                    if !missing {
+                        return Err(e);
+                    }
+                    match self.zcode_repair_provider(&zc) {
+                        Ok(msg) => {
+                            log::info!("[zcode] provider repaired: {msg}");
+                            self.zcode_preflight(&zc).await?;
+                        }
+                        Err(re) => return Err(format!("{e}；自动补全失败：{re}")),
+                    }
+                }
                 let adapter = self.tools.zcode_adapter();
                 if !adapter.exists() {
                     return Err(format!("未找到 zcode 适配器：请在「设置 → Agent 管理」展开 ZCode 后点「安装适配器」。"));
@@ -554,6 +598,7 @@ impl AgentManager {
             codex_adapter_path: self.tools.codex_adapter().to_string_lossy().to_string(),
             zcode_adapter_path: self.tools.zcode_adapter().to_string_lossy().to_string(),
             python_path: self.tools.python_exe().to_string_lossy().to_string(),
+            vscode_path: self.tools.vscode_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
             tools_dir: self.tools.tools_dir.to_string_lossy().to_string(),
             data_dir: self.app.path().app_data_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
             mcp_port: crate::mcp::port_from_settings(&self.db),

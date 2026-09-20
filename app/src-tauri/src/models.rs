@@ -426,6 +426,7 @@ pub struct SetupStatus {
     pub codex_adapter_path: String,
     pub zcode_adapter_path: String,
     pub python_path: String,
+    pub vscode_path: String,
     pub tools_dir: String,
     pub data_dir: String,
     pub mcp_port: i64,

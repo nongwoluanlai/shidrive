@@ -348,11 +348,12 @@
     window.addEventListener("pointerup", onConnectUp, { once: true });
   }
 
-  // 竖向连线：从上游节点底部中点 → 下游节点顶部中点（S 形贝塞尔）
+  // 正交折线：上游底部中点 → 垂直 → 水平 → 垂直 → 下游顶部中点（固定端口）
   function edgePath(a: WorkflowStep, b: WorkflowStep): string {
     const x1 = a.x + nodeW(a) / 2, y1 = a.y + NODE_H, x2 = b.x + nodeW(b) / 2, y2 = b.y;
+    if (Math.abs(x1 - x2) < 2) return `M ${x1} ${y1} L ${x2} ${y2}`;
     const my = Math.round((y1 + y2) / 2);
-    return `M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}`;
+    return `M ${x1} ${y1} L ${x1} ${my} L ${x2} ${my} L ${x2} ${y2}`;
   }
 
   const edges = $derived.by(() => {
@@ -442,11 +443,25 @@
       const d = Math.max(0, depth[i] < 0 ? 0 : depth[i]);
       (perLayer[d] = perLayer[d] || []).push(i);
     }
-    for (const [d, idxs] of Object.entries(perLayer)) {
+    // 纵向居中：第一层以画布纵向中心为基准；之后每层围绕上一层的平均 y 居中
+    const CENTER_Y = 340;
+    let prevCenter = CENTER_Y;
+    for (const d of Object.keys(perLayer).map(Number).sort((a, b) => a - b)) {
+      const idxs = perLayer[d];
+      const span = (idxs.length - 1) * (NODE_H + 60);
+      let center = prevCenter;
+      if (d > 0) {
+        const parents = idxs
+          .map((i) => w.edges.filter((e) => e.to === i).map((e) => e.from))
+          .flat()
+          .filter((i) => w.steps[i]?.y !== undefined);
+        if (parents.length) center = parents.reduce((acc, i) => acc + w.steps[i].y + NODE_H / 2, 0) / parents.length;
+      }
       idxs.forEach((i, k) => {
-        w.steps[i].x = 60 + Number(d) * 310;
-        w.steps[i].y = 40 + k * 140;
+        w.steps[i].x = 60 + d * 310;
+        w.steps[i].y = Math.max(40, Math.round(center - span / 2 + k * (NODE_H + 60)));
       });
+      prevCenter = idxs.reduce((acc, i) => acc + w.steps[i].y + NODE_H / 2, 0) / idxs.length;
     }
   }
 

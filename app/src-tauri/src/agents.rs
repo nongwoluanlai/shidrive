@@ -334,6 +334,8 @@ pub struct AgentEnvStatus {
     pub manual_command: String,
     pub node_ready: bool,
     pub node_path: String,
+    /// 启动时自动注入的环境变量（只读展示：ZCODE_BIN / ZCODE_NODE / CODEX_PATH 等）
+    pub auto_env: std::collections::BTreeMap<String, String>,
 }
 
 /// 汇总所有 agent 的环境状态（设置页显示用）。
@@ -359,6 +361,24 @@ pub fn registry_status(db: &Arc<Db>, tools: &Tools) -> Vec<AgentEnvStatus> {
                 .and_then(|raw| serde_json::from_str::<crate::models::AgentLaunch>(&raw).ok())
                 .map(|l| l.command)
                 .unwrap_or_default();
+            let mut auto_env = std::collections::BTreeMap::new();
+            match sp.id.as_str() {
+                "codex" => {
+                    if let Some(c) = tools.codex_exe() {
+                        auto_env.insert("CODEX_PATH".to_string(), c.to_string_lossy().to_string());
+                    }
+                }
+                "zcode" => {
+                    if let Some(z) = tools.zcode_cli() {
+                        auto_env.insert("ZCODE_BIN".to_string(), z.to_string_lossy().to_string());
+                    }
+                    let node = tools.node_exe();
+                    if node.exists() {
+                        auto_env.insert("ZCODE_NODE".to_string(), node.to_string_lossy().to_string());
+                    }
+                }
+                _ => {}
+            }
             AgentEnvStatus {
                 id: sp.id.clone(),
                 name: sp.name.clone(),
@@ -370,6 +390,7 @@ pub fn registry_status(db: &Arc<Db>, tools: &Tools) -> Vec<AgentEnvStatus> {
                 manual_command: manual,
                 node_ready,
                 node_path: node.to_string_lossy().to_string(),
+                auto_env,
             }
         })
         .collect()
