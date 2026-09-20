@@ -181,7 +181,69 @@ impl Tools {
         if let Some(p) = first_existing(&candidates) {
             return Some(p);
         }
-        self.walk_for_zcode_cli()
+        self.walk_for_zcode_cli().or_else(|| self.zcode_via_start_menu())
+    }
+
+    /// 兜底：从开始菜单的 ZCode 快捷方式解析安装目录，再找 resources\glm\zcode.cjs。
+    fn zcode_via_start_menu(&self) -> Option<PathBuf> {
+        let mut menus: Vec<PathBuf> = vec![];
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            menus.push(PathBuf::from(appdata).join("Microsoft").join("Start Menu").join("Programs"));
+        }
+        if let Ok(pd) = std::env::var("ProgramData") {
+            menus.push(PathBuf::from(pd).join("Microsoft").join("Windows").join("Start Menu").join("Programs"));
+        }
+        let mut lnks: Vec<PathBuf> = vec![];
+        for dir in menus {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    // Programs\ZCode\*.lnk
+                    if let Ok(inner) = std::fs::read_dir(&p) {
+                        for f in inner.flatten() {
+                            let n = f.file_name().to_string_lossy().to_lowercase();
+                            if n.ends_with(".lnk") && n.contains("zcode") {
+                                lnks.push(f.path());
+                            }
+                        }
+                    }
+                } else {
+                    let n = e.file_name().to_string_lossy().to_lowercase();
+                    if n.ends_with(".lnk") && n.contains("zcode") {
+                        lnks.push(p);
+                    }
+                }
+            }
+        }
+        for lnk in lnks {
+            let out = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!(
+                        "(New-Object -ComObject WScript.Shell).CreateShortcut('{}').TargetPath",
+                        lnk.to_string_lossy().replace("'", "''"),
+                    ),
+                ])
+                .no_window()
+                .output();
+            let Ok(o) = out else { continue };
+            let target = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if target.is_empty() {
+                continue;
+            }
+            let exe = PathBuf::from(&target);
+            // 快捷方式指向 <install>\ZCode.exe → 资源在其旁/上一级
+            for base in [exe.parent().map(|p| p.to_path_buf()), exe.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf())] {
+                let Some(base) = base else { continue };
+                let cand = base.join("resources").join("glm").join("zcode.cjs");
+                if cand.exists() {
+                    return Some(cand);
+                }
+            }
+        }
+        None
     }
 
     /// 在 %LOCALAPPDATA%\Programs 与 Program Files 下逐应用目录探测 zcode.cjs
@@ -215,6 +277,18 @@ impl Tools {
             }
         }
         None
+    }
+}
+
+#[cfg(windows)]
+trait CmdFlags {
+    fn no_window(&mut self) -> &mut Self;
+}
+#[cfg(windows)]
+impl CmdFlags for std::process::Command {
+    fn no_window(&mut self) -> &mut Self {
+        use std::os::windows::process::CommandExt;
+        self.creation_flags(0x0800_0000)
     }
 }
 

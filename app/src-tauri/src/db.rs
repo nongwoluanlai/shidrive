@@ -550,6 +550,11 @@ Start-Process -FilePath '{{env.__app__}}' -ArgumentList $cli -WindowStyle Hidden
                 "INSERT INTO workflow_runs (id,workflow_id,trigger,status,log,started_at) VALUES (?1,?2,?3,'running','',?4)",
                 params![id, workflow_id, trigger, now()],
             )?;
+            // 每个工作流只保留最新 50 条运行历史
+            c.execute(
+                "DELETE FROM workflow_runs WHERE workflow_id=?1 AND id NOT IN (SELECT id FROM workflow_runs WHERE workflow_id=?1 ORDER BY started_at DESC, rowid DESC LIMIT 50)",
+                params![workflow_id],
+            )?;
             Ok(())
         })?;
         Ok(id)

@@ -127,6 +127,10 @@ export type WorkflowStep =
       name: string;
       title: string;
       message: string;
+      /** none | open（打开目录/文件位置）| url（浏览器打开） */
+      click_action: string;
+      click_target: string;
+      sound: boolean;
       x: number;
       y: number;
     }

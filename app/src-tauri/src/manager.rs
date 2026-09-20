@@ -80,6 +80,45 @@ impl AgentManager {
     }
 
     /// Effective launch config: user override or auto-discovered default (registry-driven).
+    /// zcode 后端预检：用与适配器相同的方式（ZCODE_NODE + zcode.cjs）拉起后端 3 秒探活。
+    /// 启动即退（非 0）时把真实 stderr 返回给用户，替代含混的 "backend dead"。
+    async fn zcode_preflight(&self, zc: &std::path::Path) -> Result<(), String> {
+        let node = self.tools.node_exe();
+        let mut cmd = tokio::process::Command::new(&node);
+        cmd.arg(zc)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("zcode 后端预检：无法用 {} 启动 {}: {e}", node.display(), zc.display()))?;
+        let mut err_pipe = child.stderr.take();
+        let reader = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = String::new();
+            if let Some(p) = err_pipe.as_mut() {
+                let _ = p.read_to_string(&mut buf).await;
+            }
+            buf
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
+            Err(_) => {
+                let _ = child.kill().await;
+                log::info!("[zcode] preflight: backend stayed alive (ok)");
+                Ok(())
+            }
+            Ok(Ok(st)) if st.success() => Ok(()),
+            Ok(Ok(_)) => {
+                let out = reader.await.unwrap_or_default();
+                let tail = out.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
+                Err(format!("zcode 后端启动即退出：{}", if tail.is_empty() { "无错误输出（请确认 ZCode 桌面端已登录）" } else { &tail }))
+            }
+            Ok(Err(e)) => Err(format!("zcode 后端预检失败: {e}")),
+        }
+    }
+
     pub async fn launch_for(&self, agent_type: &str) -> Result<AgentLaunch, String> {
         if let Some(l) = self.overrides.read().await.get(agent_type) {
             if !l.command.trim().is_empty() {
@@ -112,9 +151,12 @@ impl AgentManager {
             "zcode" => {
                 // 提前校验：适配器内部对 zcode CLI 的探测更窄，找不到时会以
                 // "backend dead / zcode list failed" 这类含混报错收场
-                if self.tools.zcode_cli().is_none() {
-                    return Err("未找到 ZCode 桌面端的 zcode.cjs：请确认已安装 ZCode 桌面版；若安装在非标准位置，请在「设置 → Agent 管理」展开 ZCode，在环境变量里配置 ZCODE_BIN=<zcode.cjs 完整路径>".to_string());
-                }
+                let zc = match self.tools.zcode_cli() {
+                    Some(z) => z,
+                    None => return Err("未找到 ZCode 桌面端的 zcode.cjs：请确认已安装 ZCode 桌面版；若安装在非标准位置，请在「设置 → Agent 管理」展开 ZCode，在环境变量里配置 ZCODE_BIN=<zcode.cjs 完整路径>".to_string()),
+                };
+                log::info!("[zcode] cli resolved: {}", zc.display());
+                self.zcode_preflight(&zc).await?;
                 let adapter = self.tools.zcode_adapter();
                 if !adapter.exists() {
                     return Err(format!("未找到 zcode 适配器：请在「设置 → Agent 管理」展开 ZCode 后点「安装适配器」。"));

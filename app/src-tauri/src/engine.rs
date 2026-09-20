@@ -364,10 +364,11 @@ impl Engine {
                 // 注释节点：不执行任何操作
                 true
             }
-            WorkflowStep::Balloon { title, message, .. } => {
+            WorkflowStep::Balloon { title, message, click_action, click_target, sound, .. } => {
                 let title = substitute(title, &snap);
                 let message = substitute(message, &snap);
-                self.show_balloon(run_id, &title, &message)
+                let target = substitute(click_target, &snap);
+                self.show_balloon(run_id, &title, &message, click_action, &target, *sound)
             }
             WorkflowStep::Delay { seconds, .. } => {
                 for _ in 0..*seconds {
@@ -478,16 +479,65 @@ impl Engine {
         ctrl.shell_pids.lock().unwrap().push(pid);
         let out = child.stdout.take();
         let err = child.stderr.take();
-        let out_buf = collect_pipe(out);
-        let err_buf = collect_pipe(err);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u8, String)>();
+        let tx2 = tx.clone();
+        let out_buf = collect_pipe(out, 0, tx2);
+        let err_buf = collect_pipe(err, 1, tx);
 
-        let wait = child.wait();
+        let mut wait = std::pin::pin!(child.wait());
         let timeout = timeout_sec.unwrap_or(u64::MAX / 2);
-        let outcome = tokio::time::timeout(Duration::from_secs(timeout), wait).await;
 
-        let stdout_txt = out_buf.lock().unwrap().join("");
-        let stderr_txt = err_buf.lock().unwrap().join("");
+        // 流式接收输出并实时写运行日志；收完（channel 关闭）或进程退出即结束
+        let mut streamed = (0usize, 0usize); // (stdout 行数, stderr 行数)
+        let outcome = loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Some((kind, line)) => {
+                            if kind == 0 {
+                                if streamed.0 < 200 { self.log(run_id, &line); }
+                                streamed.0 += 1;
+                            } else {
+                                if streamed.1 < 100 { self.log(run_id, &format!("  ⚠ {line}")); }
+                                streamed.1 += 1;
+                            }
+                        }
+                        None => {
+                            // 两个读任务均已结束；等待进程退出状态
+                            match tokio::time::timeout(Duration::from_secs(timeout), &mut wait).await {
+                                Ok(r) => break r,
+                                Err(_) => {
+                                    kill_tree(pid);
+                                    self.log(run_id, &format!("命令超时（{timeout}s），已终止"));
+                                    break Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
+                                }
+                            }
+                        }
+                    }
+                }
+                r = &mut wait => {
+                    // 进程先退出：排干管道剩余输出再收尾
+                    while let Some((kind, line)) = rx.recv().await {
+                        if kind == 0 {
+                            if streamed.0 < 200 { self.log(run_id, &line); }
+                            streamed.0 += 1;
+                        } else {
+                            if streamed.1 < 100 { self.log(run_id, &format!("  ⚠ {line}")); }
+                            streamed.1 += 1;
+                        }
+                    }
+                    break r;
+                }
+            }
+        };
+
+        let stdout_txt = out_buf.lock().unwrap().join("
+");
+        let stderr_txt = err_buf.lock().unwrap().join("
+");
         ctrl.shell_pids.lock().unwrap().retain(|&p| p != pid);
+        if streamed.0 > 200 { self.log(run_id, &format!("…（stdout 其余 {} 行已截断）", streamed.0 - 200)); }
+        if streamed.1 > 100 { self.log(run_id, &format!("…（stderr 其余 {} 行已截断）", streamed.1 - 100)); }
 
         if ctrl.stop.load(Ordering::SeqCst) {
             kill_tree(pid);
@@ -495,31 +545,16 @@ impl Engine {
             return (false, -1, stdout_txt, stderr_txt);
         }
         match outcome {
-            Err(_) => {
-                kill_tree(pid);
-                self.log(run_id, &format!("命令超时（{timeout}s），已终止"));
-                (false, -1, stdout_txt, stderr_txt)
-            }
-            Ok(Ok(status)) => {
+            Ok(status) => {
                 let code = status.code().unwrap_or(-1);
-                if !stdout_txt.trim().is_empty() {
-                    for line in stdout_txt.lines().take(200) {
-                        self.log(run_id, line);
-                    }
-                }
-                if !stderr_txt.trim().is_empty() {
-                    for line in stderr_txt.lines().take(100) {
-                        self.log(run_id, &format!("  ⚠ {line}"));
-                    }
-                }
                 if code != 0 {
                     self.log(run_id, &format!("命令退出码 {code}"));
                     return (false, code, stdout_txt, stderr_txt);
                 }
                 (true, code, stdout_txt, stderr_txt)
             }
-            Ok(Err(e)) => {
-                self.log(run_id, &format!("等待命令失败: {e}"));
+            Err(e) => {
+                self.log(run_id, &format!("等待命令失败（可能已超时终止）: {e}"));
                 (false, -1, stdout_txt, stderr_txt)
             }
         }
@@ -575,12 +610,25 @@ impl Engine {
         }
     }
 
-    /// Windows 气泡提醒（系统托盘 balloon，与旧使驾同体验）
-    fn show_balloon(&self, run_id: &str, title: &str, message: &str) -> bool {
+    /// Windows 气泡提醒（系统托盘 balloon，与旧使驾同体验）。
+    /// 支持点击行为：open=打开目录/文件位置，url=浏览器打开；sound=伴随提示音。
+    fn show_balloon(&self, run_id: &str, title: &str, message: &str, click_action: &str, click_target: &str, sound: bool) -> bool {
+        let ps_escape = |v: &str| v.replace("`", "``").replace("\"", "`\"");
+        let action = if click_target.trim().is_empty() { "none" } else { click_action };
+        let target = ps_escape(click_target.trim());
+        let click_block = match action {
+            "open" => r#"$onClick = { try { Start-Process -FilePath explorer.exe -ArgumentList "`"$tgt`"" } catch {}; $n.Visible=$false; $n.Dispose() }; $n.add_BalloonTipClicked($onClick); $n.add_Click($onClick);"#,
+            "url" => r#"$onClick = { try { Start-Process "`"$tgt`"" } catch {}; $n.Visible=$false; $n.Dispose() }; $n.add_BalloonTipClicked($onClick); $n.add_Click($onClick);"#,
+            _ => "",
+        };
+        let sound_line = if sound { "Add-Type -AssemblyName System; [System.Media.SystemSounds]::Asterisk.Play();" } else { "" };
         let script = format!(
-            r#"$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $n=New-Object System.Windows.Forms.NotifyIcon; $n.Icon=[System.Drawing.SystemIcons]::Information; $n.Visible=$true; $n.ShowBalloonTip(5000,'{t}','{m}','Info'); Start-Sleep -Seconds 6; $n.Dispose()"#,
+            r#"$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $n=New-Object System.Windows.Forms.NotifyIcon; $n.Icon=[System.Drawing.SystemIcons]::Information; $n.Visible=$true; $tgt="{target}"; {click_block} $n.ShowBalloonTip(8000,'{t}','{m}','Info'); {sound_line} Start-Sleep -Seconds 8; $n.Visible=$false; $n.Dispose()"#,
+            target = target,
+            click_block = click_block,
             t = title.replace('\'', "''"),
             m = message.replace('\'', "''"),
+            sound_line = sound_line,
         );
         let out = std::process::Command::new("powershell")
             .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
@@ -588,6 +636,7 @@ impl Engine {
             .output();
         match out {
             Ok(o) if o.status.success() => {
+
                 self.log(run_id, &format!("🔔 已发送气泡提醒：{title}"));
                 true
             }
@@ -611,7 +660,9 @@ impl Engine {
     }
 }
 
-fn collect_pipe<R>(pipe: Option<R>) -> Arc<Mutex<Vec<String>>>
+/// 流式读取子进程输出：每行经 channel 上报（实时写运行日志），
+/// 同时在本地保留全文用于结果变量。0=stdout，1=stderr。
+fn collect_pipe<R>(pipe: Option<R>, kind: u8, tx: tokio::sync::mpsc::UnboundedSender<(u8, String)>) -> Arc<Mutex<Vec<String>>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -622,7 +673,8 @@ where
         use tokio::io::AsyncBufReadExt;
         let mut lines = tokio::io::BufReader::new(pipe).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            sink.lock().unwrap().push(line);
+            sink.lock().unwrap().push(line.clone());
+            let _ = tx.send((kind, line));
         }
     });
     buf

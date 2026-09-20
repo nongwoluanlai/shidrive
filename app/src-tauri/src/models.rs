@@ -235,6 +235,14 @@ pub enum WorkflowStep {
         title: String,
         #[serde(default)]
         message: String,
+        /// none | open（打开目录/文件位置）| url（浏览器打开）
+        #[serde(default)]
+        click_action: String,
+        #[serde(default)]
+        click_target: String,
+        /// 气泡伴随提示音
+        #[serde(default)]
+        sound: bool,
         #[serde(default)]
         x: f64,
         #[serde(default)]

@@ -176,10 +176,18 @@
   // ---------- steps / canvas ----------
   const NODE_W = 210;
   const NODE_H = 54;
-  const PORT_Y = 27; // 连接点固定在节点顶部 27px 处（与 .port-in/.port-out 的 top 对齐）
+  // 端口上下分布：输入=顶部中点(y+0)，输出=底部中点(y+NODE_H)
   const nodeW = (st: WorkflowStep) => (st.type === "note" || st.type === "env" ? 290 : NODE_W);
 
   function ensurePositions(w: Workflow) {
+    // 旧数据兼容：补齐气泡节点新字段的默认值
+    for (const st of w.steps) {
+      if (st.type === "balloon") {
+        if (st.click_action === undefined) st.click_action = "none";
+        if (st.click_target === undefined) st.click_target = "";
+        if (st.sound === undefined) st.sound = false;
+      }
+    }
     w.steps.forEach((s, i) => {
       if (!s.x && !s.y) {
         s.x = 40;
@@ -212,7 +220,7 @@
     else if (type === "env") selected.steps.push({ type, name: "", vars: {}, ...base });
     else if (type === "start") selected.steps.unshift({ type, name: "", ...{ x: 60, y: 20 } });
     else if (type === "note") selected.steps.push({ type, name: "", text: "说明…", ...base });
-    else if (type === "balloon") selected.steps.push({ type, name: "", title: "提醒", message: "", ...base });
+    else if (type === "balloon") selected.steps.push({ type, name: "", title: "提醒", message: "", click_action: "none", click_target: "", sound: false, ...base });
     const idx = type === "start" ? 0 : selected.steps.length - 1;
     const source = selected.steps.findIndex((_, k) => k !== idx && !hasOutgoing(selected, k));
     if (source >= 0 && source !== idx) addEdge(selected, source, idx);
@@ -340,11 +348,11 @@
     window.addEventListener("pointerup", onConnectUp, { once: true });
   }
 
-  // orthogonal polyline
+  // 竖向连线：从上游节点底部中点 → 下游节点顶部中点（S 形贝塞尔）
   function edgePath(a: WorkflowStep, b: WorkflowStep): string {
-    const x1 = a.x + NODE_W, y1 = a.y + NODE_H / 2, x2 = b.x, y2 = b.y + NODE_H / 2;
-    const midX = Math.round(x1 + Math.max(24, (x2 - x1) / 2));
-    return `M ${x1} ${y1} L ${midX} ${y1} L ${midX} ${y2} L ${x2} ${y2}`;
+    const x1 = a.x + nodeW(a) / 2, y1 = a.y + NODE_H, x2 = b.x + nodeW(b) / 2, y2 = b.y;
+    const my = Math.round((y1 + y2) / 2);
+    return `M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}`;
   }
 
   const edges = $derived.by(() => {
@@ -367,6 +375,7 @@
         { label: "✏️ 编辑节点", run: () => { selectedStep = i; nodeDlg = i; } },
         { label: "⧉ 复制节点", run: () => copyStep(i) },
         ...(clipboard ? [{ label: "📋 粘贴节点", run: () => pasteStep() }] : []),
+        { label: "⚙ 自动重排全部节点", run: () => { if (selected) { autoLayout(selected); toast("ok", "已按连线自动重排"); } } },
         "sep",
         { label: "🗑 删除节点", danger: true, run: () => removeStep(i) },
       ],
@@ -447,11 +456,11 @@
     const px = rect ? e.clientX - rect.left : 60;
     const py = rect ? e.clientY - rect.top : 60;
     const items: MenuItem[] = [];
+    if (selected) items.push({ label: "⚙ 自动重排全部节点", run: () => { autoLayout(selected); toast("ok", "已按连线自动重排"); } });
     if (clipboard) items.push({ label: "⧉ 粘贴节点", run: () => pasteStep(px, py) });
     items.push(
       { label: "🔗 顺序连线", run: () => { if (selected) autoChain(selected); } },
       { label: "🧹 清空连线", run: () => { if (selected) { selected.edges = []; selectedEdge = null; } } },
-      { label: "⚙ 自动重排", run: () => { if (selected) autoLayout(selected); } },
     );
     menu = { x: e.clientX, y: e.clientY, items };
   }
@@ -668,17 +677,17 @@
                     oncontextmenu={(ev) => edgeContextMenu(ev, i)}
                   />
                   <path class="edge" class:danger={selectedEdge === i} d={e.d} />
-                  <circle cx={selected.steps[e.e.to].x} cy={selected.steps[e.e.to].y + PORT_Y} r="3.5" class="dotp" />
+                  <circle cx={selected.steps[e.e.to].x + nodeW(selected.steps[e.e.to]) / 2} cy={selected.steps[e.e.to].y} r="3.5" class="dotp" />
                   <polygon
                     class="arrow"
-                    points="{selected.steps[e.e.to].x - 1},{selected.steps[e.e.to].y + PORT_Y} {selected.steps[e.e.to].x - 9},{selected.steps[e.e.to].y + PORT_Y - 4.5} {selected.steps[e.e.to].x - 9},{selected.steps[e.e.to].y + PORT_Y + 4.5}"
+                    points="{selected.steps[e.e.to].x + nodeW(selected.steps[e.e.to]) / 2},{selected.steps[e.e.to].y - 1} {selected.steps[e.e.to].x + nodeW(selected.steps[e.e.to]) / 2 - 4.5},{selected.steps[e.e.to].y - 9} {selected.steps[e.e.to].x + nodeW(selected.steps[e.e.to]) / 2 + 4.5},{selected.steps[e.e.to].y - 9}"
                   />
                 {/each}
                 {#if connecting !== null && selected}
                   {@const a = selected.steps[connecting]}
                   <path
                     class="edge connecting"
-                    d="M {a.x + nodeW(a)} {a.y + PORT_Y} L {mouse.x} {a.y + PORT_Y} L {mouse.x} {mouse.y}"
+                    d="M {a.x + nodeW(a) / 2} {a.y + NODE_H} L {mouse.x} {mouse.y}"
                   />
                 {/if}
               </svg>
@@ -804,8 +813,20 @@
           <div class="field"><label>节点名（可留空）</label><input bind:value={st.name} /></div>
           <div class="field"><label>标题</label><input bind:value={st.title} placeholder="如：构建完成" /></div>
           <div class="field"><label>内容（支持插值）</label><textarea rows="2" bind:value={st.message}></textarea></div>
+          <div class="srow">
+            <div class="field"><label>点击行为</label>
+              <select bind:value={st.click_action}>
+                <option value="none">无动作</option>
+                <option value="open">打开目录或文件位置</option>
+                <option value="url">浏览器打开 URL</option>
+              </select>
+            </div>
+            <div class="field grow"><label>点击目标（目录路径 或 http(s):// 链接，支持插值）</label><input class="grow" bind:value={st.click_target} placeholder={st.click_action === "url" ? "https://…" : "{{var.build_dir}} 或 D:\dist"} /></div>
+          </div>
+          <label class="toggle"><input type="checkbox" bind:checked={st.sound} /> 气泡伴随提示音</label>
           <p class="hint">运行到该节点时弹出 Windows 系统气泡提醒；提醒失败不会中断工作流。</p>
         {:else if st.type === "shell"}
+          <div class="field"><label>节点名（可留空，显示在画布与日志中）</label><input bind:value={st.name} placeholder="如：构建 / 下载文件" /></div>
           <div class="field"><label>命令</label><textarea rows="3" class="mono" bind:value={st.command}></textarea></div>
           <div class="srow">
             <div class="field"><label>解释器</label>
@@ -1243,15 +1264,14 @@
     border-radius: 50%;
     background: var(--bg-panel);
     border: 2px solid var(--accent);
-    top: 27px; /* 与 PORT_Y 对齐：连线终点精确落在端口上 */
-    margin-top: -6px;
+    left: calc(50% - 6px);
     z-index: 2;
   }
   .port-in {
-    left: -7px;
+    top: -7px; /* 上方输入口：连线终点落在节点顶部中点 */
   }
   .port-out {
-    right: -7px;
+    bottom: -7px; /* 下方输出口：连线起点在节点底部中点 */
     cursor: crosshair;
   }
   .port-out:hover {
