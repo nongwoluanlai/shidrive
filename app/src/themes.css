@@ -47,13 +47,13 @@ body[data-skin="steins-gate"] :is(.titlebar, .sec-head, .tabsbar, .agent-tab, .b
 body[data-skin="steins-gate"] .titlebar { border-bottom: 1px solid var(--accent); }
 body[data-skin="steins-gate"] .btn { border-radius: 3px; }
 body[data-skin="steins-gate"] :is(.modal > header, .session-bar) { box-shadow: inset 3px 0 0 var(--accent); }
-body[data-skin="hell"] .titlebar { border-bottom: 2px solid #98434f; }
+body[data-skin="hell"] .titlebar { border-bottom: 2px solid #9c6486; }
 body[data-skin="hell"] .btn { border-radius: 6px; }
 body[data-skin="hell"] :is(.modal > header, .sec-head) {
-  background-image: linear-gradient(100deg, #6b28352b, transparent 80%);
+  background-image: linear-gradient(100deg, #55324a2b, transparent 80%);
 }
-body[data-skin="hell"] .btn.primary { background: #a93849; color: #fff6ef; border-color: #df7680; }
-body[data-skin="hell"] .btn.primary:hover:not(:disabled) { background: #be4356; }
+body[data-skin="hell"] .btn.primary { background: #a05578; color: #fdf4ea; border-color: #d9a9c6; }
+body[data-skin="hell"] .btn.primary:hover:not(:disabled) { background: #b5688c; }
 
 /* Built-in skins carry their own artwork through the same --skin-bg layer. */
 body[data-skin="steins-gate"] .root {
@@ -62,7 +62,7 @@ body[data-skin="steins-gate"] .root {
 }
 body[data-skin="hell"] .root {
   --skin-bg: url("/skins/hell/bg.png");
-  --skin-veil: rgba(16, 14, 12, calc(1 - var(--skin-opacity, 1) * 0.6));
+  --skin-veil: rgba(8, 11, 6, calc(1 - var(--skin-opacity, 1) * 0.38));
 }
 
 /* Top-most floating character: a pointer-transparent overlay pinned to the

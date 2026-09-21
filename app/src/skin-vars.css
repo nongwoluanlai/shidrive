@@ -9,7 +9,7 @@ body[data-skin="steins-gate"] {
   --bg-elev2: #3b2f1f;
   --border: #71593a;
   --border-soft: #483927;
-  --text: #f2e8d5;
+  --text: #d4d4d7;
   --text-dim: #cfbd9f;
   --text-faint: #a08b6a;
   --accent: #d89123;
@@ -27,23 +27,24 @@ body[data-skin="steins-gate"] {
 }
 body[data-skin="hell"] {
   color-scheme: dark;
-  --bg: #191215;
-  --bg-panel: #24191c;
-  --bg-elev: #332226;
-  --bg-elev2: #452c32;
-  --border: #79565c;
-  --border-soft: #51383f;
-  --text: #fff0e6;
-  --text-dim: #dbc4bf;
-  --text-faint: #bea29e;
-  --accent: #ff9292;
-  --accent-contrast: #321014;
-  --accent-soft: #54282e;
-  --danger: #ffb0a2;
-  --ok: #a3d1af;
-  --warn: #edca89;
-  --code-bg: #21171a;
-  --scroll: #826269;
+  /* 蓬莱·花丛（夜林压暗版）：深苔绿底 + 收敛粉藕 accent + 锈红/黄绿/日光白 */
+  --bg: #0d120a;
+  --bg-panel: #11170d;
+  --bg-elev: #161e0f;
+  --bg-elev2: #1e2717;
+  --border: #3b4733;
+  --border-soft: #242e1f;
+  --text: #d4d4d4;
+  --text-dim: #b6bea4;
+  --text-faint: #8c957c;
+  --accent: #c597b4;
+  --accent-contrast: #2b1620;
+  --accent-soft: #311f2c;
+  --danger: #ba674f;
+  --ok: #899c58;
+  --warn: #c2aa64;
+  --code-bg: #090d08;
+  --scroll: #3b4733;
   --shadow: 0 12px 36px #0009;
   --radius: 10px;
   --skin-bg: url("/skins/hell/bg.png");
