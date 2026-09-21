@@ -1,25 +1,23 @@
-/* Background decoration is a background layer, never a foreground overlay.
-   --skin-opacity (0.3–1, user adjustable) fades every themed surface uniformly. */
+/* Skin background fills the whole window as a real layer:
+   the image stays sharp and only its veil follows --skin-opacity, so raising
+   the slider makes the artwork clearer without washing out the character board. */
 body[data-skin]:not([data-skin=""]) .root {
   isolation: isolate;
-  opacity: var(--skin-opacity, 1);
   background-color: var(--bg);
-  background-image: linear-gradient(color-mix(in srgb, var(--bg) 94%, transparent), color-mix(in srgb, var(--bg) 94%, transparent)), var(--skin-bg, none);
+  background-image: linear-gradient(var(--skin-veil, rgba(8, 10, 14, 0.45)), var(--skin-veil, rgba(8, 10, 14, 0.45))), var(--skin-bg, none);
   background-size: cover;
   background-position: center;
+  background-attachment: fixed;
 }
 body[data-skin]:not([data-skin=""]) .root::before,
 body[data-skin]:not([data-skin=""]) .root::after { content: none; }
 body[data-skin]:not([data-skin=""]) :is(.sidebar, .titlebar, .filedock, .editor-pane, .modal, .ctx-menu, .popover, .composer, .session-bar, .tabsbar) {
-  background-color: var(--bg-panel);
+  background-color: color-mix(in srgb, var(--bg-panel) calc(var(--skin-opacity, 1) * 86%), transparent);
   color: var(--text);
   border-color: var(--border-soft);
 }
 body[data-skin]:not([data-skin=""]) .main {
-  background-color: var(--bg);
-  background-image: linear-gradient(color-mix(in srgb, var(--bg) 95%, transparent), color-mix(in srgb, var(--bg) 95%, transparent)), var(--skin-bg, none);
-  background-size: cover;
-  background-position: center;
+  background-color: color-mix(in srgb, var(--bg) calc(var(--skin-opacity, 1) * 78%), transparent);
 }
 body[data-skin]:not([data-skin=""]) :is(input, textarea, select, option) {
   color: var(--text);
@@ -57,6 +55,16 @@ body[data-skin="hell"] :is(.modal > header, .sec-head) {
 body[data-skin="hell"] .btn.primary { background: #a93849; color: #fff6ef; border-color: #df7680; }
 body[data-skin="hell"] .btn.primary:hover:not(:disabled) { background: #be4356; }
 
+/* Built-in skins carry their own artwork through the same --skin-bg layer. */
+body[data-skin="steins-gate"] .root {
+  --skin-bg: url("/skins/steins-gate/bg.png");
+  --skin-veil: rgba(6, 10, 8, calc(1 - var(--skin-opacity, 1) * 0.72));
+}
+body[data-skin="hell"] .root {
+  --skin-bg: url("/skins/hell/bg.png");
+  --skin-veil: rgba(16, 14, 12, calc(1 - var(--skin-opacity, 1) * 0.6));
+}
+
 /* An actual flex child in Sidebar, after its scrollable lists. Character art only:
    transparent-background PNG shown as-is, no background compositing, no controls. */
 .skin-character-stage { display: none; }
@@ -74,7 +82,6 @@ body[data-skin-character="true"] .skin-character-stage {
   position: absolute;
   inset: 0;
   background: var(--skin-character, none) left bottom / contain no-repeat;
-  opacity: var(--skin-opacity, 1);
   filter: drop-shadow(3px 2px 7px #0006);
 }
 @media (max-height: 580px) { body[data-skin-character="true"] .skin-character-stage { flex-basis: 140px; } }

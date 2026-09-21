@@ -63,7 +63,7 @@
   </div>
   {#if app.skin}
     <label class="skin-opacity-row">
-      <span>{t("皮肤不透明度")}</span>
+      <span>{t("皮肤不透明度（背景随此变清晰/模糊，人物不受影响）")}</span>
       <input type="range" min="30" max="100" value={Math.round(skinOpacity.value * 100)} oninput={(e) => setSkinOpacity(Number((e.currentTarget as HTMLInputElement).value) / 100)} />
       <b>{Math.round(skinOpacity.value * 100)}%</b>
     </label>

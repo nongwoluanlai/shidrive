@@ -187,13 +187,18 @@ impl AgentManager {
                 child.kill().await.map_err(|e| format!("zcode 预检进程清理失败: {e}"))?;
                 Ok(())
             }
+            Ok(Ok(st)) if st.success() => {
+                // 干净退出（stdin EOF 后 app-server 主动收尾）也算健康：
+                // 预检只关心 CLI 能否带着这份环境启动。
+                Ok(())
+            }
             Ok(Ok(st)) => {
                 let out = match output {
                     Some(text) => text,
                     None => tokio::time::timeout(Duration::from_millis(250), &mut diagnostic).await.unwrap_or_default(),
                 };
                 let tail = out.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
-                Err(format!("zcode 后端启动即退出（{st}）：{}", if tail.is_empty() { "无错误输出" } else { &tail }))
+                Err(format!("zcode 后端启动失败（{st}）：{}", if tail.is_empty() { "无错误输出" } else { &tail }))
             }
             Ok(Err(e)) => Err(format!("zcode 后端预检失败: {e}")),
         }
