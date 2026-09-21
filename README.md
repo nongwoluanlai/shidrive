@@ -7,16 +7,22 @@
 使驾（ShiDrive）是一款基于 **Tauri 2** 的本地 AI 开发工作台：把项目、工作上下文、AI Agent 会话与工作流放在同一驾驶席上统一管理。它不是又一个 AI 编码工具，而是让你"驾驶"多个 ACP Agent（Codex / ZCode / Claude / Cline / Cursor / Qoder …）完成日常开发工作——同一份上下文，驱动任意 Harness。
 
 ## 功能一览
-
 - **项目与上下文**：项目分组、多工作上下文；上下文可绑定多个 Agent 会话，切换即恢复。
+<img width="2250" height="1303" alt="image" src="https://github.com/user-attachments/assets/686f9065-44f2-4aa2-af07-db07f9938223" />
 - **AI 会话（ACP）**：新建 / 绑定历史会话、流式回复、工具调用时间线、权限请求对话框、模型与模式切换、Ctrl+F 正文搜索、会话标题编辑；会话状态（对话中 / 已完成 / 已中断）集中管理。
 - **多 Agent 注册表**：内置 Codex、ZCode、Claude、Cline、Codebuddy、Cursor、MiniMax、OpenCode、Qoder、Grok 十种 ACP 工具。启用顺序即会话页标签顺序；npm 类适配器在设置页一键安装（支持 HTTP 代理、npmmirror 镜像回退、`--omit=optional` 跳过大体积平台二进制）。
+<img width="892" height="793" alt="image" src="https://github.com/user-attachments/assets/b9bd3ffe-df63-4654-9694-c6974f1cf61b" />
 - **图形化工作流**：画布拖拽 / 自由连线 / 双击编辑；开始、注释、气泡提醒、环境变量、命令（cmd/powershell/python）、Agent 调度、延时等节点；并行分支、定时与手动触发、运行日志、复制粘贴、自动保存。
+<img width="1272" height="1298" alt="image" src="https://github.com/user-attachments/assets/812ee760-deea-4384-92f8-3cab691a1eed" />
+
 - **共享上下文 MCP**：本地 HTTP MCP 服务（默认 `127.0.0.1:8345`），把项目上下文以 git 式提交模型开放给 Agent——`context_get/update/history/search` + 工作流六工具，带版本冲突检测与字节限额。
 - **Coding MCP（独立模式）**：`shidrive.exe --coding-mcp` 以独立进程暴露文件与命令工具（路径越界防护、Token/Basic 认证、执行开关）。
 - **文件树与编辑器**：目录树、系统剪贴板互操作、终端/资源管理器打开、内置编辑器。
 - **桌面集成**：自定义标题栏与对话框、深浅色主题；关闭窗口最小化到托盘常驻（右键打开/退出）、开机自启可选。
 - **免环境依赖**：Node 运行时（≥22）自动检测，或一键下载便携版到用户数据目录（不影响系统环境）；适配器按需安装，全程可配代理。
+- **自定义主题**：可以参考图片
+<img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/1221c69e-a69b-4fab-ba0d-126868d88cc0" />
+<img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/15fb9b11-24a4-479e-a09a-c152f67fbc04" />
 
 ## 架构
 
