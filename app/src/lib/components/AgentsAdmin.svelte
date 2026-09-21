@@ -192,6 +192,33 @@
     drafts[r.id] = { command: "", args: "", env: "" };
     void saveConfig(r);
   }
+
+  // 安装目录 → 推导该 Agent 已知的路径/环境变量，填充到草稿（可再手改）
+  const DIR_ENV_TARGETS: Record<string, { env: string; rel: string }> = {
+    zcode: { env: "ZCODE_BIN", rel: "resources\\glm\\zcode.cjs" },
+    codex: { env: "CODEX_PATH", rel: "codex.exe" },
+    deepseek: { env: "DSH_HOME", rel: "" },
+  };
+
+  async function fillFromInstallDir(r: AgentEnvStatusItem) {
+    const target = DIR_ENV_TARGETS[r.id];
+    if (!target) { toast("info", t("该 Agent 无需安装目录")); return; }
+    const NL = "\n";
+    const initial = (() => {
+      const line = draftOf(r).env.split(NL).find((l) => l.startsWith(target.env + "="));
+      if (line) return line.slice(target.env.length + 1).replace(new RegExp("\\\\+(resources\\\\glm)?\\\\zcode\\.cjs$", "i"), "").replace(/\\codex\.exe$/i, "");
+      return (r.auto_env?.[target.env] ?? "").replace(/\\(resources\\glm\\)?zcode\.cjs$/i, "").replace(/\\codex\.exe$/i, "");
+    })();
+    const dir = await import("../dialog.svelte").then((m) => m.promptDialog({ title: t("安装目录"), label: t("{name} 的安装目录", { name: r.name }), initial }));
+    if (dir === null || !dir.trim()) return;
+    const clean = dir.trim().replace(/[\\/]+$/, "");
+    const d = draftOf(r);
+    const lines = d.env.split(NL).filter((l) => l.trim() && !l.startsWith(target.env + "="));
+    const value = target.rel ? `${target.env}=${clean}\\${target.rel}` : `${target.env}=${clean}`;
+    lines.push(value);
+    drafts[r.id] = { ...d, env: lines.join(NL) };
+    toast("ok", t("已填充 {key}，确认后点「保存配置」", { key: target.env }));
+  }
 </script>
 
 <div class="agents-admin">
@@ -241,6 +268,12 @@
                   {busy === r.id ? t("卸载中…") : t("卸载适配器")}
                 </button>
                 <span class="pend">{t("卸载后需重新安装才能连接")}</span>
+              </div>
+            {/if}
+            {#if DIR_ENV_TARGETS[r.id]}
+              <div class="cfg-line">
+                <button class="btn sm" onclick={() => fillFromInstallDir(r)}>{t("从安装目录填充")}</button>
+                <span class="pend">{t("输入软件安装目录，自动推导环境变量")}</span>
               </div>
             {/if}
             <div class="field"><label>{t("命令（{hint}）", { hint: r.npm ? t("覆盖自动检测，留空=自动") : t("必填：可执行文件完整路径") })}</label>

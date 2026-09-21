@@ -93,6 +93,13 @@ pub fn agent_specs() -> &'static [AgentSpec] {
         args: vec![],
         help: "xAI 官方 Grok CLI（npm 包 @xai-official/grok）。安装适配器后按提示登录 xAI 账号。".into(),
     },
+    AgentSpec {
+        id: "deepseek".into(),
+        name: "DeepSeek".into(),
+        npm: Some("@deepseek-ai/dsh-acp".into()),
+        args: vec![],
+        help: "DeepSeek Harness 自动化 ACP 服务（@deepseek-ai/dsh-acp）。需要先安装 DeepSeek Harness 运行时（该包依赖 dsh-agent 等宿主组件）；安装后在环境变量里配置 DSH_HOME=<harness 安装目录>，或保证 dsh 命令可用。支持 session/list 与 session/resume（不支持 session/load 与思考流回放）。".into(),
+    },
     ])
 }
 

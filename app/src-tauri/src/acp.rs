@@ -17,7 +17,7 @@ pub const EVT_UPDATE: &str = "acp://update";
 pub const EVT_STATUS: &str = "acp://status";
 pub const EVT_PERMISSION: &str = "acp://permission";
 
-type PendingMap = Arc<Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<Value, String>>>>>;
+type PendingMap = Arc<Mutex<HashMap<Value, tokio::sync::oneshot::Sender<Result<Value, String>>>>>;
 /// permission_key ("{agent_type}:{rpc_id}") -> resolver delivering the chosen option id
 type PermissionMap = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Value>>>>;
 
@@ -35,7 +35,16 @@ pub(crate) fn apply_launch_env(cmd: &mut tokio::process::Command, env: &std::col
     }
 }
 
-struct PendingRequest { pending: PendingMap, id: i64 }
+struct PendingRequest { pending: PendingMap, id: Value }
+
+/// JSON-RPC ids may be numbers or strings; adapters choose either. Never coerce.
+fn parse_rpc_id(v: Option<&Value>) -> Option<Value> {
+    let v = v?;
+    match v {
+        Value::Number(_) | Value::String(_) => Some(v.clone()),
+        _ => None,
+    }
+}
 impl Drop for PendingRequest {
     fn drop(&mut self) { self.pending.lock().unwrap().remove(&self.id); }
 }
@@ -244,9 +253,7 @@ impl AcpConnection {
     /// Handle one incoming JSON-RPC message. Returns Err when the stream should close.
     async fn handle_message(self: &Arc<Self>, msg: Value) -> Result<(), ()> {
         let method = msg.get("method").and_then(|m| m.as_str()).map(|s| s.to_string());
-        let id = msg.get("id").and_then(|v| {
-            v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)).or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        });
+        let id = parse_rpc_id(msg.get("id"));
 
         match (method.as_deref(), id) {
             // response to our request
@@ -278,7 +285,7 @@ impl AcpConnection {
         }
     }
 
-    async fn handle_server_request(self: &Arc<Self>, id: i64, method: &str, params: Value) {
+    async fn handle_server_request(self: &Arc<Self>, id: Value, method: &str, params: Value) {
         match method {
             "fs/read_text_file" => {
                 let path = params.get("path").and_then(|p| p.as_str()).unwrap_or_default();
@@ -338,7 +345,7 @@ impl AcpConnection {
         }
     }
 
-    fn respond(&self, id: i64, result: Result<Value, Value>) {
+    fn respond(&self, id: Value, result: Result<Value, Value>) {
         let msg = match result {
             Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
             Err(e) => json!({ "jsonrpc": "2.0", "id": id, "error": e }),
@@ -424,16 +431,17 @@ impl AcpConnection {
         if !self.alive.load(Ordering::SeqCst) {
             return Err(format!("{method} 失败：适配器未连接"));
         }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = Value::Number(self.next_id.fetch_add(1, Ordering::SeqCst).into());
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap();
             // Recheck under the same lock used to drain on disconnect.
             if !self.is_alive() { return Err(format!("{method} 失败：适配器未连接")); }
-            pending.insert(id, tx);
+            pending.insert(id.clone(), tx);
         }
-        let _pending = PendingRequest { pending: self.pending.clone(), id };
+        let _pending = PendingRequest { pending: self.pending.clone(), id: id.clone() };
         let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        // PendingRequest Drop 负责在断开时清理 pending 表
         self.out_tx
             .send(msg.to_string() + "\n")
             .map_err(|_| format!("{method} 失败：无法写入适配器"))?;
@@ -531,7 +539,8 @@ impl AcpConnection {
         self.captures.lock().unwrap().remove(session_id).unwrap_or_default()
     }
 
-    /// Serialized, replay-suppressed session/load with one retry.
+    /// Serialized, replay-suppressed session/load with one retry. Adapters without
+    /// session/load (e.g. DeepSeek Harness) fall back to session/resume.
     pub async fn load_session(&self, session_id: &str, cwd: &str, mcp_servers: Value) -> Result<Value, String> {
         let _g = self.load_lock.lock().await;
         let params = json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers });
@@ -542,6 +551,19 @@ impl AcpConnection {
             tokio::time::sleep(Duration::from_millis(600)).await;
             self.begin_load(session_id);
             res = self.request("session/load", params, Some(Duration::from_secs(60))).await;
+        }
+        // session/load 不支持时（-32601 / 明确不支持文案）退回 session/resume
+        if let Some(err_text) = res.as_ref().err() {
+            let unsupported = err_text.contains("-32601") || err_text.contains("not supported")
+                || err_text.contains("不支持") || err_text.contains("Unsupported");
+            if unsupported {
+                let resume_params = json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers });
+                self.begin_load(session_id);
+                res = self
+                    .request("session/resume", resume_params, Some(Duration::from_secs(60)))
+                    .await
+                    .map_err(|e| format!("session/resume 亦失败（适配器不支持 session/load）：{e}"));
+            }
         }
         let ok = res.is_ok();
         let err = res.as_ref().err().cloned();
@@ -732,8 +754,8 @@ mod audit_tests {
     fn dropped_request_removes_pending_sender() {
         let pending: PendingMap = Default::default();
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        pending.lock().unwrap().insert(7, tx);
-        { let _request = PendingRequest { pending: pending.clone(), id: 7 }; }
+        pending.lock().unwrap().insert(Value::from(7), tx);
+        { let _request = PendingRequest { pending: pending.clone(), id: Value::from(7) }; }
         assert!(pending.lock().unwrap().is_empty());
         assert!(matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)));
     }

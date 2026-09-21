@@ -20,6 +20,62 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   const ctx = $derived(currentContext());
   const key = $derived(chatKey(ctx?.id ?? null, app.agent));
   const items = $derived(app.chat[key] ?? []);
+  // 会话历史可能很长：默认只渲染最新 30 条，向上滚动或点按钮分批加载更早内容
+  const CHUNK = 30;
+  let visibleCount = $state(CHUNK);
+  const hiddenCount = $derived(Math.max(0, items.length - visibleCount));
+  const shownItems = $derived(hiddenCount > 0 ? items.slice(hiddenCount) : items);
+
+  const chatRev = () => app.chatRev[key] ?? 0;
+
+  // 切换会话/历史重载时恢复窗口大小
+  $effect(() => {
+    key;
+    chatRev();
+    visibleCount = CHUNK;
+  });
+
+  function loadOlder() {
+    visibleCount += CHUNK;
+  }
+
+  // 上翻自动加载更早历史（距离顶部 60px 内触发），并保持视线不跳动
+  let loadingOlder = false;
+  async function onListScrollTop() {
+    if (loadingOlder || hiddenCount === 0 || !listEl) return;
+    if (listEl.scrollTop > 60) return;
+    loadingOlder = true;
+    const first = document.querySelector('.msgs-inner > div');
+    const anchorTop = first?.getBoundingClientRect().top ?? 0;
+    visibleCount += CHUNK;
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    if (first) listEl.scrollTop += first.getBoundingClientRect().top - anchorTop;
+    loadingOlder = false;
+  }
+
+  // 定位上一条发出的消息气泡（从当前可视位置向上找最近的用户气泡）
+  function jumpToPrevUserMessage() {
+    if (!listEl) return;
+    const wrappers = Array.from(listEl.querySelectorAll('.msgs-inner > div[id^="msg-"]')) as HTMLElement[];
+    const marker = listEl.scrollTop + 80;
+    let target: HTMLElement | null = null;
+    for (let i = wrappers.length - 1; i >= 0; i--) {
+      const el = wrappers[i];
+      if (!el.querySelector('.bubble.user-bubble')) continue;
+      if (el.offsetTop < marker) { target = el; break; }
+    }
+    if (!target) {
+      for (const el of wrappers) {
+        if (el.querySelector('.bubble.user-bubble')) { target = el; break; }
+      }
+    }
+    if (!target) { toast("info", t("没有更早的发出的消息")); return; }
+    stickToBottom = false;
+    target.scrollIntoView({ block: "center", behavior: "smooth" });
+    target.classList.remove("flash");
+    void target.offsetWidth;
+    target.classList.add("flash");
+  }
   const sessionId = $derived(app.bindingSession[key] ?? null);
   let bindingTitle = $state<string | null>(null);
 
@@ -128,6 +184,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     }
     const dist = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight;
     if (dist < 60) stickToBottom = true;
+    if (listEl.scrollTop < 60) void onListScrollTop();
   }
 
   // 内容高度一变（历史重放渲染完成、流式追加、图片/字体加载）即贴底：
@@ -652,7 +709,10 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
           {/if}
         </div>
       {/if}
-      {#each items as item (item.id)}
+      {#if hiddenCount > 0}
+        <button class="load-older" onclick={() => loadOlder()}>{t("加载更早的 {count} 条消息", { count: Math.min(CHUNK, hiddenCount) })}</button>
+      {/if}
+      {#each shownItems as item (item.id)}
         <div id={"msg-" + item.id}>
           <MessageItem {item} />
         </div>
@@ -669,6 +729,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   </div>
 
   <div class="composer">
+    <button class="btn ghost sm up up-prev" title={t("定位上一条发出的消息")} onclick={jumpToPrevUserMessage}>↑</button>
     <button class="btn ghost sm up" title={t("回到最新")} onclick={() => { stickToBottom = true; if (listEl) listEl.scrollTop = listEl.scrollHeight; }}>↓</button>
     {#if pendingImages.length}
       <div class="thumbs">
@@ -1015,4 +1076,18 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     background: var(--bg-panel);
     border: 1px solid var(--border);
   }
+  .up-prev {
+    bottom: calc(100% + 40px);
+  }
+  .load-older {
+    margin: 10px auto 4px;
+    display: block;
+    padding: 5px 14px;
+    font-size: 0.82em;
+    color: var(--text-dim);
+    background: var(--bg-elev);
+    border: 1px solid var(--border-soft);
+    border-radius: 999px;
+  }
+  .load-older:hover { color: var(--accent); border-color: var(--accent); }
 </style>

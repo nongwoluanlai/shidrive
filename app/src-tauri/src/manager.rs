@@ -96,10 +96,9 @@ impl AgentManager {
         Self { app, db, tools, conns: RwLock::new(HashMap::new()), overrides: RwLock::new(overrides), connection_locks: std::sync::Mutex::new(HashMap::new()), prompt_locks: std::sync::Mutex::new(HashMap::new()) }
     }
 
-    fn prompt_lock(&self, context_id: &str, agent_type: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let key = format!("{context_id}:{agent_type}");
+    fn prompt_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.prompt_locks.lock().unwrap();
-        locks.entry(key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        locks.entry(key.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
     }
 
     pub fn mcp_url(&self) -> String {
@@ -519,8 +518,12 @@ impl AgentManager {
         text: &str,
         images: &[crate::models::PromptImage],
     ) -> Result<Value, String> {
-        // one turn at a time per (context, agent)
-        let turn_lock = self.prompt_lock(&context.id, agent_type);
+        // one turn at a time per session (workflow temp sessions never block the UI bound session)
+        let lock_sid = match &target {
+            SessionTarget::Explicit(sid) => format!("{agent_type}:{sid}"),
+            _ => format!("{agent_type}:ctx-{}", context.id),
+        };
+        let turn_lock = self.prompt_lock(&lock_sid);
         let _turn = turn_lock.lock().await;
         let mut conn = self.ensure_connected(agent_type).await?;
         let cwd = self.project_root_for(context);

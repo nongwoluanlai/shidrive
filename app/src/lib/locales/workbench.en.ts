@@ -138,5 +138,14 @@ export const workbenchEn: Record<string, string> = {
   "用户数据 node22": "User data node22",
   "随包 .tools/node22": "Bundled .tools/node22",
   "系统 PATH": "System PATH",
-  "未找到": "Not found"
+  "未找到": "Not found",
+  "加载更早的 {count} 条消息": "Load {count} earlier messages",
+  "定位上一条发出的消息": "Jump to previous sent message",
+  "没有更早的发出的消息": "No earlier sent messages",
+  "安装目录": "Install folder",
+  "{name} 的安装目录": "{name} install folder",
+  "从安装目录填充": "Fill from install folder",
+  "输入软件安装目录，自动推导环境变量": "Enter the install folder; env vars are derived automatically",
+  "已填充 {key}，确认后点「保存配置」": "{key} filled. Review and click Save",
+  "该 Agent 无需安装目录": "This agent needs no install folder",
 };
