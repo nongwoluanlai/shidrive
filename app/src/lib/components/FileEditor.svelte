@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../i18n";
   // Collapsible file preview/editor pane. Save is debounced.
   import { app, toast } from "../state.svelte";
   import { api } from "../ipc";
@@ -38,13 +39,13 @@
   <div class="pbar">
     <Icon name="file" size={13} />
     <span class="ppath" title={ed.path}>{relPath(ed.path)}</span>
-    {#if ed.dirty}<span class="badge warn">未保存</span>{/if}
+    {#if ed.dirty}<span class="badge warn">{t("未保存")}</span>{/if}
     <span class="spacer"></span>
-    <button class="btn ghost sm" title="在资源管理器中显示" onclick={() => api.fsOpenExplorer(ed.path).catch((e) => toast("error", String(e)))}><Icon name="folder" size={13} /></button>
-    <button class="btn ghost sm" title="收起（文件树中可再次打开）" onclick={collapse}><Icon name="close" size={13} /></button>
+    <button class="btn ghost sm" title={t("在资源管理器中显示")} onclick={() => api.fsOpenExplorer(ed.path).catch((e) => toast("error", String(e)))}><Icon name="folder" size={13} /></button>
+    <button class="btn ghost sm" title={t("收起（文件树中可再次打开）")} onclick={collapse}><Icon name="close" size={13} /></button>
   </div>
   {#if ed.binary}
-    <div class="empty">{ed.content}</div>
+    <div class="empty">{t("无法预览二进制文件")}</div>
   {:else}
     <textarea class="editor-area" bind:value={ed.content} oninput={queueSave} spellcheck="false"></textarea>
   {/if}

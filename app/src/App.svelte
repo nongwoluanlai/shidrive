@@ -3,6 +3,8 @@
   import { app, loadProjects, currentProject, currentContext, loadPrompts, isNoProject } from "./lib/state.svelte";
   import { api } from "./lib/ipc";
   import { applyTheme } from "./lib/theme";
+  import { activateSkin, loadSkinOpacity } from "./lib/skins.svelte";
+  import { toast as skinToast } from "./lib/state.svelte";
   import { wireEvents } from "./lib/events";
   import TitleBar from "./lib/components/TitleBar.svelte";
   import Sidebar from "./lib/components/Sidebar.svelte";
@@ -47,7 +49,7 @@
       const win = tauri.webviewWindow.getCurrentWebviewWindow();
       await win.toggleDevtools();
     } catch {
-      console.warn("DevTools 仅在调试构建中可用");
+      console.warn(t("DevTools 仅在调试构建中可用"));
     }
   }
 
@@ -59,10 +61,11 @@
     };
   });
 
-  // 皮肤应用：body[data-skin] 驱动 themes.css；非内置皮肤注入其变量/图片
-  $effect(() => {
-    document.body.dataset.skin = app.skin;
-  });
+  // One lifecycle owns preset tokens, custom assets and complete cleanup.
+  $effect(() => activateSkin(app.skin, (message) => {
+    skinToast("error", `${t("皮肤加载失败，已恢复基础主题")}: ${message}`);
+    app.skin = "";
+  }));
 
   function blockMenu(e: MouseEvent) {
     // 组件内已自行处理的自定义菜单（画布/文件树/正文等）会先 preventDefault，
@@ -88,6 +91,7 @@
     if (locale === "en" || locale === "zh") app.locale = locale;
     const skin = await api.settingsGet("ui.skin").catch(() => null);
     app.skin = skin ?? "";
+    await loadSkinOpacity();
     // 加载启用的 agent（顺序即会话页 tab 顺序）与缓存能力
     const enabled = await api.agentsEnabledGet().catch(() => [] as string[]);
     const reg = await api.agentsRegistry().catch(() => []);
@@ -172,21 +176,13 @@
             <WorkflowsView />
           {:else}
             <div class="empty welcome">
-              <img src={logo} alt="使驾" class="wlogo" />
+              <img src={logo} alt={t("使驾")} class="wlogo" />
               <h2>{t("欢迎来到使驾 ShiDrive")}</h2>
-              <p>One Context. Any Harness. —— 让 Harness 并驾齐驱</p>
-              <p class="hint">统一管理项目、工作上下文、AI Agent 会话与工作流 · 左侧选择或创建一个项目开始</p>
+              <p>{t("One Context. Any Harness. —— 让 Harness 并驾齐驱")}</p>
+              <p class="hint">{t("统一管理项目、工作上下文、AI Agent 会话与工作流 · 左侧选择或创建一个项目开始")}</p>
             </div>
           {/if}
         </div>
-        {#if app.skin}
-          <img
-            class="skin-character"
-            src={app.skin === "steins-gate" ? "/skins/steins-gate/character.png" : app.skin === "hell" ? "/skins/hell/character.png" : ""}
-            alt=""
-            draggable="false"
-          />
-        {/if}
       </main>
       {#if editorVisible}
         <div class="editor-pane half">

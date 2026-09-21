@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../i18n";
   // 会话时间线：按消息流定位的导航条，hover 预览发出消息，点击滚动定位。
   import type { DisplayItem } from "../state.svelte";
 
@@ -34,7 +35,7 @@
   }
 </script>
 
-<div class="timeline" role="navigation" aria-label="会话时间线">
+<div class="timeline" role="navigation" aria-label={t("会话时间线")}>
   <div class="rail"></div>
   {#each markers as m, mi (m.item.id)}
     <div
@@ -43,7 +44,7 @@
       style="top:{posOf(mi)}%"
       role="button"
       tabindex="0"
-      aria-label="跳转到该消息"
+      aria-label={t("跳转到该消息")}
       onclick={() => onJump(m.item.id)}
       onmouseenter={(e) => onEnter(e, m)}
       onmouseleave={() => (hover = null)}
@@ -54,7 +55,7 @@
 {#if hover}
   <div class="preview" style="left:{Math.min(hover.left + 18, window.innerWidth - 360)}px; top:{Math.min(hover.top - 20, window.innerHeight - 140)}px">
     {#if hover.time}<div class="ptime">{hover.time}</div>{/if}
-    <div class="ptext">{hover.text || "（空消息）"}</div>
+    <div class="ptext">{hover.text || t("（空消息）")}</div>
   </div>
 {/if}
 

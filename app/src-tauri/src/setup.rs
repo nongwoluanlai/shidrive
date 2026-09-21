@@ -78,7 +78,7 @@ impl Tools {
         if portable.exists() {
             portable
         } else {
-            PathBuf::from("node")
+            which("node.exe").or_else(|| which("node")).unwrap_or_else(|| PathBuf::from("node"))
         }
     }
 
@@ -97,11 +97,6 @@ impl Tools {
             let npm = dir.join("node_modules").join("npm").join("bin").join("npm-cli.js");
             if npm.exists() {
                 return npm;
-            }
-            // npm.cmd 同目录（PATH 安装）
-            let npm_cmd = dir.join("npm.cmd");
-            if npm_cmd.exists() {
-                return npm_cmd;
             }
         }
         PathBuf::from("npm")
@@ -222,16 +217,11 @@ impl Tools {
         if let Some(pf) = std::env::var("ProgramFiles").ok() {
             candidates.push(PathBuf::from(pf).join("ZCode").join("resources").join("glm").join("zcode.cjs"));
         }
-        if let Some(p) = first_existing(&candidates) {
-            return Some(p);
-        }
-        // 多候选时按完整性择优：完整安装（含 @zcode 运行时包 / provider 配置）优先于残缺拷贝
-        let mut all: Vec<PathBuf> = vec![];
-        all.extend(self.walk_for_zcode_cli());
-        all.extend(self.zcode_via_start_menu_all());
-        all.retain(|p| p.exists());
-        all.sort_by_key(|p| std::cmp::Reverse(self.zcode_completeness(p)));
-        all.into_iter().next()
+        candidates.extend(self.walk_for_zcode_cli_all());
+        candidates.extend(self.zcode_via_start_menu_all());
+        candidates.retain(|p| p.is_file());
+        candidates.sort_by_key(|p| std::cmp::Reverse(self.zcode_completeness(p)));
+        candidates.into_iter().next()
     }
 
     /// zcode.cjs 所在 glm 目录的完整性评分：2=含 @zcode 运行时包，1=含 provider 配置，0=只有裸文件。
@@ -241,14 +231,18 @@ impl Tools {
         if glm.join("node_modules").join("@zcode").exists() || glm.join("packages").join("@zcode").exists() {
             score += 2;
         }
-        if glm.join("provider").join("zcode-builtin.json").exists() {
+        if self.zcode_provider_config(zc).is_some() {
             score += 1;
         }
         score
     }
 
-    /// 完整 ZCode 桌面安装的 glm 目录候选（标准位置 + 开始菜单快捷方式解析出的安装目录），
-    /// 供适配器 provider 配置缺失时自动补全使用。仅保留真实存在内容的目录。
+    /// Resolve the provider table belonging to this CLI without copying files.
+    pub fn zcode_provider_config(&self, zc: &Path) -> Option<PathBuf> {
+        provider_config_next_to(zc)
+    }
+
+    /// Desktop GLM directories, for read-only discovery.
     pub fn zcode_desktop_glm_dirs(&self) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = vec![];
         let mut push_glm = |install: PathBuf| {
@@ -266,7 +260,9 @@ impl Tools {
         }
         for lnk in self.zcode_start_menu_lnks() {
             if let Some(install) = self.resolve_lnk_install(&lnk) {
-                push_glm(install);
+                if let Some(parent) = install.parent() {
+                    push_glm(parent.to_path_buf());
+                }
             }
         }
         out.retain(|g| g.join("provider").exists() || g.join("zcode.cjs").exists());
@@ -394,13 +390,37 @@ impl CmdFlags for std::process::Command {
     }
 }
 
+fn provider_config_next_to(zc: &Path) -> Option<PathBuf> {
+    let dir = zc.parent()?;
+    [dir.join("provider").join("zcode-builtin.json"),
+     dir.join("..").join("config").join("provider").join("zcode-builtin.json")]
+        .into_iter().find(|p| p.is_file())
+}
+
 pub fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var("PATH").ok()?;
-    for dir in path.split(';') {
-        let p = Path::new(dir).join(name);
-        if p.exists() {
-            return Some(p);
-        }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).map(|dir| dir.join(name)).find(|p| p.is_file())
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn provider_resolution_supports_desktop_and_adjacent_layouts_without_copying() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("provider-test-{}", uuid::Uuid::new_v4()));
+        let glm = root.join("resources/glm");
+        let desktop = root.join("resources/config/provider/zcode-builtin.json");
+        std::fs::create_dir_all(&glm).unwrap();
+        std::fs::create_dir_all(desktop.parent().unwrap()).unwrap();
+        std::fs::write(&desktop, "{}").unwrap();
+        let cli = glm.join("zcode.cjs");
+        assert_eq!(std::fs::canonicalize(provider_config_next_to(&cli).unwrap()).unwrap(), std::fs::canonicalize(&desktop).unwrap());
+        assert!(!glm.join("provider").exists());
+        let adjacent = glm.join("provider/zcode-builtin.json");
+        std::fs::create_dir_all(adjacent.parent().unwrap()).unwrap();
+        std::fs::write(&adjacent, "{}").unwrap();
+        assert_eq!(provider_config_next_to(&cli), Some(adjacent));
+        std::fs::remove_dir_all(root).unwrap();
     }
-    None
 }

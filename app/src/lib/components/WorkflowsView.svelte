@@ -86,7 +86,7 @@
         await api.workflowUpdate(w);
         savedSnap = snapOf(w);
       } catch (e) {
-        toast("error", "自动保存失败: " + String(e));
+        toast("error", t("自动保存失败：{error}", { error: String(e) }));
       }
     }, 800);
     return () => {
@@ -112,7 +112,7 @@
 
   async function createWorkflow() {
     if (!project) return;
-    const name = await promptDialog({ title: "新建工作流", label: "工作流名称 *" });
+    const name = await promptDialog({ title: t("新建工作流"), label: t("工作流名称 *") });
     if (name === null || !name.trim()) return;
     try {
       const w = await api.workflowCreate({
@@ -136,14 +136,14 @@
     try {
       await api.workflowUpdate(selected);
       await refreshWorkflows();
-      toast("ok", "已保存");
+      toast("ok", t("已保存"));
     } catch (e) {
       toast("error", String(e));
     }
   }
 
   async function del() {
-    if (!selected || !(await confirmDialog({ title: "删除工作流", message: `删除工作流「${selected.name}」？{t("运行历史")}将一并删除。`, danger: true, confirmText: "删除" }))) return;
+    if (!selected || !(await confirmDialog({ title: t("删除工作流"), message: t("删除工作流「{name}」？运行历史将一并删除。", { name: selected.name }), danger: true, confirmText: t("删除") }))) return;
     try {
       await api.workflowDelete(selected.id);
       app.workflowSelected = null;
@@ -157,7 +157,7 @@
     if (!selected) return;
     try {
       await api.workflowRun(selected.id);
-      toast("ok", "已启动");
+      toast("ok", t("已启动"));
     } catch (e) {
       toast("error", String(e));
     }
@@ -204,7 +204,7 @@
   function addStep(type: WorkflowStep["type"]) {
     if (!selected) return;
     if (type === "start" && selected.steps.some((s) => s.type === "start")) {
-      toast("warn", "已存在「开始」节点（工作流从该节点起跑）");
+      toast("warn", t("已存在「开始」节点（工作流从该节点起跑）"));
       return;
     }
     const i = selected.steps.length;
@@ -213,15 +213,15 @@
       selected.steps.push({ type, name: "", command: "echo hello", cwd: "", shell: "cmd", timeout_sec: null, continue_on_error: false, ...base });
     else if (type === "agent") {
       if (!contexts.length) {
-        toast("warn", "请先创建上下文，Agent 节点需要绑定上下文");
+        toast("warn", t("请先创建上下文，Agent 节点需要绑定上下文"));
         return;
       }
       selected.steps.push({ type, name: "", context_id: contexts[0].id, agent_type: "codex", prompt: "", session_id: null, timeout_sec: null, continue_on_error: false, ...base });
     } else if (type === "delay") selected.steps.push({ type, name: "", seconds: 5, ...base });
     else if (type === "env") selected.steps.push({ type, name: "", vars: {}, ...base });
     else if (type === "start") selected.steps.unshift({ type, name: "", ...{ x: 60, y: 20 } });
-    else if (type === "note") selected.steps.push({ type, name: "", text: "说明…", ...base });
-    else if (type === "balloon") selected.steps.push({ type, name: "", title: "提醒", message: "", click_action: "none", click_target: "", sound: false, ...base });
+    else if (type === "note") selected.steps.push({ type, name: "", text: t("说明…"), ...base });
+    else if (type === "balloon") selected.steps.push({ type, name: "", title: t("提醒"), message: "", click_action: "none", click_target: "", sound: false, ...base });
     const idx = type === "start" ? 0 : selected.steps.length - 1;
     const source = selected.steps.findIndex((_, k) => k !== idx && !hasOutgoing(selected, k));
     if (source >= 0 && source !== idx) addEdge(selected, source, idx);
@@ -243,7 +243,7 @@
   function addEdge(w: Workflow, from: number, to: number) {
     if (from === to) return;
     if (reaches(w, to, from)) {
-      toast("warn", "不能创建循环连线");
+      toast("warn", t("不能创建循环连线"));
       return;
     }
     if (w.edges.some((e) => e.from === from && e.to === to)) return;
@@ -377,7 +377,7 @@
         { label: "✏️ 编辑节点", run: () => { selectedStep = i; nodeDlg = i; } },
         { label: "⧉ 复制节点", run: () => copyStep(i) },
         ...(clipboard ? [{ label: "📋 粘贴节点", run: () => pasteStep() }] : []),
-        { label: "⚙ 自动重排全部节点", run: () => { if (selected) { autoLayout(selected); toast("ok", "已按连线自动重排"); } } },
+        { label: "⚙ 自动重排全部节点", run: () => { if (selected) { autoLayout(selected); toast("ok", t("已按连线自动重排")); } } },
         "sep",
         { label: "🗑 删除节点", danger: true, run: () => removeStep(i) },
       ],
@@ -387,7 +387,7 @@
   function copyStep(i: number) {
     if (!selected) return;
     clipboard = JSON.parse(JSON.stringify(selected.steps[i]));
-    toast("ok", "节点已复制，画布空白处右键粘贴或 Ctrl+V");
+    toast("ok", t("节点已复制，画布空白处右键粘贴或 Ctrl+V"));
   }
 
   function pasteStep(atX?: number, atY?: number) {
@@ -466,11 +466,12 @@
 
   function canvasContextMenu(e: MouseEvent) {
     e.preventDefault();
+    e.stopPropagation();
     const rect = canvasEl?.getBoundingClientRect();
     const px = rect ? e.clientX - rect.left : 60;
     const py = rect ? e.clientY - rect.top : 60;
     const items: MenuItem[] = [];
-    if (selected) items.push({ label: "⚙ 自动重排全部节点", run: () => { autoLayout(selected); toast("ok", "已按连线自动重排"); } });
+    if (selected) items.push({ label: "⚙ 自动重排全部节点", run: () => { autoLayout(selected); toast("ok", t("已按连线自动重排")); } });
     if (clipboard) items.push({ label: "⧉ 粘贴节点", run: () => pasteStep(px, py) });
     items.push(
       { label: "🔗 顺序连线", run: () => { if (selected) autoChain(selected); } },
@@ -591,35 +592,35 @@
     <div class="detail">
       {#if selected}
         <div class="head">
-          <input class="name-input" bind:value={selected.name} placeholder="工作流名称" />
+          <input class="name-input" bind:value={selected.name} placeholder={t("工作流名称")} />
           {#if selected.trigger_type === "schedule" && selected.enabled}
-            <span class="badge accent" title="下次触发">⏰ {scheduleText(selected.schedule)} · 下次 {selected.next_run_at ?? "—"}</span>
+            <span class="badge accent" title={t("下次触发")}>⏰ {scheduleText(selected.schedule)} · {t("下次 {time}", { time: selected.next_run_at ?? "—" })}</span>
           {:else}
-            <span class="badge">手动</span>
+            <span class="badge">{t("手动")}</span>
           {/if}
           <div class="trigger-wrap">
             <button class="btn" onclick={() => (triggerOpen = !triggerOpen)}>
-              ⚡ 触发：{selected.trigger_type === "schedule" ? (selected.enabled ? scheduleText(selected.schedule) : "已停用") : "手动"}
+              ⚡ {t("触发：{schedule}", { schedule: selected.trigger_type === "schedule" ? (selected.enabled ? scheduleText(selected.schedule) : t("已停用")) : t("手动") })}
             </button>
             {#if triggerOpen}
               <div class="popover">
                 <div class="row">
-                  <label><input type="radio" checked={selected.trigger_type === "manual"} onchange={() => setScheduleKind("manual")} /> 手动</label>
-                  <label><input type="radio" checked={selected.trigger_type === "schedule"} onchange={() => setScheduleKind("schedule")} /> 定时</label>
-                  <label class="toggle"><input type="checkbox" bind:checked={selected.enabled} disabled={selected.trigger_type !== "schedule"} /> 启用</label>
+                  <label><input type="radio" checked={selected.trigger_type === "manual"} onchange={() => setScheduleKind("manual")} /> {t("手动")}</label>
+                  <label><input type="radio" checked={selected.trigger_type === "schedule"} onchange={() => setScheduleKind("schedule")} /> {t("定时")}</label>
+                  <label class="toggle"><input type="checkbox" bind:checked={selected.enabled} disabled={selected.trigger_type !== "schedule"} /> {t("启用")}</label>
                 </div>
                 {#if selected.trigger_type === "schedule"}
                   <div class="row sched">
                     <select value={selected.schedule?.kind ?? "daily"} onchange={(e) => setSchedKind((e.target as HTMLSelectElement).value)}>
-                      <option value="interval">固定间隔</option>
-                      <option value="daily">每天</option>
-                      <option value="weekly">每周</option>
-                      <option value="once">单次</option>
+                      <option value="interval">{t("固定间隔")}</option>
+                      <option value="daily">{t("每天")}</option>
+                      <option value="weekly">{t("每周")}</option>
+                      <option value="once">{t("单次")}</option>
                     </select>
                     {#if selected.schedule?.kind === "interval"}
-                      <span>每</span>
+                      <span>{t("每")}</span>
                       <input class="num" type="number" min="1" bind:value={(selected.schedule as any).every_minutes} />
-                      <span>分钟</span>
+                      <span>{t("分钟")}</span>
                     {:else if selected.schedule?.kind === "daily"}
                       <input class="time" type="time" bind:value={(selected.schedule as any).time} />
                     {:else if selected.schedule?.kind === "weekly"}
@@ -634,7 +635,7 @@
                               if ((e.target as HTMLInputElement).checked && i < 0) arr.push(d.v);
                               if (!(e.target as HTMLInputElement).checked && i >= 0) arr.splice(i, 1);
                             }}
-                          />{d.n}
+                          />{t(d.n)}
                         </label>
                       {/each}
                       <input class="time" type="time" bind:value={(selected.schedule as any).time} />
@@ -642,32 +643,32 @@
                       <input class="time" type="datetime-local" bind:value={(selected.schedule as any).at} />
                     {/if}
                   </div>
-                  <p class="next">下次运行：{selected.next_run_at ?? "—"}</p>
+                  <p class="next">{t("下次运行：{time}", { time: selected.next_run_at ?? "—" })}</p>
                 {/if}
-                <button class="btn sm primary" onclick={() => { triggerOpen = false; void save(); }}>应用</button>
+                <button class="btn sm primary" onclick={() => { triggerOpen = false; void save(); }}>{t("应用")}</button>
               </div>
             {/if}
           </div>
           <span class="spacer"></span>
           {#if running}
-            <button class="btn danger" onclick={stopRun}>■ 停止</button>
+            <button class="btn danger" onclick={stopRun}>■ {t("停止")}</button>
           {:else}
             <button class="btn primary" onclick={runNow}>▶ {t("运行")}</button>
           {/if}
-          <button class="btn" onclick={save}>保存</button>
-          <button class="btn danger" onclick={del}>删除</button>
+          <button class="btn" onclick={save}>{t("保存")}</button>
+          <button class="btn danger" onclick={del}>{t("删除")}</button>
         </div>
 
         <div class="canvas-row">
           <div class="canvas-col">
             <div class="canvas-toolbar">
               <span class="spacer"></span>
-              <button class="btn sm" onclick={() => addStep("start")}>🚩 开始</button>
-              <button class="btn sm" onclick={() => addStep("note")}>📝 注释</button>
+              <button class="btn sm" onclick={() => addStep("start")}>🚩 {t("开始")}</button>
+              <button class="btn sm" onclick={() => addStep("note")}>📝 {t("注释")}</button>
               <button class="btn sm" onclick={() => addStep("shell")}>＋ {t("命令")}</button>
               <button class="btn sm" onclick={() => addStep("agent")}>＋ Agent</button>
-              <button class="btn sm" onclick={() => addStep("delay")}>＋ 等待</button>
-              <button class="btn sm" onclick={() => addStep("env")}>＋ 变量</button>
+              <button class="btn sm" onclick={() => addStep("delay")}>＋ {t("等待")}</button>
+              <button class="btn sm" onclick={() => addStep("env")}>＋ {t("变量")}</button>
               <button class="btn sm" onclick={() => addStep("balloon")}>🔔 {t("气泡")}</button>
             </div>
             <div
@@ -678,7 +679,7 @@
               oncontextmenu={canvasContextMenu}
             >
               {#if selected.steps.length === 0}
-                <div class="empty">画布为空：从上方添加第一个节点</div>
+                <div class="empty">{t("画布为空：从上方添加第一个节点")}</div>
               {/if}
               <svg class="edges">
                 {#each edges as e, i (i)}
@@ -716,53 +717,53 @@
                   oncontextmenu={(e) => nodeContextMenu(e, i)}
                 >
                   {#if step.type !== "start"}
-                    <div class="port-in" title="输入"></div>
+                    <div class="port-in" title={t("输入")}></div>
                   {/if}
                   <div class="nhead">
                     <span class="nnum">{i + 1}</span>
                     <span class="nicon">{stepIcon[step.type]}</span>
-                    <span class="ntype">{stepLabel[step.type]}</span>
+                    <span class="ntype">{t(stepLabel[step.type] ?? step.type)}</span>
                     <span class="spacer"></span>
-                    <button class="ghost-xs" title="删除" onclick={(e) => { e.stopPropagation(); removeStep(i); }}>✕</button>
+                    <button class="ghost-xs" title={t("删除")} onclick={(e) => { e.stopPropagation(); removeStep(i); }}>✕</button>
                   </div>
                   <div class="nbody">
                     {#if step.type === "start"}
-                      {step.name || "开始"}
+                      {step.name || t("开始")}
                     {:else if step.type === "note"}
                       <textarea
                         class="note-edit"
                         rows="3"
-                        placeholder="写点说明…"
+                        placeholder={t("写点说明…")}
                         bind:value={step.text}
                         onclick={(e) => e.stopPropagation()}
                         onpointerdown={(e) => e.stopPropagation()}
                         ondblclick={(e) => e.stopPropagation()}
                       ></textarea>
                     {:else if step.type === "balloon"}
-                      <span class="balloon-line">🔔 {step.title || "提醒"}</span>
+                      <span class="balloon-line">🔔 {step.title || t("提醒")}</span>
                       {#if step.message}<div class="env-line dim2">{step.message}</div>{/if}
                     {:else if step.type === "shell"}
                       {step.name || firstLineOf(step.command)}
                     {:else if step.type === "agent"}
-                      {step.name || ((contexts.find((c) => c.id === step.context_id)?.name ?? "未知上下文") + " · " + (step.agent_type))}
-                      {step.session_id ? "" : " · 临时"}
+                      {step.name || ((contexts.find((c) => c.id === step.context_id)?.name ?? t("未知上下文")) + " · " + (step.agent_type))}
+                      {step.session_id ? "" : " · " + t("临时")}
                     {:else if step.type === "delay"}
-                      等待 {step.seconds}s
+                      {t("等待 {seconds} 秒", { seconds: step.seconds })}
                     {:else if step.type === "env"}
                       <div class="env-lines">
                         {#each Object.entries(step.vars ?? {}) as [k, v] (k)}
                           <div class="env-row">
                             <span class="env-k" title={k}>{step.labels?.[k] || k}</span>=<input class="env-input" bind:value={step.vars[k]} onclick={(e) => e.stopPropagation()} onpointerdown={(e) => e.stopPropagation()} ondblclick={(e) => e.stopPropagation()} />
-                            <button class="ghost-xs" title={"删除 " + (step.labels?.[k] || k)} onclick={(e) => { e.stopPropagation(); delete step.vars[k]; }}>✕</button>
+                            <button class="ghost-xs" title={t("删除 {name}", { name: step.labels?.[k] || k })} onclick={(e) => { e.stopPropagation(); delete step.vars[k]; }}>✕</button>
                           </div>
                         {/each}
-                        <button class="env-add" onclick={(e) => { e.stopPropagation(); const key = envNewKey(step); if (key) step.vars[key] = ""; }}>＋ 添加</button>
+                        <button class="env-add" onclick={(e) => { e.stopPropagation(); const key = envNewKey(step); if (key) step.vars[key] = ""; }}>＋ {t("添加")}</button>
                       </div>
                     {/if}
                   </div>
                   <div
                     class="port-out"
-                    title="拖到目标节点连线"
+                    title={t("拖到目标节点连线")}
                     onpointerdown={(e) => portDown(e, i)}
                   ></div>
                 </div>
@@ -778,12 +779,12 @@
                   <div class="run">
                     <button class="rhead" onclick={() => (openRun = openRun === r.id ? null : r.id)}>
                       <span class="badge {r.status === 'success' ? 'ok' : r.status === 'running' ? 'accent' : r.status === 'stopped' ? 'warn' : 'danger'}">
-                        {{ running: "运行中", success: "成功", failed: "失败", stopped: "已停止" }[r.status] ?? r.status}
+                        {t({ running: "运行中", success: "成功", failed: "失败", stopped: "已停止" }[r.status] ?? r.status)}
                       </span>
-                      <span class="rtime">{r.started_at.slice(5, 16)} · {r.trigger === "manual" ? "手动" : "定时"}</span>
+                      <span class="rtime">{r.started_at.slice(5, 16)} · {t(r.trigger === "manual" ? "手动" : "定时")}</span>
                     </button>
                     {#if openRun === r.id}
-                      <pre class="rlog">{(app.wfLiveLogs[r.id] ?? r.log) || "（暂无日志）"}</pre>
+                      <pre class="rlog">{(app.wfLiveLogs[r.id] ?? r.log) || t("（暂无日志）")}</pre>
                     {/if}
                   </div>
                 {:else}
@@ -794,11 +795,11 @@
           </aside>
         </div>
       {:else}
-        <div class="empty" style="flex:1">选择或创建一个工作流</div>
+        <div class="empty" style="flex:1">{t("选择或创建一个工作流")}</div>
       {/if}
     </div>
   {:else}
-    <div class="empty" style="flex:1">先选择项目</div>
+    <div class="empty" style="flex:1">{t("先选择项目")}</div>
   {/if}
 </div>
 
@@ -810,57 +811,57 @@
   {@const st = selected.steps[nodeDlg]}
   {@const idx = nodeDlg}
   <div class="modal-backdrop">
-    <div class="modal" style="min-width: 560px" role="dialog" aria-label="编辑节点">
+    <div class="modal" style="min-width: 560px" role="dialog" aria-label={t("编辑节点")}>
       <header>
-        编辑节点 — {stepLabel[st.type]} {idx + 1}
+        {t("编辑节点 — {type} {number}", { type: t(stepLabel[st.type] ?? st.type), number: idx + 1 })}
         <button class="btn ghost sm" onclick={() => (nodeDlg = null)}>✕</button>
       </header>
       <div class="body col">
         {#if st.type === "start"}
-          <div class="field"><label>节点名（可留空）</label><input bind:value={st.name} placeholder="开始" /></div>
-          <p class="hint">工作流从「开始」节点起跑；从它连线到后续节点。</p>
+          <div class="field"><label>{t("节点名（可留空）")}</label><input bind:value={st.name} placeholder={t("开始")} /></div>
+          <p class="hint">{t("工作流从「开始」节点起跑；从它连线到后续节点。")}</p>
         {:else if st.type === "note"}
-          <div class="field"><label>标题（可留空）</label><input bind:value={st.name} /></div>
-          <div class="field"><label>注释内容（画布上可直接编辑）</label><textarea rows="4" bind:value={st.text}></textarea></div>
-          <p class="hint">注释节点不执行，仅用于说明工作流的作用与用法。</p>
+          <div class="field"><label>{t("标题（可留空）")}</label><input bind:value={st.name} /></div>
+          <div class="field"><label>{t("注释内容（画布上可直接编辑）")}</label><textarea rows="4" bind:value={st.text}></textarea></div>
+          <p class="hint">{t("注释节点不执行，仅用于说明工作流的作用与用法。")}</p>
         {:else if st.type === "balloon"}
-          <div class="field"><label>节点名（可留空）</label><input bind:value={st.name} /></div>
-          <div class="field"><label>标题</label><input bind:value={st.title} placeholder="如：构建完成" /></div>
-          <div class="field"><label>内容（支持插值）</label><textarea rows="2" bind:value={st.message}></textarea></div>
+          <div class="field"><label>{t("节点名（可留空）")}</label><input bind:value={st.name} /></div>
+          <div class="field"><label>{t("标题")}</label><input bind:value={st.title} placeholder={t("如：构建完成")} /></div>
+          <div class="field"><label>{t("内容（支持插值）")}</label><textarea rows="2" bind:value={st.message}></textarea></div>
           <div class="srow">
-            <div class="field"><label>点击行为</label>
+            <div class="field"><label>{t("点击行为")}</label>
               <select bind:value={st.click_action}>
-                <option value="none">无动作</option>
-                <option value="open">打开目录或文件位置</option>
-                <option value="url">浏览器打开 URL</option>
+                <option value="none">{t("无动作")}</option>
+                <option value="open">{t("打开目录或文件位置")}</option>
+                <option value="url">{t("浏览器打开 URL")}</option>
               </select>
             </div>
-            <div class="field grow"><label>点击目标（目录路径 或 http(s):// 链接，支持插值）</label><input class="grow" bind:value={st.click_target} placeholder={st.click_action === "url" ? "https://…" : "{{var.build_dir}} 或 D:\dist"} /></div>
+            <div class="field grow"><label>{t("点击目标（目录路径 或 http(s):// 链接，支持插值）")}</label><input class="grow" bind:value={st.click_target} placeholder={st.click_action === "url" ? "https://…" : t("{variable} 或 {path}", { variable: "{{var.build_dir}}", path: "D:\\dist" })} /></div>
           </div>
-          <label class="toggle"><input type="checkbox" bind:checked={st.sound} /> 气泡伴随提示音</label>
-          <p class="hint">运行到该节点时弹出 Windows 系统气泡提醒；提醒失败不会中断工作流。</p>
+          <label class="toggle"><input type="checkbox" bind:checked={st.sound} /> {t("气泡伴随提示音")}</label>
+          <p class="hint">{t("运行到该节点时弹出 Windows 系统气泡提醒；提醒失败不会中断工作流。")}</p>
         {:else if st.type === "shell"}
-          <div class="field"><label>节点名（可留空，显示在画布与日志中）</label><input bind:value={st.name} placeholder="如：构建 / 下载文件" /></div>
-          <div class="field"><label>命令</label><textarea rows="3" class="mono" bind:value={st.command}></textarea></div>
+          <div class="field"><label>{t("节点名（可留空，显示在画布与日志中）")}</label><input bind:value={st.name} placeholder={t("如：构建 / 下载文件")} /></div>
+          <div class="field"><label>{t("命令")}</label><textarea rows="3" class="mono" bind:value={st.command}></textarea></div>
           <div class="srow">
-            <div class="field"><label>解释器</label>
+            <div class="field"><label>{t("解释器")}</label>
               <select bind:value={st.shell}>
                 <option value="cmd">cmd</option>
                 <option value="powershell">powershell</option>
-                <option value="python">python（设置里配置解释器）</option>
+                <option value="python">{t("python（设置里配置解释器）")}</option>
               </select>
             </div>
-            <div class="field grow"><label>工作目录（留空=项目根）</label><input class="grow" bind:value={st.cwd} placeholder={"{{env.__root__}} 或绝对路径"} /></div>
+            <div class="field grow"><label>{t("工作目录（留空=项目根）")}</label><input class="grow" bind:value={st.cwd} placeholder={t("{variable} 或绝对路径", { variable: "{{env.__root__}}" })} /></div>
           </div>
           <div class="srow">
-            <div class="field"><label>超时秒（留空不限）</label><input class="num" type="number" min="0" value={st.timeout_sec ?? ""} oninput={(e) => (st.timeout_sec = (e.target as HTMLInputElement).value ? Number((e.target as HTMLInputElement).value) : null)} /></div>
-            <label class="toggle"><input type="checkbox" bind:checked={st.continue_on_error} /> 失败继续</label>
+            <div class="field"><label>{t("超时秒（留空不限）")}</label><input class="num" type="number" min="0" value={st.timeout_sec ?? ""} oninput={(e) => (st.timeout_sec = (e.target as HTMLInputElement).value ? Number((e.target as HTMLInputElement).value) : null)} /></div>
+            <label class="toggle"><input type="checkbox" bind:checked={st.continue_on_error} /> {t("失败继续")}</label>
           </div>
-          <p class="hint">输出变量：{envOutName(st, idx)}</p>
+          <p class="hint">{t("输出变量：{variables}", { variables: envOutName(st, idx) })}</p>
         {:else if st.type === "agent"}
-          <div class="field"><label>节点名</label><input bind:value={st.name} placeholder="可留空" /></div>
+          <div class="field"><label>{t("节点名")}</label><input bind:value={st.name} placeholder={t("可留空")} /></div>
           <div class="srow">
-            <div class="field"><label>上下文</label>
+            <div class="field"><label>{t("上下文")}</label>
               <select bind:value={st.context_id}>
                 {#each contexts as c (c.id)}
                   <option value={c.id}>{c.name}</option>
@@ -873,43 +874,43 @@
                 <option value="zcode">ZCode</option>
               </select>
             </div>
-            <div class="field grow"><label>会话 ID（留空=新建临时会话）</label><input bind:value={st.session_id} placeholder="留空 = 临时会话" /></div>
+            <div class="field grow"><label>{t("会话 ID（留空=新建临时会话）")}</label><input bind:value={st.session_id} placeholder={t("留空 = 临时会话")} /></div>
           </div>
-          <div class="field"><label>提示词</label><textarea rows="3" bind:value={st.prompt}></textarea></div>
+          <div class="field"><label>{t("提示词")}</label><textarea rows="3" bind:value={st.prompt}></textarea></div>
           <div class="srow">
-            <div class="field"><label>超时秒</label><input class="num" type="number" min="0" value={st.timeout_sec ?? ""} oninput={(e) => (st.timeout_sec = (e.target as HTMLInputElement).value ? Number((e.target as HTMLInputElement).value) : null)} /></div>
-            <label class="toggle"><input type="checkbox" bind:checked={st.continue_on_error} /> 失败继续</label>
+            <div class="field"><label>{t("超时秒")}</label><input class="num" type="number" min="0" value={st.timeout_sec ?? ""} oninput={(e) => (st.timeout_sec = (e.target as HTMLInputElement).value ? Number((e.target as HTMLInputElement).value) : null)} /></div>
+            <label class="toggle"><input type="checkbox" bind:checked={st.continue_on_error} /> {t("失败继续")}</label>
           </div>
         {:else if st.type === "delay"}
           <div class="srow">
-            <span>等待</span>
+            <span>{t("等待")}</span>
             <input class="num" type="number" min="1" bind:value={(st as any).seconds} />
-            <span>秒</span>
+            <span>{t("秒")}</span>
           </div>
         {:else if st.type === "env"}
-          <p class="hint">在节点上直接配置变量：</p>
+          <p class="hint">{t("在节点上直接配置变量：")}</p>
           {#each Object.entries(st.vars ?? {}) as [k, v] (k)}
             <div class="kv">
               <input class="kn" value={k} readonly title={k} />
-              <input class="klabel" placeholder="备注（画布优先显示）" value={st.labels?.[k] ?? ""} oninput={(ev) => { if (!st.labels) st.labels = {}; st.labels[k] = (ev.target as HTMLInputElement).value; }} />
+              <input class="klabel" placeholder={t("备注（画布优先显示）")} value={st.labels?.[k] ?? ""} oninput={(ev) => { if (!st.labels) st.labels = {}; st.labels[k] = (ev.target as HTMLInputElement).value; }} />
               <span>=</span>
               <input bind:value={st.vars[k]} />
               <button class="btn ghost sm" onclick={() => delete st.vars[k]}>✕</button>
             </div>
           {:else}
-            <p class="none">无变量</p>
+            <p class="none">{t("无变量")}</p>
           {/each}
           <div class="kv add">
-            <input class="kn" placeholder="变量名" bind:value={dlgEnvKey} />
+            <input class="kn" placeholder={t("变量名")} bind:value={dlgEnvKey} />
             <span>=</span>
-            <input placeholder="值，可用 {HINT_ENV} 或 {HINT_DATE}" bind:value={dlgEnvVal} />
-            <button class="btn sm" onclick={() => { if (dlgEnvKey.trim()) { st.vars[dlgEnvKey.trim()] = dlgEnvVal; dlgEnvKey = ""; dlgEnvVal = ""; } }}>添加</button>
+            <input placeholder={t("值，可用 {env} 或 {date}", { env: HINT_ENV, date: HINT_DATE })} bind:value={dlgEnvVal} />
+            <button class="btn sm" onclick={() => { if (dlgEnvKey.trim()) { st.vars[dlgEnvKey.trim()] = dlgEnvVal; dlgEnvKey = ""; dlgEnvVal = ""; } }}>{t("添加")}</button>
           </div>
         {/if}
       </div>
       <footer>
-        <button class="btn" onclick={() => (nodeDlg = null)}>取消</button>
-        <button class="btn primary" onclick={() => { nodeDlg = null; void save(); }}>完成并保存</button>
+        <button class="btn" onclick={() => (nodeDlg = null)}>{t("取消")}</button>
+        <button class="btn primary" onclick={() => { nodeDlg = null; void save(); }}>{t("完成并保存")}</button>
       </footer>
     </div>
   </div>

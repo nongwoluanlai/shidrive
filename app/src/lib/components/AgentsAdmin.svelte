@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../i18n";
   // Agent 管理设置页：折叠行/开关/探测状态/?指引/优先级/手动配置/安装适配器
   // 注意：草稿初始化只能在 $effect 或事件回调里写状态——渲染期写状态会触发
   // Svelte 的 state_unsafe_mutation，导致展开/上移下移整块渲染中断失效。
@@ -95,13 +96,13 @@
     if (on && r.npm) {
       const row = registry.find((x) => x.id === r.id);
       if (row && !row.adapter_ready) {
-        toast("info", `已启用 ${r.name}：适配器未安装，请展开该行点「安装适配器」（需联网，仅此一次）`);
+        toast("info", t("已启用 {p0}：适配器未安装，请展开该行点「安装适配器」（需联网，仅此一次）", { p0: r.name }));
         toggleExpand(r);
       } else {
-        toast("ok", `已启用 ${r.name}`);
+        toast("ok", t("已启用 {p0}", { p0: r.name }));
       }
     } else {
-      toast("ok", on ? `已启用 ${r.name}（排在第 ${next.length} 位）` : `已停用 ${r.name}`);
+      toast("ok", on ? t("已启用 {p0}（排在第 {p1} 位）", { p0: r.name, p1: next.length }) : t("已停用 {p0}", { p0: r.name }));
     }
   }
 
@@ -126,8 +127,8 @@
     const i = enabled.indexOf(r.id);
     const j = i + dir;
     if (i < 0) return;
-    if (j < 0) return toast("info", `${r.name} 已在最前`);
-    if (j >= enabled.length) return toast("info", `${r.name} 已在最后`);
+    if (j < 0) return toast("info", t("{p0} 已在最前", { p0: r.name }));
+    if (j >= enabled.length) return toast("info", t("{p0} 已在最后", { p0: r.name }));
     [enabled[i], enabled[j]] = [enabled[j], enabled[i]];
     await api.agentsEnabledSet(enabled);
     await refreshEnabled();
@@ -136,10 +137,10 @@
   async function install(r: AgentEnvStatusItem) {
     if (!r.npm) return;
     busy = r.id;
-    toast("info", `正在安装 ${r.npm}…（首次可能需要几分钟）`);
+    toast("info", t("正在安装 {p0}…（首次可能需要几分钟）", { p0: r.npm }));
     try {
-      const msg = await api.agentsBootstrap(r.id);
-      toast("ok", msg);
+      await api.agentsBootstrap(r.id);
+      toast("ok", t("适配器已安装"));
       await loadRegistry();
       await refreshEnabled();
     } catch (e) {
@@ -152,10 +153,10 @@
   async function uninstall(r: AgentEnvStatusItem) {
     if (!r.npm) return;
     busy = r.id;
-    toast("info", `正在卸载 ${r.npm}…`);
+    toast("info", t("正在卸载 {p0}…", { p0: r.npm }));
     try {
-      const msg = await api.agentsUninstall(r.id);
-      toast("ok", msg);
+      await api.agentsUninstall(r.id);
+      toast("ok", t("适配器已卸载"));
       await loadRegistry();
       await refreshEnabled();
     } catch (e) {
@@ -180,7 +181,7 @@
           ? { command: d.command.trim(), args: d.args.split("\n").map((x) => x.trim()).filter(Boolean), env }
           : null,
       );
-      toast("ok", "已保存配置，连接已重置");
+      toast("ok", t("已保存配置，连接已重置"));
       await loadRegistry();
     } catch (e) {
       toast("error", String(e));
@@ -194,7 +195,7 @@
 </script>
 
 <div class="agents-admin">
-  <p class="hint">默认全部停用。启用后会话页顶部出现对应 Agent 标签；顺序即标签顺序（用 ↑↓ 调整）。npm 类工具：展开该行点「安装适配器」自动下载到用户数据目录（跳过大体积平台二进制，可配代理）；二进制类（Cursor/OpenCode）手动填命令路径。</p>
+  <p class="hint">{t("默认全部停用。启用后会话页顶部出现对应 Agent 标签；顺序即标签顺序（用 ↑↓ 调整）。npm 类工具：展开该行点「安装适配器」自动下载到用户数据目录（跳过大体积平台二进制，可配代理）；二进制类（Cursor/OpenCode）手动填命令路径。")}</p>
   <div class="rows">
     {#each sortedRegistry as r (r.id)}
       <div class="agent-row" class:open={expanded === r.id} class:on={r.enabled}>
@@ -204,55 +205,55 @@
             class="toggle"
             checked={r.enabled}
             onchange={(e) => toggle(r, (e.target as HTMLInputElement).checked)}
-            title={r.enabled ? "停用" : "启用"}
+            title={r.enabled ? t("停用") : t("启用")}
           />
           <span class="name">{r.name}</span>
           {#if r.enabled}
             {#if !r.npm}
-              <span class="badge {r.manual_command ? 'ok' : 'warn'}">{r.manual_command ? "已配置命令" : "待配置命令"}</span>
+              <span class="badge {r.manual_command ? 'ok' : 'warn'}">{r.manual_command ? t("已配置命令") : t("待配置命令")}</span>
             {:else if r.adapter_ready}
-              <span class="badge ok">适配器就绪</span>
+              <span class="badge ok">{t("适配器就绪")}</span>
             {:else}
-              <span class="badge warn">未安装</span>
+              <span class="badge warn">{t("未安装")}</span>
             {/if}
-            <span class="qid" title={r.help}>?</span>
-            <button class="mini" title="上移（提高优先级）" onclick={() => move(r, -1)}>↑</button>
-            <button class="mini" title="下移" onclick={() => move(r, 1)}>↓</button>
+            <span class="qid" title={t(r.help)}>?</span>
+            <button class="mini" title={t("上移（提高优先级）")} onclick={() => move(r, -1)}>↑</button>
+            <button class="mini" title={t("下移")} onclick={() => move(r, 1)}>↓</button>
           {:else}
-            <span class="qid" title={r.help}>?</span>
+            <span class="qid" title={t(r.help)}>?</span>
           {/if}
           <span class="spacer"></span>
-          <button class="mini chev" title={expanded === r.id ? "收起" : "展开配置"} onclick={() => toggleExpand(r)}>{expanded === r.id ? "▾" : "▸"}</button>
+          <button class="mini chev" title={expanded === r.id ? t("收起") : t("展开配置")} onclick={() => toggleExpand(r)}>{expanded === r.id ? "▾" : "▸"}</button>
         </div>
         {#if expanded === r.id}
           <div class="row-body">
-<p class="help-text">{r.help}</p>
+<p class="help-text">{t(r.help)}</p>
             {#if r.npm && !r.adapter_ready}
               <div class="cfg-line">
                 <button class="btn sm primary" disabled={busy === r.id} onclick={() => install(r)}>
-                  {busy === r.id ? "安装中…" : "安装适配器"}
+                  {busy === r.id ? t("安装中…") : t("安装适配器")}
                 </button>
-                <span class="pend">安装后即可连接（npm：{r.npm}）</span>
+                <span class="pend">{t("安装后即可连接（npm：{package}）", { package: r.npm })}</span>
               </div>
             {:else if r.npm && r.adapter_ready}
               <div class="cfg-line">
                 <button class="btn sm" disabled={busy === r.id} onclick={() => uninstall(r)}>
-                  {busy === r.id ? "卸载中…" : "卸载适配器"}
+                  {busy === r.id ? t("卸载中…") : t("卸载适配器")}
                 </button>
-                <span class="pend">卸载后需重新安装才能连接</span>
+                <span class="pend">{t("卸载后需重新安装才能连接")}</span>
               </div>
             {/if}
-            <div class="field"><label>命令（{r.npm ? "覆盖自动检测，留空=自动" : "必填：可执行文件完整路径"}）</label>
-              <input value={draftOf(r).command} oninput={(e) => (drafts[r.id] = { ...draftOf(r), command: (e.target as HTMLInputElement).value })} placeholder={r.npm ? "留空自动" : r.id === "cursor" ? "…\\dist-package\\cursor-agent.cmd" : "…\\opencode.exe"} />
+            <div class="field"><label>{t("命令（{hint}）", { hint: r.npm ? t("覆盖自动检测，留空=自动") : t("必填：可执行文件完整路径") })}</label>
+              <input value={draftOf(r).command} oninput={(e) => (drafts[r.id] = { ...draftOf(r), command: (e.target as HTMLInputElement).value })} placeholder={r.npm ? t("留空自动") : r.id === "cursor" ? "…\\dist-package\\cursor-agent.cmd" : "…\\opencode.exe"} />
             </div>
             {#if !r.npm}
-              <p class="help-text">参数 <code>acp</code> 已自动附加，无需填写。</p>
+              <p class="help-text">{t("参数 acp 已自动附加，无需填写。")}</p>
             {/if}
-            <div class="field"><label>参数（每行一个，一般留空）</label><textarea rows="2" class="mono" value={draftOf(r).args} oninput={(e) => (drafts[r.id] = { ...draftOf(r), args: (e.target as HTMLTextAreaElement).value })}></textarea></div>
-            <div class="field"><label>环境变量（每行 KEY=VALUE）</label><textarea rows="2" class="mono" value={draftOf(r).env} oninput={(e) => (drafts[r.id] = { ...draftOf(r), env: (e.target as HTMLTextAreaElement).value })}></textarea></div>
+            <div class="field"><label>{t("参数（每行一个，一般留空）")}</label><textarea rows="2" class="mono" value={draftOf(r).args} oninput={(e) => (drafts[r.id] = { ...draftOf(r), args: (e.target as HTMLTextAreaElement).value })}></textarea></div>
+            <div class="field"><label>{t("环境变量（每行 KEY=VALUE）")}</label><textarea rows="2" class="mono" value={draftOf(r).env} oninput={(e) => (drafts[r.id] = { ...draftOf(r), env: (e.target as HTMLTextAreaElement).value })}></textarea></div>
             <div class="rowbtns">
-              <button class="btn sm primary" onclick={() => saveConfig(r)}>保存配置</button>
-              <button class="btn sm" onclick={() => clearConfig(r)}>清除自定义</button>
+              <button class="btn sm primary" onclick={() => saveConfig(r)}>{t("保存配置")}</button>
+              <button class="btn sm" onclick={() => clearConfig(r)}>{t("清除自定义")}</button>
             </div>
           </div>
         {/if}

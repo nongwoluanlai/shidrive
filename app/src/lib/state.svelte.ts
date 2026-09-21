@@ -59,7 +59,7 @@ export const app = $state({
   agentStatus: {} as Record<string, string>,
   /** 启用的 agent（有序）：[{id, name}] */
   agents: [] as { id: string; name: string }[],
-  theme: { preset: "dark", accent: "#4da3ff", radius: 10, font_size: 14 } as ThemeConfig,
+  theme: { preset: "light", accent: "#268f78", radius: 10, font_size: 14 } as ThemeConfig,
   settingsOpen: false,
   overlay: null as Overlay,
   /** history-session binding dialog for (agent) */

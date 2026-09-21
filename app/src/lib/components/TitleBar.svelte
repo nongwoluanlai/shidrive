@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../i18n";
   import { app, toast } from "../state.svelte";
   import Icon from "./Icon.svelte";
   import logo from "../../assets/logo.png";
@@ -21,31 +22,31 @@
 
 <header class="titlebar">
   <div class="left" data-tauri-drag-region>
-    <img src={logo} alt="使驾" class="logo" />
-    <span class="name" data-tauri-drag-region>使驾 <b>ShiDrive</b></span>
+    <img src={logo} alt={t("使驾")} class="logo" />
+    <span class="name" data-tauri-drag-region>{#if app.locale !== "en"}使驾 {/if}<b>ShiDrive</b></span>
   </div>
 
   <div class="quick">
-    <button class="qbtn" class:active={app.overlay === "sessions"} title="会话管理" onclick={() => (app.overlay = app.overlay === "sessions" ? null : "sessions")}>
-      <Icon name="sessions" size={15} /> 会话管理
+    <button class="qbtn" class:active={app.overlay === "sessions"} title={t("会话管理")} onclick={() => (app.overlay = app.overlay === "sessions" ? null : "sessions")}>
+      <Icon name="sessions" size={15} /> {t("会话管理")}
     </button>
-    <button class="qbtn" class:active={app.overlay === "tasks"} title="运行中任务" onclick={() => (app.overlay = app.overlay === "tasks" ? null : "tasks")}>
-      <Icon name="tasks" size={15} /> 运行中任务
+    <button class="qbtn" class:active={app.overlay === "tasks"} title={t("运行中任务")} onclick={() => (app.overlay = app.overlay === "tasks" ? null : "tasks")}>
+      <Icon name="tasks" size={15} /> {t("运行中任务")}
     </button>
-    <button class="qbtn" class:active={app.overlay === "prompts"} title="常用提示词" onclick={() => (app.overlay = app.overlay === "prompts" ? null : "prompts")}>
-      <Icon name="prompts" size={15} /> 常用提示词
+    <button class="qbtn" class:active={app.overlay === "prompts"} title={t("常用提示词")} onclick={() => (app.overlay = app.overlay === "prompts" ? null : "prompts")}>
+      <Icon name="prompts" size={15} /> {t("常用提示词")}
     </button>
     <span class="divider"></span>
-    <button class="qbtn icon-only" class:active={app.settingsOpen} title="设置" onclick={() => (app.settingsOpen = true)}>
+    <button class="qbtn icon-only" class:active={app.settingsOpen} title={t("设置")} onclick={() => (app.settingsOpen = true)}>
       <Icon name="settings" size={16} />
     </button>
   </div>
 
   <div class="winctrls">
-    <button class="wbtn" title="最小化" onclick={() => w("minimize")}>
+    <button class="wbtn" title={t("最小化")} onclick={() => w("minimize")}>
       <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M1 6h10" stroke="currentColor" stroke-width="1" /></svg>
     </button>
-    <button class="wbtn" title="最大化/还原" onclick={() => w("toggleMaximize")}>
+    <button class="wbtn" title={t("最大化/还原")} onclick={() => w("toggleMaximize")}>
       {#if maximized}
         <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
           <rect x="1" y="3.5" width="7.5" height="7.5" fill="none" stroke="currentColor" stroke-width="1" />
@@ -57,7 +58,7 @@
         </svg>
       {/if}
     </button>
-    <button class="wbtn close" title="关闭" onclick={() => w("close")}>
+    <button class="wbtn close" title={t("关闭")} onclick={() => w("close")}>
       <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M1 1l10 10M11 1L1 11" stroke="currentColor" stroke-width="1" /></svg>
     </button>
   </div>

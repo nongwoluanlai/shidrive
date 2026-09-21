@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t, localeTag } from "../i18n";
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { app, currentContext, toast } from "../state.svelte";
@@ -23,7 +24,7 @@
     try {
       commits = await api.contextCommits(ctx.id);
     } catch (e) {
-      toast("error", "加载提交历史失败: " + String(e));
+      toast("error", t("加载提交历史失败: ") + String(e));
     }
   }
 
@@ -40,30 +41,30 @@
     if (!ctx) return;
     const esc = (s: string) => s.replaceAll("|", "\\|").replaceAll("\r\n", "\n");
     const lines: string[] = [];
-    lines.push(`# 共享上下文：${ctx.name}`);
+    lines.push(t("# 共享上下文：{p0}", { p0: ctx.name }));
     lines.push("");
-    lines.push(`- 项目：${app.projects.find((p) => p.id === ctx.project_id)?.name ?? ctx.project_id}`);
-    lines.push(`- 导出时间：${new Date().toLocaleString()}`);
-    lines.push(`- 提交版本：v1 ~ v${commits.length ? Math.max(...commits.map((c) => c.seq)) : 0}（共 ${commits.length} 条）`);
+    lines.push(t("- 项目：{p0}", { p0: app.projects.find((p) => p.id === ctx.project_id)?.name ?? ctx.project_id }));
+    lines.push(t("- 导出时间：{p0}", { p0: new Date().toLocaleString(localeTag()) }));
+    lines.push(t("- 提交版本：v1 ~ v{p0}（共 {p1} 条）", { p0: commits.length ? Math.max(...commits.map((c) => c.seq)) : 0, p1: commits.length }));
     lines.push("");
     for (const c of [...commits].sort((a, b) => a.seq - b.seq)) {
       lines.push(`---`);
       lines.push("");
       lines.push(`## v${c.seq} · ${c.created_at}`);
-      const who = [c.agent_type, c.session_id ? `会话 ${c.session_id.slice(0, 8)}` : ""].filter(Boolean).join(" · ");
+      const who = [c.agent_type, c.session_id ? t("会话 {p0}", { p0: c.session_id.slice(0, 8) }) : ""].filter(Boolean).join(" · ");
       if (who) lines.push(`> ${who}`);
       lines.push("");
-      if (c.summary) lines.push(`**摘要**：${esc(c.summary)}`, "");
+      if (c.summary) lines.push(t("**摘要**：{p0}", { p0: esc(c.summary) }), "");
       const files = parseFiles(c.files);
-      if (files.length) lines.push("**涉及文件**：", "", ...files.map((f) => `- ${f}`), "");
+      if (files.length) lines.push(t("**涉及文件**："), "", ...files.map((f) => `- ${f}`), "");
       try {
         const snap = JSON.parse(c.snapshot || "{}") as Record<string, unknown>;
         const sections: [string, unknown][] = [
-          ["概述", snap.overview],
-          ["条目", snap.todos ?? snap.entries],
-          ["进展", snap.progress],
-          ["备注", snap.notes],
-          ["约束", snap.constraints],
+          [t("概述"), snap.overview],
+          [t("条目"), snap.todos ?? snap.entries],
+          [t("进展"), snap.progress],
+          [t("备注"), snap.notes],
+          [t("约束"), snap.constraints],
         ];
         for (const [name, val] of sections) {
           if (val === undefined || val === null || val === "") continue;
@@ -81,9 +82,9 @@
       const dir = await api.fsDesktopDir();
       const path = `${dir}\\${name}`;
       await api.fsWrite(path, lines.join("\n"));
-      toast("ok", `已导出到 ${path}`);
+      toast("ok", t("已导出到 {p0}", { p0: path }));
     } catch (e) {
-      toast("error", "导出失败: " + String(e));
+      toast("error", t("导出失败: ") + String(e));
     }
   }
 
@@ -188,24 +189,24 @@
   {#if ctx}
     <div class="col">
       <section class="card">
-        <h3>🧭 概述 Overview</h3>
+        <h3>{t("🧭 概述 Overview")}</h3>
         <textarea
           rows="4"
           bind:value={overview}
           oninput={queueSave}
-          placeholder="这个上下文要做什么？当前目标、范围、背景…（自动保存）"
+          placeholder={t("这个上下文要做什么？当前目标、范围、背景…（自动保存）")}
         ></textarea>
       </section>
 
       <section class="card">
-        <h3>✅ 待办 Todo</h3>
+        <h3>{t("✅ 待办 Todo")}</h3>
         <div class="addrow">
           <input
-            placeholder="添加待办，回车确认"
+            placeholder={t("添加待办，回车确认")}
             bind:value={inputs.todo}
             onkeydown={(e) => e.key === "Enter" && add("todo")}
           />
-          <button class="btn sm" onclick={() => add("todo")}>添加</button>
+          <button class="btn sm" onclick={() => add("todo")}>{t("添加")}</button>
         </div>
         <ul class="todos">
           {#each of("todo") as e (e.id)}
@@ -215,59 +216,59 @@
               <button class="btn ghost sm" onclick={() => remove(e)}>✕</button>
             </li>
           {:else}
-            <li class="none">暂无待办</li>
+            <li class="none">{t("暂无待办")}</li>
           {/each}
         </ul>
       </section>
 
       <section class="card">
-        <h3>📈 进展 Progress</h3>
+        <h3>{t("📈 进展 Progress")}</h3>
         <div class="addrow">
-          <input placeholder="记录阶段性进展，回车确认" bind:value={inputs.progress} onkeydown={(e) => e.key === "Enter" && add("progress")} />
-          <button class="btn sm" onclick={() => add("progress")}>添加</button>
+          <input placeholder={t("记录阶段性进展，回车确认")} bind:value={inputs.progress} onkeydown={(e) => e.key === "Enter" && add("progress")} />
+          <button class="btn sm" onclick={() => add("progress")}>{t("添加")}</button>
         </div>
         <ul>
           {#each of("progress") as e (e.id)}
             <li><span class="content">{e.content}</span><span class="time">{e.created_at.slice(5, 16)}</span><button class="btn ghost sm" onclick={() => remove(e)}>✕</button></li>
           {:else}
-            <li class="none">暂无进展记录</li>
+            <li class="none">{t("暂无进展记录")}</li>
           {/each}
         </ul>
       </section>
 
       <div class="pair">
         <section class="card">
-          <h3>⚖️ 决策 Decisions</h3>
+          <h3>{t("⚖️ 决策 Decisions")}</h3>
           <div class="addrow">
-            <input placeholder="记录重要决策" bind:value={inputs.decision} onkeydown={(e) => e.key === "Enter" && add("decision")} />
-            <button class="btn sm" onclick={() => add("decision")}>添加</button>
+            <input placeholder={t("记录重要决策")} bind:value={inputs.decision} onkeydown={(e) => e.key === "Enter" && add("decision")} />
+            <button class="btn sm" onclick={() => add("decision")}>{t("添加")}</button>
           </div>
           <ul>
             {#each of("decision") as e (e.id)}
               <li><span class="content">{e.content}</span><button class="btn ghost sm" onclick={() => remove(e)}>✕</button></li>
             {:else}
-              <li class="none">暂无决策记录</li>
+              <li class="none">{t("暂无决策记录")}</li>
             {/each}
           </ul>
         </section>
         <section class="card">
-          <h3>📝 注意 Notes</h3>
+          <h3>{t("📝 注意 Notes")}</h3>
           <div class="addrow">
-            <input placeholder="记录注意事项" bind:value={inputs.note} onkeydown={(e) => e.key === "Enter" && add("note")} />
-            <button class="btn sm" onclick={() => add("note")}>添加</button>
+            <input placeholder={t("记录注意事项")} bind:value={inputs.note} onkeydown={(e) => e.key === "Enter" && add("note")} />
+            <button class="btn sm" onclick={() => add("note")}>{t("添加")}</button>
           </div>
           <ul>
             {#each of("note") as e (e.id)}
               <li><span class="content">{e.content}</span><button class="btn ghost sm" onclick={() => remove(e)}>✕</button></li>
             {:else}
-              <li class="none">暂无注意事项</li>
+              <li class="none">{t("暂无注意事项")}</li>
             {/each}
           </ul>
         </section>
       </div>
 
       <section class="card commits">
-        <h3>🕘 提交历史 <span class="ver">当前 v{commits[0]?.seq ?? 0}</span><span class="spacer"></span><button class="btn ghost sm" title="导出全部版本为 Markdown（保存到桌面）" onclick={exportMarkdown}>导出 MD</button><button class="btn ghost sm" title="刷新" onclick={refreshCommits}>⟳</button></h3>
+        <h3>{t("🕘 提交历史")} <span class="ver">{t("当前版本 v{version}", { version: commits[0]?.seq ?? 0 })}</span><span class="spacer"></span><button class="btn ghost sm" title={t("导出全部版本为 Markdown（保存到桌面）")} onclick={exportMarkdown}>{t("导出 MD")}</button><button class="btn ghost sm" title={t("刷新")} onclick={refreshCommits}>⟳</button></h3>
         <div class="commit-list">
           {#each commits as c (c.seq)}
             <div class="commit">
@@ -281,34 +282,34 @@
                 {@const snap = parseSnap(c.snapshot)}
                 <div class="cbody">
                   {#if parseFiles(c.files).length}
-                    <div class="cfiles">涉及文件：{#each parseFiles(c.files) as f, i (f + i)}{#if i > 0}、{/if}<code>{f}</code>{/each}</div>
+                    <div class="cfiles">{t("涉及文件：")}{#each parseFiles(c.files) as f, i (f + i)}{#if i > 0}、{/if}<code>{f}</code>{/each}</div>
                   {/if}
-                  {#if snap.overview}<div class="csec"><b>概述</b><div class="ctext">{snap.overview}</div></div>{/if}
-                  {#if snap.todos?.length}<div class="csec"><b>待办</b><ul>{#each snap.todos as t (t.content)}<li>{t.content}{t.status === "done" ? " ✓" : ""}</li>{/each}</ul></div>{/if}
-                  {#if snap.progress?.length}<div class="csec"><b>进展</b><ul>{#each snap.progress as t (t.content)}<li>{t.content}</li>{/each}</ul></div>{/if}
-                  {#if snap.notes?.length}<div class="csec"><b>注意</b><ul>{#each snap.notes as t (t.content)}<li>{t.content}</li>{/each}</ul></div>{/if}
-                  {#if snap.constraints}<div class="csec"><b>约束</b><div class="ctext">{snap.constraints}</div></div>{/if}
+                  {#if snap.overview}<div class="csec"><b>{t("概述")}</b><div class="ctext">{snap.overview}</div></div>{/if}
+                  {#if snap.todos?.length}<div class="csec"><b>{t("待办")}</b><ul>{#each snap.todos as t (t.content)}<li>{t.content}{t.status === "done" ? " ✓" : ""}</li>{/each}</ul></div>{/if}
+                  {#if snap.progress?.length}<div class="csec"><b>{t("进展")}</b><ul>{#each snap.progress as t (t.content)}<li>{t.content}</li>{/each}</ul></div>{/if}
+                  {#if snap.notes?.length}<div class="csec"><b>{t("注意")}</b><ul>{#each snap.notes as t (t.content)}<li>{t.content}</li>{/each}</ul></div>{/if}
+                  {#if snap.constraints}<div class="csec"><b>{t("约束")}</b><div class="ctext">{snap.constraints}</div></div>{/if}
                 </div>
               {/if}
             </div>
           {:else}
-            <p class="none">还没有提交记录（Agent 通过 MCP 提交后会出现在这里）</p>
+            <p class="none">{t("还没有提交记录（Agent 通过 MCP 提交后会出现在这里）")}</p>
           {/each}
         </div>
       </section>
 
       <section class="card">
-        <h3>⛔ 约束 Constraints</h3>
+        <h3>{t("⛔ 约束 Constraints")}</h3>
         <textarea
           rows="3"
           bind:value={constraints}
           oninput={queueSave}
-          placeholder="项目约束：技术栈限定、不能动的部分、性能要求…（自动保存）"
+          placeholder={t("项目约束：技术栈限定、不能动的部分、性能要求…（自动保存）")}
         ></textarea>
       </section>
     </div>
   {:else}
-    <div class="empty">选择一个上下文</div>
+    <div class="empty">{t("选择一个上下文")}</div>
   {/if}
 </div>
 

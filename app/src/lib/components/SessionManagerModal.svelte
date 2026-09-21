@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../i18n";
   // 会话管理: 表格形式展示所有绑定，双击跳转；支持解绑、复制提示词、改标题。
   import { app, toast, sharedContextPrompt } from "../state.svelte";
   import { api } from "../ipc";
@@ -21,11 +22,11 @@
   });
 
   async function unbind(b: BindingInfo) {
-    if (!(await confirmDialog({ title: "解绑会话", message: `解绑 ${b.context_name} × ${b.agent_type} 的会话？AI 端会话不会删除。`, danger: true, confirmText: "解绑" }))) return;
+    if (!(await confirmDialog({ title: t("解绑会话"), message: t("解绑 {p0} × {p1} 的会话？AI 端会话不会删除。", { p0: b.context_name, p1: b.agent_type }), danger: true, confirmText: t("解绑") }))) return;
     try {
       await api.bindingUnbind(b.context_id, b.agent_type);
       bindings = await api.bindingsAll();
-      toast("ok", "已解绑");
+      toast("ok", t("已解绑"));
     } catch (e) {
       toast("error", String(e));
     }
@@ -48,12 +49,12 @@
   }
 
   async function editTitle(b: BindingInfo) {
-    const t = await promptDialog({ title: "会话标题", label: "标题（本地备注）", initial: b.title ?? "" });
-    if (t === null || !t.trim()) return;
+    const newTitle = await promptDialog({ title: t("会话标题"), label: t("标题（本地备注）"), initial: b.title ?? "" });
+    if (newTitle === null || !newTitle.trim()) return;
     try {
-      await api.bindingSetTitle(b.context_id, b.agent_type, t.trim());
-      b.title = t.trim();
-      toast("ok", "标题已更新");
+      await api.bindingSetTitle(b.context_id, b.agent_type, newTitle.trim());
+      b.title = newTitle.trim();
+      toast("ok", t("标题已更新"));
     } catch (e) {
       toast("error", String(e));
     }
@@ -65,58 +66,58 @@
 </script>
 
 {#if app.overlay === "sessions"}
-  <div class="panel" role="dialog" aria-label="会话管理">
+  <div class="panel" role="dialog" aria-label={t("会话管理")}>
     <div class="head">
-      <Icon name="sessions" size={15} /> 会话管理
+      <Icon name="sessions" size={15} /> {t("会话管理")}
       <span class="spacer"></span>
       <button class="btn ghost sm" onclick={() => (app.overlay = null)}>✕</button>
     </div>
     <div class="table-wrap">
       {#if loading}
-        <p class="none">加载中…</p>
+        <p class="none">{t("加载中…")}</p>
       {:else}
         <table>
           <thead>
             <tr>
-              <th>项目</th>
-              <th>状态</th>
-              <th>会话描述</th>
+              <th>{t("项目")}</th>
+              <th>{t("状态")}</th>
+              <th>{t("会话描述")}</th>
               <th>Agent</th>
-              <th>工作目录</th>
+              <th>{t("工作目录")}</th>
               <th>session</th>
-              <th>更新时间</th>
+              <th>{t("更新时间")}</th>
               <th></th>
             </tr>
           </thead>
           <tbody>
             {#each bindings as b (b.id)}
-              <tr ondblclick={() => jump(b)} title="双击前往该会话">
+              <tr ondblclick={() => jump(b)} title={t("双击前往该会话")}>
                 <td>{b.project_name}</td>
                 <td>
                   <span class="badge {b.status === 'running' ? 'accent' : b.status === 'completed' ? 'ok' : b.status === 'interrupted' ? 'warn' : ''}">
-                    {{ running: "对话中", completed: "已完成", interrupted: "已中断" }[b.status ?? ""] ?? "未创建"}
+                    {{ running: t("对话中"), completed: t("已完成"), interrupted: t("已中断") }[b.status ?? ""] ?? t("未创建")}
                   </span>
                 </td>
                 <td class="tdesc">
-                  <span class="ttitle" title="点击修改标题（本地备注）" onclick={(e) => { e.stopPropagation(); editTitle(b); }}>{displayTitle(b)}</span>
+                  <span class="ttitle" title={t("点击修改标题（本地备注）")} onclick={(e) => { e.stopPropagation(); editTitle(b); }}>{displayTitle(b)}</span>
                 </td>
                 <td>{agentName(b.agent_type)}</td>
                 <td class="twd" title={b.workspace ?? ""}>{b.workspace || "—"}</td>
                 <td class="tsid" title={b.session_id ?? ""}>{b.session_id ? b.session_id.slice(0, 8) + "…" : "—"}</td>
                 <td>{b.updated_at.slice(5, 16)}</td>
                 <td class="acts">
-                  <button class="btn sm" onclick={(e) => { e.stopPropagation(); void jump(b); }}>前往</button>
-                  <button class="btn ghost sm danger" onclick={(e) => { e.stopPropagation(); void unbind(b); }}>解绑</button>
+                  <button class="btn sm" onclick={(e) => { e.stopPropagation(); void jump(b); }}>{t("前往")}</button>
+                  <button class="btn ghost sm danger" onclick={(e) => { e.stopPropagation(); void unbind(b); }}>{t("解绑")}</button>
                 </td>
               </tr>
             {:else}
-              <tr><td colspan="8" class="none">还没有任何会话绑定</td></tr>
+              <tr><td colspan="8" class="none">{t("还没有任何会话绑定")}</td></tr>
             {/each}
           </tbody>
         </table>
       {/if}
     </div>
-    <p class="tip">双击行前往会话 · 点击会话描述可修改标题（本地备注）· 绑定历史会话请进入对应上下文聊天页的「绑定」。</p>
+    <p class="tip">{t("双击行前往会话 · 点击会话描述可修改标题（本地备注）· 绑定历史会话请进入对应上下文聊天页的「绑定」。")}</p>
   </div>
 {/if}
 

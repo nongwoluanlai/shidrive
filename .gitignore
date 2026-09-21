@@ -11,6 +11,7 @@ __pycache__/
 .portable-test/
 .shots/
 .testproj/
+/app/.review/
 .zcode/
 .cm-test.txt
 

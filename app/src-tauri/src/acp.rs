@@ -21,6 +21,25 @@ type PendingMap = Arc<Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<Val
 /// permission_key ("{agent_type}:{rpc_id}") -> resolver delivering the chosen option id
 type PermissionMap = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Value>>>>;
 
+/// Match adapter and preflight environment, including PATH prefix semantics.
+pub(crate) fn apply_launch_env(cmd: &mut tokio::process::Command, env: &std::collections::BTreeMap<String, String>) {
+    cmd.env("PYTHONUNBUFFERED", "1");
+    for (key, value) in env {
+        if key.eq_ignore_ascii_case("PATH") {
+            let mut paths: Vec<_> = std::env::split_paths(value).collect();
+            if let Some(current) = std::env::var_os("PATH") { paths.extend(std::env::split_paths(&current)); }
+            cmd.env("PATH", std::env::join_paths(paths).unwrap_or_else(|_| value.into()));
+        } else {
+            cmd.env(key, value);
+        }
+    }
+}
+
+struct PendingRequest { pending: PendingMap, id: i64 }
+impl Drop for PendingRequest {
+    fn drop(&mut self) { self.pending.lock().unwrap().remove(&self.id); }
+}
+
 /// Accumulated transcript of the current turn for one session (persisted on turn end).
 #[derive(Default)]
 struct TurnBuffer {
@@ -34,6 +53,7 @@ pub struct AcpConnection {
     pub agent_type: String,
     out_tx: tokio::sync::mpsc::UnboundedSender<String>,
     child: Mutex<Option<tokio::process::Child>>,
+    io_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     next_id: AtomicI64,
     pending: PendingMap,
     permissions: PermissionMap,
@@ -70,18 +90,9 @@ impl AcpConnection {
             .env("PYTHONUNBUFFERED", "1")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        for (k, v) in &launch.env {
-            if k.eq_ignore_ascii_case("path") {
-                let merged = match std::env::var("PATH") {
-                    Ok(cur) => format!("{v};{cur}"),
-                    Err(_) => v.clone(),
-                };
-                cmd.env("PATH", merged);
-            } else {
-                cmd.env(k, v);
-            }
-        }
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        apply_launch_env(&mut cmd, &launch.env);
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 
@@ -91,7 +102,7 @@ impl AcpConnection {
         let stderr = child.stderr.take().ok_or("no stderr")?;
 
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        tokio::spawn(async move {
+        let writer_task = tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             let mut writer = stdin;
             while let Some(line) = out_rx.recv().await {
@@ -106,7 +117,7 @@ impl AcpConnection {
 
         // Log adapter stderr (never blocking the protocol).
         let stderr_type = agent_type.to_string();
-        tauri::async_runtime::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
             use tokio::io::AsyncBufReadExt;
             let reader = tokio::io::BufReader::new(stderr);
             let mut lines = reader.lines();
@@ -121,6 +132,7 @@ impl AcpConnection {
             agent_type: agent_type.to_string(),
             out_tx,
             child: Mutex::new(Some(child)),
+            io_tasks: Mutex::new(vec![writer_task.abort_handle(), stderr_task.abort_handle()]),
             next_id: AtomicI64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permissions: Arc::new(Mutex::new(HashMap::new())),
@@ -138,6 +150,12 @@ impl AcpConnection {
 
         conn.spawn_reader(stdout);
         conn.emit_status("connecting", None);
+        // Also closes the process when the initialize future is cancelled.
+        struct InitGuard(Option<Arc<AcpConnection>>);
+        impl Drop for InitGuard {
+            fn drop(&mut self) { if let Some(conn) = self.0.take() { conn.shutdown(); } }
+        }
+        let mut guard = InitGuard(Some(conn.clone()));
 
         let init = conn
             .request(
@@ -154,12 +172,13 @@ impl AcpConnection {
             .await?;
         conn.emit_status("connected", Some(&init));
         *conn.agent_info.lock().unwrap() = init;
+        guard.0 = None;
         Ok(conn)
     }
 
     fn spawn_reader(self: &Arc<Self>, stdout: tokio::process::ChildStdout) {
         let conn = self.clone();
-        tauri::async_runtime::spawn(async move {
+        let task = tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
             let mut reader = stdout;
             let mut buf = Vec::with_capacity(8192);
@@ -191,9 +210,10 @@ impl AcpConnection {
             }
             conn.on_closed();
         });
+        self.io_tasks.lock().unwrap().push(task.abort_handle());
     }
 
-    fn on_closed(self: &Arc<Self>) {
+    fn on_closed(&self) {
         if !self.alive.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -208,6 +228,9 @@ impl AcpConnection {
         for (_, tx) in perms.drain() {
             let _ = tx.send(json!({ "optionId": "__connection_closed__" }));
         }
+        drop(perms);
+        if let Some(child) = self.child.lock().unwrap().as_mut() { let _ = child.start_kill(); }
+        for task in self.io_tasks.lock().unwrap().drain(..) { task.abort(); }
         self.emit_status("disconnected", None);
     }
 
@@ -279,9 +302,13 @@ impl AcpConnection {
             }
             "session/request_permission" => {
                 let session_id = params.get("sessionId").and_then(|s| s.as_str()).unwrap_or_default().to_string();
-                let key = format!("{}:{id}", self.agent_type);
+                let key = format!("{}:{}:{id}", self.agent_type, uuid::Uuid::new_v4());
                 let (tx, rx) = tokio::sync::oneshot::channel::<Value>();
-                self.permissions.lock().unwrap().insert(key.clone(), tx);
+                {
+                    let mut permissions = self.permissions.lock().unwrap();
+                    if !self.is_alive() { return; }
+                    permissions.insert(key.clone(), tx);
+                }
                 let _ = self.app.emit(
                     EVT_PERMISSION,
                     json!({
@@ -291,12 +318,15 @@ impl AcpConnection {
                         "params": params,
                     }),
                 );
-                let outcome = rx.await.unwrap_or(json!({ "optionId": "__rejected__" }));
-                if outcome.get("optionId").and_then(|o| o.as_str()) == Some("__connection_closed__") {
-                    self.respond(id, Err(json!({ "code": -32000, "message": "连接已关闭" })));
-                } else {
-                    self.respond(id, Ok(outcome));
-                }
+                // Do not block the protocol reader on a user decision: it must still
+                // process prompt cancellation, responses and EOF.
+                let conn = self.clone();
+                tokio::spawn(async move {
+                    let outcome = rx.await.unwrap_or_else(|_| json!({ "outcome": "cancelled" }));
+                    if conn.is_alive() {
+                        conn.respond(id, Ok(json!({ "outcome": outcome })));
+                    }
+                });
             }
             "terminal/create" | "terminal/output" | "terminal/wait_for_exit" | "terminal/release" | "terminal/kill" => {
                 self.respond(id, Err(json!({ "code": -32601, "message": "terminal not supported" })));
@@ -396,7 +426,13 @@ impl AcpConnection {
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        {
+            let mut pending = self.pending.lock().unwrap();
+            // Recheck under the same lock used to drain on disconnect.
+            if !self.is_alive() { return Err(format!("{method} 失败：适配器未连接")); }
+            pending.insert(id, tx);
+        }
+        let _pending = PendingRequest { pending: self.pending.clone(), id };
         let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         self.out_tx
             .send(msg.to_string() + "\n")
@@ -435,10 +471,10 @@ impl AcpConnection {
         let loaded = self.loaded.clone();
         let sid = session_id.to_string();
         if ok {
+            loaded.lock().unwrap().insert(sid.clone());
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(2500)).await;
                 loading.lock().unwrap().remove(&sid);
-                loaded.lock().unwrap().insert(sid);
             });
         } else {
             loading.lock().unwrap().remove(&sid);
@@ -598,6 +634,9 @@ impl AcpConnection {
 
     /// Begin tracking a turn: returns previous buffer content (if any) and resets it.
     pub fn begin_turn(&self, session_id: &str, context_id: &str) {
+        // A live prompt starts immediately after load. Its updates must not be
+        // discarded by the replay settle window.
+        self.loading.lock().unwrap().remove(session_id);
         let mut buffers = self.buffers.lock().unwrap();
         buffers.insert(
             session_id.to_string(),
@@ -618,17 +657,10 @@ impl AcpConnection {
     /// Deliver the user's permission decision to the pending server request.
     pub fn resolve_permission(&self, request_id: &str, option_id: &str) -> Result<(), String> {
         if let Some(tx) = self.permissions.lock().unwrap().remove(request_id) {
-            let _ = tx.send(json!({ "optionId": option_id }));
-            Ok(())
+            tx.send(json!({ "outcome": "selected", "optionId": option_id }))
+                .map_err(|_| "权限请求已失效".to_string())
         } else {
-            // waiter gone (e.g. restart): answer directly on the wire
-            let rpc_id: i64 = request_id
-                .rsplit(':')
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| "无效的权限请求 ID".to_string())?;
-            self.respond(rpc_id, Ok(json!({ "optionId": option_id })));
-            Err("权限请求已失效，已直接拒绝应答".into())
+            Err("权限请求已失效".into())
         }
     }
 
@@ -637,11 +669,7 @@ impl AcpConnection {
     }
 
     pub fn shutdown(&self) {
-        self.alive.store(false, Ordering::SeqCst);
-        self.notify("session/close", json!({}));
-        if let Some(child) = self.child.lock().unwrap().as_mut() {
-            let _ = child.start_kill();
-        }
+        self.on_closed();
     }
 }
 
@@ -687,7 +715,7 @@ fn read_text_file_range(path: &str, line: Option<u64>, limit: Option<u64>) -> Re
     let start = line.unwrap_or(1).max(1) as usize - 1;
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let end = match limit {
-        Some(l) => (start + l as usize).min(lines.len()),
+        Some(l) => start.saturating_add(usize::try_from(l).unwrap_or(usize::MAX)).min(lines.len()),
         None => lines.len(),
     };
     if start < lines.len() {
@@ -695,3 +723,43 @@ fn read_text_file_range(path: &str, line: Option<u64>, limit: Option<u64>) -> Re
     }
     Ok(out.concat())
 }
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn dropped_request_removes_pending_sender() {
+        let pending: PendingMap = Default::default();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        pending.lock().unwrap().insert(7, tx);
+        { let _request = PendingRequest { pending: pending.clone(), id: 7 }; }
+        assert!(pending.lock().unwrap().is_empty());
+        assert!(matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)));
+    }
+
+    #[test]
+    fn launch_env_preserves_override_and_prepends_path() {
+        let mut cmd = tokio::process::Command::new("unused");
+        let prefix = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixture-bin");
+        let env = std::collections::BTreeMap::from([
+            ("PATH".into(), prefix.to_string_lossy().to_string()),
+            ("ZCODE_NODE".into(), "custom-node".into()),
+            ("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE".into(), "custom-provider".into()),
+        ]);
+        apply_launch_env(&mut cmd, &env);
+        let vars: std::collections::HashMap<_, _> = cmd.as_std().get_envs().collect();
+        assert_eq!(vars[std::ffi::OsStr::new("ZCODE_NODE")], Some(std::ffi::OsStr::new("custom-node")));
+        assert_eq!(vars[std::ffi::OsStr::new("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE")], Some(std::ffi::OsStr::new("custom-provider")));
+        assert_eq!(std::env::split_paths(vars[std::ffi::OsStr::new("PATH")].unwrap()).next(), Some(prefix));
+    }
+
+    #[test]
+    fn file_range_accepts_unbounded_limit_without_overflow() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/acp.rs");
+        let full = read_text_file_range(path, None, None).unwrap();
+        let ranged = read_text_file_range(path, Some(2), Some(u64::MAX)).unwrap();
+        assert_eq!(ranged, full.split_inclusive('\n').skip(1).collect::<String>());
+    }
+}
+

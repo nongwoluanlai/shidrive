@@ -1,15 +1,18 @@
 import type { ScheduleConfig } from "../types";
+import { t } from "../i18n";
 
 export function scheduleText(s: ScheduleConfig | null): string {
-  if (!s) return "定时";
+  if (!s) return t("定时");
   switch (s.kind) {
     case "interval":
-      return `每 ${s.every_minutes} 分钟`;
+      return t("每 {minutes} 分钟", { minutes: s.every_minutes });
     case "daily":
-      return `每天 ${s.time}`;
-    case "weekly":
-      return `每周 ${s.weekdays.map((d) => "一二三四五六日"[d - 1]).join("")} ${s.time}`;
+      return t("每天 {time}", { time: s.time });
+    case "weekly": {
+      const weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+      return t("每周 {days} {time}", { days: s.weekdays.map((d) => t(weekdays[d - 1] ?? String(d))).join(", "), time: s.time });
+    }
     case "once":
-      return `单次 ${s.at}`;
+      return t("单次 {at}", { at: s.at });
   }
 }

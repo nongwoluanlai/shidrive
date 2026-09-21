@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../i18n";
   // 运行中任务: currently executing workflow runs with stop + log.
   import { app, toast } from "../state.svelte";
   import { api } from "../ipc";
@@ -53,7 +54,7 @@
   async function stop(run_id: string) {
     try {
       await api.workflowStop(run_id);
-      toast("ok", "已发送停止请求");
+      toast("ok", t("已发送停止请求"));
     } catch (e) {
       toast("error", String(e));
     }
@@ -61,9 +62,9 @@
 </script>
 
 {#if app.overlay === "tasks"}
-  <div class="panel" role="dialog" aria-label="运行中任务">
+  <div class="panel" role="dialog" aria-label={t("运行中任务")}>
     <div class="head">
-      <Icon name="tasks" size={15} /> 运行中任务
+      <Icon name="tasks" size={15} /> {t("运行中任务")}
       <span class="spacer"></span>
       <button class="btn ghost sm" onclick={() => (app.overlay = null)}>✕</button>
     </div>
@@ -72,21 +73,21 @@
         <div class="row">
           <div class="info">
             <div class="l1"><span class="dot accent pulse"></span><b>{r.name}</b></div>
-            <div class="l2 dim">开始于 {r.started_at.slice(5, 16)}</div>
+            <div class="l2 dim">{t("开始于")} {r.started_at.slice(5, 16)}</div>
           </div>
           <div class="acts">
-            <button class="btn sm" onclick={() => (openRun = openRun === r.run_id ? null : r.run_id)}>{openRun === r.run_id ? "收起日志" : "日志"}</button>
-            <button class="btn sm danger" onclick={() => stop(r.run_id)}>■ 停止</button>
+            <button class="btn sm" onclick={() => (openRun = openRun === r.run_id ? null : r.run_id)}>{openRun === r.run_id ? t("收起日志") : t("日志")}</button>
+            <button class="btn sm danger" onclick={() => stop(r.run_id)}>{t("■ 停止")}</button>
           </div>
         </div>
         {#if openRun === r.run_id}
-          <pre class="rlog">{logs[r.run_id] || "（暂无日志）"}</pre>
+          <pre class="rlog">{logs[r.run_id] || t("（暂无日志）")}</pre>
         {/if}
       {:else}
-        <p class="none">当前没有运行中的任务</p>
+        <p class="none">{t("当前没有运行中的任务")}</p>
       {/each}
     </div>
-    <p class="tip">定时与手动运行的工作流会在这里实时显示；也可在「工作流」页查看历史。</p>
+    <p class="tip">{t("定时与手动运行的工作流会在这里实时显示；也可在「工作流」页查看历史。")}</p>
   </div>
 {/if}
 

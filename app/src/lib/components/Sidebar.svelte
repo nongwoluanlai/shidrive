@@ -4,6 +4,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { api } from "../ipc";
   import ContextMenu from "./ContextMenu.svelte";
   import Icon from "./Icon.svelte";
+  import SkinCharacter from "./SkinCharacter.svelte";
   import type { MenuItem } from "./menu-item";
   import { scheduleText } from "./wf-shared";
   import { t } from "../i18n";
@@ -31,27 +32,27 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
 
   async function saveProject() {
     if (!editName.trim()) {
-      toast("warn", "项目名称不能为空");
+      toast("warn", t("项目名称不能为空"));
       return;
     }
     try {
       await api.projectsUpdate(editProjectId, editName, editPath, editDesc);
       app.projects = await api.projectsList();
       showEditProject = false;
-      toast("ok", "项目已更新");
+      toast("ok", t("项目已更新"));
     } catch (e) {
       toast("error", String(e));
     }
   }
 
   async function deleteProject() {
-    if (!(await confirmDialog({ title: "删除项目", message: "删除该项目？其下上下文、会话绑定与工作流记录将一并删除（项目目录文件不受影响）。", danger: true, confirmText: "删除" }))) return;
+    if (!(await confirmDialog({ title: t("删除项目"), message: t("删除该项目？其下上下文、会话绑定与工作流记录将一并删除（项目目录文件不受影响）。"), danger: true, confirmText: t("删除") }))) return;
     try {
       await api.projectsDelete(editProjectId);
       showEditProject = false;
       await selectProject(null);
       app.projects = await api.projectsList();
-      toast("ok", "项目已删除");
+      toast("ok", t("项目已删除"));
     } catch (e) {
       toast("error", String(e));
     }
@@ -81,7 +82,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
 
   async function createProject() {
     if (!projectName.trim()) {
-      toast("warn", "项目名称不能为空");
+      toast("warn", t("项目名称不能为空"));
       return;
     }
     try {
@@ -90,7 +91,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       projectName = projectPath = projectDesc = "";
       app.projects = await api.projectsList();
       await selectProject(p.id);
-      toast("ok", "项目已创建");
+      toast("ok", t("项目已创建"));
     } catch (e) {
       toast("error", String(e));
     }
@@ -113,12 +114,12 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   }
 
   async function deleteContext(id: string) {
-    if (!(await confirmDialog({ title: "删除上下文", message: "删除该上下文？会话绑定与本地聊天记录将一并删除（AI 端会话不受影响）。", danger: true, confirmText: "删除" }))) return;
+    if (!(await confirmDialog({ title: t("删除上下文"), message: t("删除该上下文？会话绑定与本地聊天记录将一并删除（AI 端会话不受影响）。"), danger: true, confirmText: t("删除") }))) return;
     try {
       await api.contextsDelete(id);
       if (app.projectId) app.contexts = await api.contextsList(app.projectId);
       if (app.contextId === id) app.contextId = null;
-      toast("ok", "上下文已删除");
+      toast("ok", t("上下文已删除"));
     } catch (e) {
       toast("error", String(e));
     }
@@ -127,12 +128,12 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   async function renameContext(id: string) {
     const c = app.contexts.find((x) => x.id === id);
     if (!c) return;
-    const name = await promptDialog({ title: "编辑上下文", label: "名称", initial: c.name });
+    const name = await promptDialog({ title: t("编辑上下文"), label: t("名称"), initial: c.name });
     if (name === null || !name.trim() || name.trim() === c.name) return;
     try {
       await api.contextsUpdate(id, name.trim(), c.overview, c.constraints);
       if (app.projectId) app.contexts = await api.contextsList(app.projectId);
-      toast("ok", "上下文已更新");
+      toast("ok", t("上下文已更新"));
     } catch (e) {
       toast("error", String(e));
     }
@@ -147,9 +148,9 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       x: e.clientX,
       y: e.clientY,
       items: [
-        { label: "✏️ 编辑（重命名）", run: () => renameContext(id) },
+        { label: t("✏️ 编辑（重命名）"), run: () => renameContext(id) },
         "sep",
-        { label: "🗑 删除上下文", danger: true, run: () => deleteContext(id) },
+        { label: t("🗑 删除上下文"), danger: true, run: () => deleteContext(id) },
       ],
     };
   }
@@ -163,7 +164,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     try {
       const copy = await api.workflowCreate({
         project_id: w.project_id,
-        name: w.name + " 副本",
+        name: w.name + t(" 副本"),
         description: w.description,
         enabled: w.enabled,
         trigger_type: w.trigger_type,
@@ -175,7 +176,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       await refreshWorkflows();
       app.tab = "workflows";
       app.workflowSelected = copy.id;
-      toast("ok", "已创建副本");
+      toast("ok", t("已创建副本"));
     } catch (e) {
       toast("error", String(e));
     }
@@ -187,12 +188,12 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     const w = app.workflows.find((x) => x.id === id);
     if (!w) return;
     const items: MenuItem[] = [
-      { label: "▶ 运行", run: () => {
+      { label: t("▶ 运行"), run: () => {
           app.tab = "workflows";
           app.workflowSelected = id;
-          api.workflowRun(id).then(() => toast("ok", "已启动")).catch((err) => toast("error", String(err)));
+          api.workflowRun(id).then(() => toast("ok", t("已启动"))).catch((err) => toast("error", String(err)));
       } },
-      { label: "↻ 重新执行", run: () => {
+      { label: t("↻ 重新执行"), run: () => {
           void (async () => {
             const act = await api.activeRuns();
             const r = act.find((x) => x[1] === id);
@@ -204,41 +205,41 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
             app.workflowSelected = id;
             try {
               await api.workflowRun(id);
-              toast("ok", "已重新执行");
+              toast("ok", t("已重新执行"));
             } catch (err) {
               toast("error", String(err));
             }
           })();
       } },
-      { label: "■ 停止运行", run: () => {
+      { label: t("■ 停止运行"), run: () => {
           void (async () => {
             const act = await api.activeRuns();
             const r = act.find((x) => x[1] === id);
             if (r) {
               await api.workflowStop(r[0]);
-              toast("ok", "已发送停止请求");
+              toast("ok", t("已发送停止请求"));
             } else {
-              toast("info", "该工作流未在运行");
+              toast("info", t("该工作流未在运行"));
             }
           })();
       } },
       "sep",
-      { label: "↑ 上移", run: () => api.workflowMove(id, -1).then(refreshWorkflows).catch((err) => toast("error", String(err))) },
-      { label: "↓ 下移", run: () => api.workflowMove(id, 1).then(refreshWorkflows).catch((err) => toast("error", String(err))) },
-      { label: "⧉ 复制", run: () => {
+      { label: t("↑ 上移"), run: () => api.workflowMove(id, -1).then(refreshWorkflows).catch((err) => toast("error", String(err))) },
+      { label: t("↓ 下移"), run: () => api.workflowMove(id, 1).then(refreshWorkflows).catch((err) => toast("error", String(err))) },
+      { label: t("⧉ 复制"), run: () => {
           wfClipboard = { name: w.name, steps: JSON.parse(JSON.stringify(w.steps)), edges: JSON.parse(JSON.stringify(w.edges ?? [])), env: JSON.parse(JSON.stringify(w.env ?? {})), description: w.description };
-          toast("ok", "工作流已复制");
+          toast("ok", t("工作流已复制"));
       } },
-      { label: "📋 粘贴为副本", run: () => { if (wfClipboard) void duplicateWorkflow(id); }, },
+      { label: t("📋 粘贴为副本"), run: () => { if (wfClipboard) void duplicateWorkflow(id); }, },
       "sep",
-      { label: "🗑 删除工作流", danger: true, run: () => {
+      { label: t("🗑 删除工作流"), danger: true, run: () => {
           void (async () => {
-            if (!(await confirmDialog({ title: "删除工作流", message: `删除工作流「${w.name}」？运行历史将一并删除。`, danger: true, confirmText: "删除" }))) return;
+            if (!(await confirmDialog({ title: t("删除工作流"), message: t("删除工作流「{p0}」？运行历史将一并删除。", { p0: w.name }), danger: true, confirmText: t("删除") }))) return;
             try {
               await api.workflowDelete(id);
               await refreshWorkflows();
               if (app.workflowSelected === id) app.workflowSelected = null;
-              toast("ok", "工作流已删除");
+              toast("ok", t("工作流已删除"));
             } catch (err) {
               toast("error", String(err));
             }
@@ -264,14 +265,14 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
         }}
       >
         {#if !app.projects.length}
-          <option value="">（无项目）</option>
+          <option value="">{t("（无项目）")}</option>
         {/if}
         {#each app.projects as p (p.id)}
-          <option value={p.id}>{p.name}</option>
+          <option value={p.id}>{isNoProject(p.id) ? t("无项目") : p.name}</option>
         {/each}
       </select>
       {#if app.projectId}
-        <button class="btn ghost sm sq" title="编辑项目" onclick={openEditProject}><Icon name="pencil" size={14} /></button>
+        <button class="btn ghost sm sq" title={t("编辑项目")} onclick={openEditProject}><Icon name="pencil" size={14} /></button>
       {/if}
     </div>
   </div>
@@ -281,7 +282,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   <div class="sec">
     <div class="sec-head">
       <Icon name="context" size={13} /> {t("上下文")} <span class="spacer"></span>
-      <button class="btn ghost sm" title="新建上下文" disabled={!app.projectId} onclick={() => (showNewContext = true)}><Icon name="plus" size={13} /></button>
+      <button class="btn ghost sm" title={t("新建上下文")} disabled={!app.projectId} onclick={() => (showNewContext = true)}><Icon name="plus" size={13} /></button>
     </div>
     <div class="list ctx-list">
       {#each app.contexts as c (c.id)}
@@ -312,11 +313,11 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       <Icon name="workflow" size={13} /> {t("工作流")} <span class="spacer"></span>
       <button
         class="btn ghost sm"
-        title="新建工作流"
+        title={t("新建工作流")}
         disabled={!app.projectId}
         onclick={async () => {
           if (!app.projectId) return;
-          const name = await promptDialog({ title: "新建工作流", label: "工作流名称 *" });
+          const name = await promptDialog({ title: t("新建工作流"), label: t("工作流名称 *") });
           if (name === null || !name.trim()) return;
           try {
             const w = await api.workflowCreate({
@@ -331,7 +332,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
             await refreshWorkflows();
             app.tab = "workflows";
             app.workflowSelected = w.id;
-            toast("ok", "工作流已创建");
+            toast("ok", t("工作流已创建"));
           } catch (e) {
             toast("error", String(e));
           }
@@ -353,7 +354,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
         >
           <span class="iname">{w.name}</span>
           <span class="imeta">
-            {#if w.trigger_type === "schedule" && w.enabled}<span class="badge accent">⏰ {scheduleText(w.schedule)}</span>{:else}<span class="badge">手动</span>{/if}
+            {#if w.trigger_type === "schedule" && w.enabled}<span class="badge accent">⏰ {scheduleText(w.schedule)}</span>{:else}<span class="badge">{t("手动")}</span>{/if}
             <span class="dim">{w.steps.length} {t("节点")}</span>
           </span>
         </div>
@@ -363,21 +364,22 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     </div>
   </div>
 
+  <SkinCharacter />
 </aside>
 
 
 {#if showNewProject}
   <div class="modal-backdrop">
     <div class="modal">
-      <header>新建项目 <button class="btn ghost sm" onclick={() => (showNewProject = false)}>✕</button></header>
+      <header>{t("新建项目")} <button class="btn ghost sm" onclick={() => (showNewProject = false)}>✕</button></header>
       <div class="body col">
-        <div class="field"><label>名称 *</label><input bind:value={projectName} placeholder="例如：我的项目" onkeydown={(e) => e.key === "Enter" && createProject()} /></div>
-        <div class="field"><label>根目录</label><input bind:value={projectPath} placeholder="D:\path\to\project" /></div>
-        <div class="field"><label>描述</label><textarea rows="2" bind:value={projectDesc} placeholder="项目简介"></textarea></div>
+        <div class="field"><label>{t("名称 *")}</label><input bind:value={projectName} placeholder={t("例如：我的项目")} onkeydown={(e) => e.key === "Enter" && createProject()} /></div>
+        <div class="field"><label>{t("根目录")}</label><input bind:value={projectPath} placeholder="D:\path\to\project" /></div>
+        <div class="field"><label>{t("描述")}</label><textarea rows="2" bind:value={projectDesc} placeholder={t("项目简介")}></textarea></div>
       </div>
       <footer>
-        <button class="btn" onclick={() => (showNewProject = false)}>取消</button>
-        <button class="btn primary" onclick={createProject}>创建</button>
+        <button class="btn" onclick={() => (showNewProject = false)}>{t("取消")}</button>
+        <button class="btn primary" onclick={createProject}>{t("创建")}</button>
       </footer>
     </div>
   </div>
@@ -386,17 +388,17 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
 {#if showEditProject}
   <div class="modal-backdrop">
     <div class="modal">
-      <header>编辑项目 <button class="btn ghost sm" onclick={() => (showEditProject = false)}>✕</button></header>
+      <header>{t("编辑项目")} <button class="btn ghost sm" onclick={() => (showEditProject = false)}>✕</button></header>
       <div class="body col">
-        <div class="field"><label>名称 *</label><input bind:value={editName} /></div>
-        <div class="field"><label>根目录</label><input bind:value={editPath} placeholder="D:\path\to\project" /></div>
-        <div class="field"><label>描述</label><textarea rows="2" bind:value={editDesc}></textarea></div>
+        <div class="field"><label>{t("名称 *")}</label><input bind:value={editName} /></div>
+        <div class="field"><label>{t("根目录")}</label><input bind:value={editPath} placeholder="D:\path\to\project" /></div>
+        <div class="field"><label>{t("描述")}</label><textarea rows="2" bind:value={editDesc}></textarea></div>
       </div>
       <footer>
-        <button class="btn danger left" onclick={deleteProject}>删除项目</button>
+        <button class="btn danger left" onclick={deleteProject}>{t("删除项目")}</button>
         <span class="spacer"></span>
-        <button class="btn" onclick={() => (showEditProject = false)}>取消</button>
-        <button class="btn primary" onclick={saveProject}>保存</button>
+        <button class="btn" onclick={() => (showEditProject = false)}>{t("取消")}</button>
+        <button class="btn primary" onclick={saveProject}>{t("保存")}</button>
       </footer>
     </div>
   </div>
@@ -405,17 +407,17 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
 {#if showNewContext}
   <div class="modal-backdrop">
     <div class="modal">
-      <header>新建上下文 <button class="btn ghost sm" onclick={() => (showNewContext = false)}>✕</button></header>
+      <header>{t("新建上下文")} <button class="btn ghost sm" onclick={() => (showNewContext = false)}>✕</button></header>
       <div class="body col">
         <div class="field">
-          <label>名称 *</label>
-          <input bind:value={contextName} placeholder="例如：主开发 / Bug修复 / UI重构" onkeydown={(e) => e.key === "Enter" && createContext()} />
+          <label>{t("名称 *")}</label>
+          <input bind:value={contextName} placeholder={t("例如：主开发 / Bug修复 / UI重构")} onkeydown={(e) => e.key === "Enter" && createContext()} />
         </div>
-        <p class="note">Context 不绑定某一种 AI，可分别与 Codex / ZCode 新建会话或绑定历史会话。</p>
+        <p class="note">{t("Context 不绑定某一种 AI，可分别与 Codex / ZCode 新建会话或绑定历史会话。")}</p>
       </div>
       <footer>
-        <button class="btn" onclick={() => (showNewContext = false)}>取消</button>
-        <button class="btn primary" onclick={createContext}>创建</button>
+        <button class="btn" onclick={() => (showNewContext = false)}>{t("取消")}</button>
+        <button class="btn primary" onclick={createContext}>{t("创建")}</button>
       </footer>
     </div>
   </div>

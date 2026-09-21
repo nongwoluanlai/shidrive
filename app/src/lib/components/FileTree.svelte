@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../i18n";
   // Right-docked file tree. Single-click selects/opens preview in the editor pane.
   import { app, currentProject, toast, openEditor, closeEditor } from "../state.svelte";
 import { confirmDialog, promptDialog } from "../dialog.svelte";
@@ -102,25 +103,25 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     e.stopPropagation();
     const dir = node.is_dir ? node.path : parentPath(node.path);
     const items: MenuItem[] = [
-      { label: "📋 复制路径", run: () => navigator.clipboard.writeText(node.path).then(() => toast("ok", "路径已复制")).catch((err) => toast("error", String(err))) },
-      { label: node.is_dir ? "📂 打开所在位置" : "📂 在所在位置显示", run: () => api.fsOpenExplorer(dir).catch((err) => toast("error", String(err))) },
+      { label: t("📋 复制路径"), run: () => navigator.clipboard.writeText(node.path).then(() => toast("ok", t("路径已复制"))).catch((err) => toast("error", String(err))) },
+      { label: node.is_dir ? t("📂 打开所在位置") : t("📂 在所在位置显示"), run: () => api.fsOpenExplorer(dir).catch((err) => toast("error", String(err))) },
       {
-        label: "✏️ 重命名",
+        label: t("✏️ 重命名"),
         run: () => {
           renaming = node.path;
           renameValue = node.name;
         },
       },
-      { label: "⧉ 复制", run: () => api.fsCopyToClipboard([node.path]).then(() => toast("ok", "已复制到系统剪贴板")).catch((err) => toast("error", String(err))) },
-      { label: "📋 粘贴到该文件夹", run: () => api.fsPasteFromClipboard(dir).then(() => reloadParent(dir)).then(() => toast("ok", "已粘贴")).catch((err) => toast("error", String(err))) },
+      { label: t("⧉ 复制"), run: () => api.fsCopyToClipboard([node.path]).then(() => toast("ok", t("已复制到系统剪贴板"))).catch((err) => toast("error", String(err))) },
+      { label: t("📋 粘贴到该文件夹"), run: () => api.fsPasteFromClipboard(dir).then(() => reloadParent(dir)).then(() => toast("ok", t("已粘贴"))).catch((err) => toast("error", String(err))) },
       "sep",
-      { label: "🖥 在 cmd 打开", run: () => api.fsOpenCmd(dir).catch((err) => toast("error", String(err))) },
-      { label: "🖥 在 PowerShell 打开", run: () => api.fsOpenTerminal(dir).catch((err) => toast("error", String(err))) },
+      { label: t("🖥 在 cmd 打开"), run: () => api.fsOpenCmd(dir).catch((err) => toast("error", String(err))) },
+      { label: t("🖥 在 PowerShell 打开"), run: () => api.fsOpenTerminal(dir).catch((err) => toast("error", String(err))) },
       {
-        label: "📄 新建文件",
+        label: t("📄 新建文件"),
         run: () => {
           void (async () => {
-            const name = await promptDialog({ title: "新建文件", label: "文件名 *" });
+            const name = await promptDialog({ title: t("新建文件"), label: t("文件名 *") });
             if (name === null || !name.trim()) return;
             try {
               await api.fsCreateFile(dir + "\\" + name);
@@ -132,10 +133,10 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
         },
       },
       {
-        label: "📁 新建文件夹",
+        label: t("📁 新建文件夹"),
         run: () => {
           void (async () => {
-            const name = await promptDialog({ title: "新建文件夹", label: "文件夹名 *" });
+            const name = await promptDialog({ title: t("新建文件夹"), label: t("文件夹名 *") });
             if (name === null || !name.trim()) return;
             try {
               await api.fsCreateDir(dir + "\\" + name);
@@ -148,14 +149,14 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       },
       "sep",
       {
-        label: "🗑 移入回收站",
+        label: t("🗑 移入回收站"),
         danger: true,
         run: () => {
           void (async () => {
-            if (!(await confirmDialog({ title: "删除", message: `将 ${node.name} 移入回收站？`, danger: true, confirmText: "移入回收站" }))) return;
+            if (!(await confirmDialog({ title: t("删除"), message: t("将 {p0} 移入回收站？", { p0: node.name }), danger: true, confirmText: t("移入回收站") }))) return;
             try {
               await api.fsDelete(node.path);
-              toast("ok", "已删除");
+              toast("ok", t("已删除"));
               if (app.editor?.path === node.path || app.editor?.path.startsWith(node.path + "\\")) closeEditor();
               await reloadParent(parentPath(node.path));
             } catch (err) {
@@ -178,7 +179,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     try {
       await api.fsRename(from, to);
       await reloadParent(parent);
-      toast("ok", "已重命名");
+      toast("ok", t("已重命名"));
     } catch (e) {
       toast("error", String(e));
     }
@@ -188,11 +189,11 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
 <div class="tree-pane">
   <div class="bar">
     <Icon name="folder" size={14} />
-    <span class="title" title={root}>{project?.name ?? "文件"}</span>
+    <span class="title" title={root}>{project?.name ?? t("文件")}</span>
     <span class="spacer"></span>
-    <button class="btn ghost sm" title="刷新" onclick={() => refresh()}><Icon name="refresh" size={13} /></button>
-    <button class="btn ghost sm" title="资源管理器" onclick={() => api.fsOpenExplorer(root).catch((e) => toast("error", String(e)))}>↗</button>
-    <button class="btn ghost sm" title="在 VS Code 中打开" onclick={() => api.fsOpenVscode(root).catch((e) => toast("error", String(e)))}><Icon name="code" size={13} /></button>
+    <button class="btn ghost sm" title={t("刷新")} onclick={() => refresh()}><Icon name="refresh" size={13} /></button>
+    <button class="btn ghost sm" title={t("资源管理器")} onclick={() => api.fsOpenExplorer(root).catch((e) => toast("error", String(e)))}>↗</button>
+    <button class="btn ghost sm" title={t("在 VS Code 中打开")} onclick={() => api.fsOpenVscode(root).catch((e) => toast("error", String(e)))}><Icon name="code" size={13} /></button>
   </div>
   <div class="tree">
     {#each tree as node (node.path)}

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../i18n";
   import { app, toast } from "../state.svelte";
   import { api } from "../ipc";
 
@@ -21,7 +22,7 @@
       // answer first; shift afterwards so the request stays visible if the IPC throws
       await api.acpRespondPermission(req.requestId, optionId);
     } catch (e) {
-      toast("error", `权限应答失败: ${e}`);
+      toast("error", t("权限应答失败: {p0}", { p0: String(e) }));
     }
     app.permissions.shift();
   }
@@ -37,12 +38,12 @@
   <div class="modal-backdrop">
     <div class="modal perm">
       <header>
-        <span>{kindIcon(req.params?.toolCall?.kind)} 权限请求 — {req.agentType === "codex" ? "Codex" : "ZCode"}</span>
+        <span>{kindIcon(req.params?.toolCall?.kind)} {t("权限请求 —")} {app.agents.find((a) => a.id === req.agentType)?.name ?? req.agentType}</span>
       </header>
       <div class="body">
-        <p class="title">{req.params?.toolCall?.title ?? "Agent 请求执行操作"}</p>
+        <p class="title">{req.params?.toolCall?.title ?? t("Agent 请求执行操作")}</p>
         {#if inputText}
-          <pre>{inputText.length > 2000 ? inputText.slice(0, 2000) + "\n…(截断)" : inputText}</pre>
+          <pre>{inputText.length > 2000 ? inputText.slice(0, 2000) + t("\n…(截断)") : inputText}</pre>
         {/if}
       </div>
       <footer>

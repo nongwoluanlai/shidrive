@@ -156,10 +156,10 @@ fn adapter_script_in(nm: &std::path::Path, npm_pkg: &str) -> Option<PathBuf> {
             // 取与包名同名的 bin；serde_json Map 按键排序，不能取"第一个"，
             // 按包名最后一段后缀匹配（如 @qoder-ai/qodercli → qodercli）
             let short = npm_pkg.rsplit('/').next().unwrap_or(npm_pkg);
-            m.iter()
-                .find(|(k, _)| k.as_str() == npm_pkg || k.as_str().ends_with(short))
-                .or_else(|| m.iter().next())
-                .and_then(|(_, x)| x.as_str())
+            m.get(npm_pkg).or_else(|| m.get(short))
+                .or_else(|| m.iter().find(|(k, _)| k.as_str().ends_with(short)).map(|(_, v)| v))
+                .or_else(|| m.values().next())
+                .and_then(|x| x.as_str())
                 .map(|s| s.to_string())?
         }
         _ => return None,
@@ -170,7 +170,7 @@ fn adapter_script_in(nm: &std::path::Path, npm_pkg: &str) -> Option<PathBuf> {
         .split(['/', '\\'])
         .filter(|s| !s.is_empty() && *s != ".")
         .fold(pkg_dir, |acc, seg| acc.join(seg));
-    if script.exists() {
+    if script.is_file() {
         Some(script)
     } else {
         None
@@ -191,6 +191,23 @@ pub fn resolve_adapter_file(tools: &Tools, rel: &[&str]) -> PathBuf {
         }
     }
     rel.iter().fold(tools.acp_node_modules(), |acc, s| acc.join(s))
+}
+
+/// 后台 npm 不弹控制台窗。
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[test]
+    fn exact_package_bin_wins_over_suffix_match() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("bin-test-{}", uuid::Uuid::new_v4()));
+        let package = root.join("@scope/cli");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("package.json"), r#"{"bin":{"a-cli":"wrong.js","cli":"right.js"}}"#).unwrap();
+        std::fs::write(package.join("wrong.js"), "").unwrap();
+        std::fs::write(package.join("right.js"), "").unwrap();
+        assert_eq!(adapter_script_in(&root, "@scope/cli"), Some(package.join("right.js")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 /// 后台 npm 不弹控制台窗。
@@ -344,7 +361,7 @@ pub struct AgentEnvStatus {
 pub fn registry_status(db: &Arc<Db>, tools: &Tools) -> Vec<AgentEnvStatus> {
     let enabled = enabled_agents(db);
     let node = tools.node_exe();
-    let node_ready = node.exists() || node.to_string_lossy() == "node";
+    let node_ready = node.is_file();
     agent_specs()
         .iter()
         .map(|sp| {
@@ -373,6 +390,9 @@ pub fn registry_status(db: &Arc<Db>, tools: &Tools) -> Vec<AgentEnvStatus> {
                 "zcode" => {
                     if let Some(z) = tools.zcode_cli() {
                         auto_env.insert("ZCODE_BIN".to_string(), z.to_string_lossy().to_string());
+                        if let Some(provider) = tools.zcode_provider_config(&z) {
+                            auto_env.insert("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE".into(), provider.to_string_lossy().to_string());
+                        }
                     }
                     let node = tools.node_exe();
                     if node.exists() {

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t, localeTag } from "../i18n";
   // 绑定历史会话: pick an existing adapter session and bind it to the current context.
   // 表格形式：可按 工作目录/时间 排序（默认时间倒序），搜索覆盖标题/ID/目录。
   import { app, currentContext, toast, setChatRows, chatKey } from "../state.svelte";
@@ -44,8 +45,8 @@
     const dir = sortAsc ? 1 : -1;
     return [...rows].sort((x, y) => {
       if (sortKey === "time") return dir * (x.updated_at ?? "").localeCompare(y.updated_at ?? "");
-      if (sortKey === "cwd") return dir * (x.cwd ?? "").localeCompare(y.cwd ?? "", "zh");
-      return dir * (x.title ?? "").localeCompare(y.title ?? "", "zh");
+      if (sortKey === "cwd") return dir * (x.cwd ?? "").localeCompare(y.cwd ?? "", localeTag());
+      return dir * (x.title ?? "").localeCompare(y.title ?? "", localeTag());
     });
   });
 
@@ -66,9 +67,9 @@
       const rows = await api.acpSessionBind(c, a, s.session_id, s.title ?? undefined);
       setChatRows(chatKey(c.id, a), rows);
       app.historyBind = null;
-      toast("ok", rows.length ? `已绑定并加载会话历史（${rows.length} 条）` : "已绑定会话（该会话暂无历史记录）");
+      toast("ok", rows.length ? t("已绑定并加载会话历史（{p0} 条）", { p0: rows.length }) : t("已绑定会话（该会话暂无历史记录）"));
     } catch (e) {
-      toast("error", `绑定失败: ${e}`);
+      toast("error", t("绑定失败: {p0}", { p0: String(e) }));
     } finally {
       binding = null;
     }
@@ -79,22 +80,22 @@
   <div class="modal-backdrop">
     <div class="modal wide">
       <header>
-        <span>绑定历史会话 — {agent === "codex" ? "Codex" : "ZCode"}（{ctx?.name ?? ""}）· 共 {sessions.length} 条</span>
+        <span>{t("绑定历史会话 — {agent}（{context}）· 共 {count} 条", { agent: app.agents.find((a) => a.id === agent)?.name ?? agent, context: ctx?.name ?? "", count: sessions.length })}</span>
         <button class="btn ghost sm" onclick={() => (app.historyBind = null)}>✕</button>
       </header>
       <div class="body">
-        <input class="search" placeholder="按标题、会话 ID 或工作目录搜索…" bind:value={query} />
+        <input class="search" placeholder={t("按标题、会话 ID 或工作目录搜索…")} bind:value={query} />
         {#if loading}
-          <p class="none">正在从适配器读取会话列表…</p>
+          <p class="none">{t("正在从适配器读取会话列表…")}</p>
         {:else}
           <div class="tbl-wrap">
             <table class="tbl">
               <thead>
                 <tr>
-                  <th class="sortable" onclick={() => setSort("title")}>标题 {sortKey === "title" ? (sortAsc ? "↑" : "↓") : ""}</th>
-                  <th class="sortable" onclick={() => setSort("cwd")}>工作目录 {sortKey === "cwd" ? (sortAsc ? "↑" : "↓") : ""}</th>
-                  <th class="sortable" onclick={() => setSort("time")}>时间 {sortKey === "time" ? (sortAsc ? "↑" : "↓") : ""}</th>
-                  <th class="op-col">操作</th>
+                  <th class="sortable" onclick={() => setSort("title")}>{t("标题")} {sortKey === "title" ? (sortAsc ? "↑" : "↓") : ""}</th>
+                  <th class="sortable" onclick={() => setSort("cwd")}>{t("工作目录")} {sortKey === "cwd" ? (sortAsc ? "↑" : "↓") : ""}</th>
+                  <th class="sortable" onclick={() => setSort("time")}>{t("时间")} {sortKey === "time" ? (sortAsc ? "↑" : "↓") : ""}</th>
+                  <th class="op-col">{t("操作")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -105,19 +106,19 @@
                     <td class="t-time">{s.updated_at || "—"}</td>
                     <td class="op-col">
                       <button class="btn sm primary" disabled={binding !== null} onclick={() => bind(s)}>
-                        {#if binding === s.session_id}<span class="spin">◠</span> 绑定中…{:else}绑定{/if}
+                        {#if binding === s.session_id}<span class="spin">◠</span> {t("绑定中…")}{:else}{t("绑定")}{/if}
                       </button>
                     </td>
                   </tr>
                 {:else}
-                  <tr><td colspan="4" class="none">{query ? "没有匹配的会话" : "适配器没有返回历史会话"}</td></tr>
+                  <tr><td colspan="4" class="none">{query ? t("没有匹配的会话") : t("适配器没有返回历史会话")}</td></tr>
                 {/each}
               </tbody>
             </table>
           </div>
         {/if}
       </div>
-      <p class="tip"><Icon name="link" size={12} /> 绑定后，使驾会通过 session/load 恢复该会话；如需共享上下文，请复制「接入提示词」发送给 Agent。</p>
+      <p class="tip"><Icon name="link" size={12} /> {t("绑定后，使驾会通过 session/load 恢复该会话；如需共享上下文，请复制「接入提示词」发送给 Agent。")}</p>
     </div>
   </div>
 {/if}

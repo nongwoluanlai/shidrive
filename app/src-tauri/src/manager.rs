@@ -14,6 +14,48 @@ use crate::db::Db;
 use crate::models::*;
 use crate::setup::Tools;
 
+fn configured_env_path(env: &std::collections::BTreeMap<String, String>, key: &str) -> Option<std::path::PathBuf> {
+    env.get(key).cloned().or_else(|| std::env::var(key).ok())
+        .filter(|v| !v.trim().is_empty()).map(std::path::PathBuf::from)
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[test]
+    fn env_only_override_resolves_without_autodiscovery() {
+        let env = std::collections::BTreeMap::from([
+            ("ZCODE_BIN".into(), "custom/zcode.cjs".into()),
+            ("ZCODE_NODE".into(), "custom/node.exe".into()),
+        ]);
+        assert_eq!(configured_env_path(&env, "ZCODE_BIN"), Some("custom/zcode.cjs".into()));
+        assert_eq!(configured_env_path(&env, "ZCODE_NODE"), Some("custom/node.exe".into()));
+    }
+}
+
+/// Cancelling the future must cancel the session it actually prompted (including temp sessions).
+struct ActiveTurn<'a> {
+    manager: &'a AgentManager,
+    conn: Arc<AcpConnection>,
+    session_id: String,
+    context_id: String,
+    agent_type: String,
+    completed: bool,
+}
+
+impl Drop for ActiveTurn<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.conn.notify("session/cancel", json!({ "sessionId": self.session_id }));
+            let _ = self.manager.db.set_binding_status(&self.context_id, &self.agent_type, "interrupted");
+            let _ = self.manager.app.emit("acp://binding-status", json!({
+                "contextId": self.context_id, "agentType": self.agent_type, "status": "interrupted"
+            }));
+        }
+        let _ = self.conn.end_turn(&self.session_id);
+    }
+}
+
 pub fn enabled_agents(db: &Arc<Db>) -> Vec<String> {
     crate::agents::enabled_agents(db)
 }
@@ -32,6 +74,8 @@ pub struct AgentManager {
     pub tools: Tools,
     conns: RwLock<HashMap<String, Arc<AcpConnection>>>,
     overrides: RwLock<HashMap<String, AgentLaunch>>,
+    /// Serialize connect, disconnect and config replacement for each adapter.
+    connection_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// serializes prompts per (context_id, agent_type) so a UI turn and a
     /// workflow turn on the same binding never interleave
     prompt_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -49,7 +93,7 @@ impl AgentManager {
                 }
             }
         }
-        Self { app, db, tools, conns: RwLock::new(HashMap::new()), overrides: RwLock::new(overrides), prompt_locks: std::sync::Mutex::new(HashMap::new()) }
+        Self { app, db, tools, conns: RwLock::new(HashMap::new()), overrides: RwLock::new(overrides), connection_locks: std::sync::Mutex::new(HashMap::new()), prompt_locks: std::sync::Mutex::new(HashMap::new()) }
     }
 
     fn prompt_lock(&self, context_id: &str, agent_type: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -63,7 +107,21 @@ impl AgentManager {
         format!("http://127.0.0.1:{port}/mcp")
     }
 
+    fn connection_lock(&self, agent_type: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.connection_locks.lock().unwrap().entry(agent_type.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    }
+
+    /// Manual settings only: auto-discovery belongs in the read-only status UI.
+    pub async fn override_for(&self, agent_type: &str) -> AgentLaunch {
+        self.overrides.read().await.get(agent_type).cloned().unwrap_or_else(|| AgentLaunch {
+            command: String::new(), args: Vec::new(), env: Default::default(),
+        })
+    }
+
     pub async fn set_override(&self, agent_type: &str, launch: Option<AgentLaunch>) {
+        let lock = self.connection_lock(agent_type);
+        let _guard = lock.lock().await;
         let key = format!("agent.{agent_type}");
         let mut overrides = self.overrides.write().await;
         match launch {
@@ -76,87 +134,75 @@ impl AgentManager {
                 overrides.remove(agent_type);
             }
         }
-        self.disconnect(agent_type).await;
+        drop(overrides);
+        self.disconnect_locked(agent_type).await;
     }
 
-    /// Effective launch config: user override or auto-discovered default (registry-driven).
-    /// zcode.cjs 拷贝不完整时，从完整桌面安装复制 provider 目录过来。
-    fn zcode_repair_provider(&self, zc: &std::path::Path) -> Result<String, String> {
-        let glm = zc.parent().ok_or("无法定位 zcode.cjs 目录")?;
-        let dst = glm.join("provider");
-        if dst.join("zcode-builtin.json").exists() {
-            return Ok("provider 配置已存在".to_string());
-        }
-        for src in self.tools.zcode_desktop_glm_dirs() {
-            let src_provider = src.join("provider");
-            if !src_provider.join("zcode-builtin.json").exists() {
-                continue;
-            }
-            std::fs::create_dir_all(&dst).map_err(|e| format!("创建 provider 目录失败: {e}"))?;
-            let mut copied = 0;
-            if let Ok(entries) = std::fs::read_dir(&src_provider) {
-                for f in entries.flatten() {
-                    if f.path().is_file() {
-                        if std::fs::copy(f.path(), dst.join(f.file_name())).is_ok() {
-                            copied += 1;
-                        }
-                    }
-                }
-            }
-            if copied > 0 {
-                return Ok(format!("已从 {} 复制 {copied} 个 provider 配置文件到 {}", src_provider.display(), dst.display()));
-            }
-        }
-        Err("本机没有找到完整的 ZCode 桌面安装（含 provider 配置）可复制。请重装/修复 ZCode 桌面版，或把完整安装的 resources\\glm\\provider 目录补到 zcode.cjs 旁边".to_string())
-    }
-
-    /// zcode 后端预检：用与适配器相同的方式（ZCODE_NODE + zcode.cjs）拉起后端 3 秒探活。
-    /// 启动即退（非 0）时把真实 stderr 返回给用户，替代含混的 "backend dead"。
-    async fn zcode_preflight(&self, zc: &std::path::Path) -> Result<(), String> {
-        let node = self.tools.node_exe();
-        let mut cmd = tokio::process::Command::new(&node);
-        cmd.arg(zc)
-            // 与适配器真实启动完全一致：zcode app-server --stdio
-            // （裸启动会进 TUI 分支，误报 @zcode/tui 缺失）
-            .args(["app-server", "--stdio"])
+    /// Probe the same CLI, Node and environment that the adapter will inherit.
+    async fn zcode_preflight(&self, launch: &AgentLaunch) -> Result<(), String> {
+        let zc = launch.env.get("ZCODE_BIN").ok_or("未配置 ZCODE_BIN")?;
+        let node = launch.env.get("ZCODE_NODE").unwrap_or(&launch.command);
+        let is_script = std::path::Path::new(zc).extension().and_then(|s| s.to_str())
+            .map(|ext| matches!(ext, "cjs" | "mjs" | "js")).unwrap_or(false);
+        let mut cmd = tokio::process::Command::new(if is_script { node } else { zc });
+        if is_script { cmd.arg(zc); }
+        // Probe server mode, never the interactive TUI entry point.
+        cmd.args(["app-server", "--stdio"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        crate::acp::apply_launch_env(&mut cmd, &launch.env);
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000);
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("zcode 后端预检：无法用 {} 启动 {}: {e}", node.display(), zc.display()))?;
-        let mut err_pipe = child.stderr.take();
-        let reader = tokio::spawn(async move {
+            .map_err(|e| format!("zcode 后端预检：无法用 {node} 启动 {zc}: {e}"))?;
+        let stderr = child.stderr.take().ok_or("zcode 预检缺少 stderr")?;
+        // Keep stderr draining, but retain only a bounded diagnostic tail. No detached reader.
+        let diagnostic = async move {
             use tokio::io::AsyncReadExt;
-            let mut buf = String::new();
-            if let Some(p) = err_pipe.as_mut() {
-                let _ = p.read_to_string(&mut buf).await;
+            let mut stderr = stderr;
+            let mut tail = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = stderr.read(&mut chunk).await {
+                if n == 0 { break; }
+                tail.extend_from_slice(&chunk[..n]);
+                if tail.len() > 16 * 1024 { tail.drain(..tail.len() - 16 * 1024); }
             }
-            buf
-        });
-        match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
+            String::from_utf8_lossy(&tail).to_string()
+        };
+        tokio::pin!(diagnostic);
+        let mut output = None;
+        let status = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    status = child.wait() => break status,
+                    text = &mut diagnostic, if output.is_none() => output = Some(text),
+                }
+            }
+        }).await;
+        match status {
             Err(_) => {
-                let _ = child.kill().await;
-                log::info!("[zcode] preflight: backend stayed alive (ok)");
+                child.kill().await.map_err(|e| format!("zcode 预检进程清理失败: {e}"))?;
                 Ok(())
             }
-            Ok(Ok(st)) if st.success() => Ok(()),
-            Ok(Ok(_)) => {
-                let out = reader.await.unwrap_or_default();
+            Ok(Ok(st)) => {
+                let out = match output {
+                    Some(text) => text,
+                    None => tokio::time::timeout(Duration::from_millis(250), &mut diagnostic).await.unwrap_or_default(),
+                };
                 let tail = out.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
-                Err(format!("zcode 后端启动即退出：{}", if tail.is_empty() { "无错误输出（请确认 ZCode 桌面端已登录）" } else { &tail }))
+                Err(format!("zcode 后端启动即退出（{st}）：{}", if tail.is_empty() { "无错误输出" } else { &tail }))
             }
             Ok(Err(e)) => Err(format!("zcode 后端预检失败: {e}")),
         }
     }
 
     pub async fn launch_for(&self, agent_type: &str) -> Result<AgentLaunch, String> {
-        if let Some(l) = self.overrides.read().await.get(agent_type) {
-            if !l.command.trim().is_empty() {
-                return Ok(l.clone());
-            }
+        let manual = self.override_for(agent_type).await;
+        if !manual.command.trim().is_empty() {
+            return Ok(manual);
         }
         let sp = crate::agents::spec(agent_type)
             .ok_or_else(|| format!("未知的 Agent 类型：{agent_type}（可在「设置 → Agent 管理」启用更多工具）"))?;
@@ -182,39 +228,33 @@ impl AgentManager {
                 }
             }
             "zcode" => {
-                // 提前校验：适配器内部对 zcode CLI 的探测更窄，找不到时会以
-                // "backend dead / zcode list failed" 这类含混报错收场
-                let zc = match self.tools.zcode_cli() {
-                    Some(z) => z,
-                    None => return Err("未找到 ZCode 桌面端的 zcode.cjs：请确认已安装 ZCode 桌面版；若安装在非标准位置，请在「设置 → Agent 管理」展开 ZCode，在环境变量里配置 ZCODE_BIN=<zcode.cjs 完整路径>".to_string()),
-                };
-                log::info!("[zcode] cli resolved: {}", zc.display());
-                if let Err(e) = self.zcode_preflight(&zc).await {
-                    // zcode.cjs 拷贝不完整（缺 provider 配置）时，尝试从完整桌面安装
-                    // 自动补全 provider 目录并重试一次
-                    let missing = e.contains("Provider Config") || e.contains("无法定位");
-                    if !missing {
-                        return Err(e);
-                    }
-                    match self.zcode_repair_provider(&zc) {
-                        Ok(msg) => {
-                            log::info!("[zcode] provider repaired: {msg}");
-                            self.zcode_preflight(&zc).await?;
-                        }
-                        Err(re) => return Err(format!("{e}；自动补全失败：{re}")),
-                    }
+                let zc = configured_env_path(&manual.env, "ZCODE_BIN")
+                    .or_else(|| self.tools.zcode_cli())
+                    .ok_or("未找到 ZCode 桌面端的 zcode.cjs：请在环境变量里配置 ZCODE_BIN=<zcode.cjs 完整路径>")?;
+                let backend_node = configured_env_path(&manual.env, "ZCODE_NODE").unwrap_or_else(|| node.clone());
+                env.insert("ZCODE_BIN".into(), zc.to_string_lossy().to_string());
+                env.insert("ZCODE_NODE".into(), backend_node.to_string_lossy().to_string());
+                if let Some(provider) = manual.env.get("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE").map(std::path::PathBuf::from)
+                    .or_else(|| self.tools.zcode_provider_config(&zc))
+                    .or_else(|| configured_env_path(&manual.env, "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE")) {
+                    env.insert("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE".into(), provider.to_string_lossy().to_string());
+                }
+                if let Some(personal) = configured_env_path(&manual.env, "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE")
+                    .or_else(|| {
+                        let home = configured_env_path(&manual.env, "ZCODE_HOME").or_else(|| {
+                            configured_env_path(&manual.env, "HOME").or_else(|| configured_env_path(&manual.env, "USERPROFILE"))
+                                .map(|home| home.join(".zcode"))
+                        })?;
+                        let path = home.join("v2").join("provider_config.json");
+                        path.is_file().then_some(path)
+                    }) {
+                    env.insert("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE".into(), personal.to_string_lossy().to_string());
                 }
                 let adapter = self.tools.zcode_adapter();
                 if !adapter.exists() {
                     return Err(format!("未找到 zcode 适配器：请在「设置 → Agent 管理」展开 ZCode 后点「安装适配器」。"));
                 }
                 args = vec!["--disable-warning=ExperimentalWarning".into(), adapter.to_string_lossy().to_string()];
-                if let Some(cli) = self.tools.zcode_cli() {
-                    env.insert("ZCODE_BIN".to_string(), cli.to_string_lossy().to_string());
-                }
-                if self.tools.node_exe().exists() {
-                    env.insert("ZCODE_NODE".to_string(), self.tools.node_exe().to_string_lossy().to_string());
-                }
             }
             _ => {
                 let pkg = sp
@@ -227,11 +267,7 @@ impl AgentManager {
                 args.extend(sp.args.iter().cloned());
             }
         }
-        if let Some(l) = self.overrides.read().await.get(agent_type) {
-            for (k, v) in &l.env {
-                env.insert(k.clone(), v.clone());
-            }
-        }
+        env.extend(manual.env);
         Ok(AgentLaunch { command: node_str, args, env: env.into_iter().collect() })
     }
 
@@ -243,6 +279,12 @@ impl AgentManager {
     }
 
     pub async fn disconnect(&self, agent_type: &str) {
+        let lock = self.connection_lock(agent_type);
+        let _guard = lock.lock().await;
+        self.disconnect_locked(agent_type).await;
+    }
+
+    async fn disconnect_locked(&self, agent_type: &str) {
         if let Some(c) = self.conns.write().await.remove(agent_type) {
             c.shutdown();
         }
@@ -250,6 +292,8 @@ impl AgentManager {
     }
 
     pub async fn ensure_connected(&self, agent_type: &str) -> Result<Arc<AcpConnection>, String> {
+        let lock = self.connection_lock(agent_type);
+        let _guard = lock.lock().await;
         {
             let conns = self.conns.read().await;
             if let Some(c) = conns.get(agent_type) {
@@ -258,7 +302,13 @@ impl AgentManager {
                 }
             }
         }
+        if let Some(stale) = self.conns.write().await.remove(agent_type) {
+            stale.shutdown();
+        }
         let launch = self.launch_for(agent_type).await?;
+        if agent_type == "zcode" && self.override_for(agent_type).await.command.trim().is_empty() {
+            self.zcode_preflight(&launch).await?;
+        }
         let conn = AcpConnection::spawn(self.app.clone(), agent_type, &launch).await?;
         self.conns.write().await.insert(agent_type.to_string(), conn.clone());
         Ok(conn)
@@ -286,7 +336,7 @@ impl AgentManager {
             .get("agentCapabilities")
             .and_then(|c| c.get("mcpCapabilities"))
             .and_then(|m| m.get("http"))
-            .map(|v| !v.is_null())
+            .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let no_mcp_caps = caps.get("agentCapabilities").and_then(|c| c.get("mcpCapabilities")).is_none();
         if declared_http || no_mcp_caps {
@@ -467,12 +517,12 @@ impl AgentManager {
         // one turn at a time per (context, agent)
         let turn_lock = self.prompt_lock(&context.id, agent_type);
         let _turn = turn_lock.lock().await;
-        let conn = self.ensure_connected(agent_type).await?;
+        let mut conn = self.ensure_connected(agent_type).await?;
         let cwd = self.project_root_for(context);
         let sid: String = match target {
             SessionTarget::Binding => {
                 let (conn2, sid) = self.ensure_session(context, agent_type).await?;
-                drop(conn2);
+                conn = conn2;
                 sid
             }
             SessionTarget::Explicit(sid) => {
@@ -492,6 +542,10 @@ impl AgentManager {
         };
 
         conn.begin_turn(&sid, &context.id);
+        let mut turn = ActiveTurn {
+            manager: self, conn: conn.clone(), session_id: sid.clone(), context_id: context.id.clone(),
+            agent_type: agent_type.to_string(), completed: false,
+        };
         let _ = self.db.set_binding_status(&context.id, agent_type, "running");
         let _ = self.app.emit("acp://binding-status", json!({ "contextId": context.id, "agentType": agent_type, "status": "running" }));
         let mut blocks = Vec::new();
@@ -516,7 +570,7 @@ impl AgentManager {
         let _ = self.db.set_binding_status(&context.id, agent_type, final_status);
         let _ = self.app.emit("acp://binding-status", json!({ "contextId": context.id, "agentType": agent_type, "status": final_status }));
         // 回合内容经 acp://update 实时流给前端；历史不再落本地库
-        let _ = conn.end_turn(&sid);
+        turn.completed = true;
         result
     }
 

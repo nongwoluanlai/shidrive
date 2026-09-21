@@ -1,34 +1,49 @@
-/* 皮肤主题变量（独立文件：避免与后代规则同文件时的打包问题） */
+/* Skin tokens live on body: base-theme inline tokens on html remain intact. */
 body[data-skin="steins-gate"] {
-  --bg: #080c0f;
-  --bg-panel: #0d1317f2;
-  --bg-elev: #111a1fe8;
-  --border: #2a3b33;
-  --border-soft: #1e2c27;
-  --text: #cfe6cf;
-  --text-dim: #8fb09a;
-  --text-faint: #5d7a67;
-  --accent: #b7d36b;
-  --accent-soft: #b7d36b26;
-  --danger: #d83b3b;
-  --code-bg: #0a1114;
-  --mono: "Consolas", "Cascadia Mono", ui-monospace, monospace;
-  --radius: 4px;
-  font-family: var(--mono);
+  color-scheme: dark;
+  --bg: #0c120e;
+  --bg-panel: #111c15;
+  --bg-elev: #1a2a1e;
+  --bg-elev2: #253a28;
+  --border: #526c45;
+  --border-soft: #344b36;
+  --text: #eef7e8;
+  --text-dim: #c3d4b8;
+  --text-faint: #a1b295;
+  --accent: #baff62;
+  --accent-contrast: #102008;
+  --accent-soft: #2c4220;
+  --danger: #ff9393;
+  --ok: #baff62;
+  --warn: #ffd079;
+  --code-bg: #0e1911;
+  --scroll: #5b7451;
+  --shadow: 0 12px 36px #0009;
+  --radius: 7px;
+  --skin-bg: url("/skins/steins-gate/bg.png");
+  --skin-character: url("/skins/steins-gate/character.png");
 }
-
 body[data-skin="hell"] {
-  --bg: #14171a;
-  --bg-panel: #1a1e22f0;
-  --bg-elev: #20252af0;
-  --border: #3a3436;
-  --border-soft: #2b2729;
-  --text: #e8e4dc;
-  --text-dim: #b3aca0;
-  --text-faint: #7d766c;
-  --accent: #b52a2a;
-  --accent-soft: #b52a2a26;
-  --code-bg: #101315;
-  --radius: 6px;
+  color-scheme: dark;
+  --bg: #191215;
+  --bg-panel: #24191c;
+  --bg-elev: #332226;
+  --bg-elev2: #452c32;
+  --border: #79565c;
+  --border-soft: #51383f;
+  --text: #fff0e6;
+  --text-dim: #dbc4bf;
+  --text-faint: #bea29e;
+  --accent: #ff9292;
+  --accent-contrast: #321014;
+  --accent-soft: #54282e;
+  --danger: #ffb0a2;
+  --ok: #a3d1af;
+  --warn: #edca89;
+  --code-bg: #21171a;
+  --scroll: #826269;
+  --shadow: 0 12px 36px #0009;
+  --radius: 10px;
+  --skin-bg: url("/skins/hell/bg.png");
+  --skin-character: url("/skins/hell/character.png");
 }
-

@@ -446,115 +446,26 @@ pub async fn setup_status(agents: AgentsState<'_>) -> Result<SetupStatus, String
     Ok(agents.setup_status())
 }
 
-/// 导入皮肤包（zip：skin.json + 图片/可选 custom.css），解压到用户数据 skins/<id>/。
+/// Import a bounded skin package into the skin store.
 #[tauri::command]
-pub async fn skin_import(db: DbState<'_>, path: String) -> Result<serde_json::Value, String> {
-    let appdata = std::env::var("APPDATA").map_err(|_| "无法确定用户数据目录".to_string())?;
-    let skins_root = std::path::PathBuf::from(&appdata).join("com.shidrive.desktop").join("skins");
-    std::fs::create_dir_all(&skins_root).map_err(|e| format!("创建目录失败: {e}"))?;
-
-    let file = std::fs::File::open(&path).map_err(|e| format!("打开失败: {e}"))?;
-    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|e| format!("读取压缩包失败: {e}"))?;
-
-    // 先找 skin.json 确定 id
-    let mut manifest_raw = String::new();
-    for i in 0..archive.len() {
-        let mut f = archive.by_index(i).map_err(|e| format!("压缩包损坏: {e}"))?;
-        if f.name().ends_with("skin.json") {
-            std::io::Read::read_to_string(&mut f, &mut manifest_raw).map_err(|e| format!("读取 skin.json 失败: {e}"))?;
-            break;
-        }
-    }
-    if manifest_raw.is_empty() {
-        return Err("皮肤包缺少 skin.json".into());
-    }
-    let manifest: serde_json::Value = serde_json::from_str(&manifest_raw).map_err(|e| format!("skin.json 解析失败: {e}"))?;
-    let id = manifest
-        .get("id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.replace(['/', '\\', '.', ' '], "-"))
-        .filter(|s| !s.is_empty())
-        .ok_or("skin.json 缺少 id")?;
-
-    let dest = skins_root.join(&id);
-    std::fs::create_dir_all(&dest).map_err(|e| format!("创建目录失败: {e}"))?;
-    for i in 0..archive.len() {
-        let mut f = archive.by_index(i).map_err(|e| format!("压缩包损坏: {e}"))?;
-        let Some(rel) = f.enclosed_name() else { continue };
-        // 跳过包内目录前缀，平铺到皮肤根
-        let name = rel.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        if name.is_empty() || name == "skin.json" {
-            continue;
-        }
-        let out = dest.join(&name);
-        let mut w = std::fs::File::create(&out).map_err(|e| format!("解压失败: {e}"))?;
-        std::io::copy(&mut f, &mut w).map_err(|e| format!("解压失败: {e}"))?;
-    }
-    std::fs::write(dest.join("skin.json"), manifest_raw).map_err(|e| e.to_string())?;
-    let _ = db.set_setting("skins.installed", "1");
-    Ok(manifest)
+pub async fn skin_import(path: String) -> Result<serde_json::Value, String> {
+    let root = crate::skins::root()?;
+    tauri::async_runtime::spawn_blocking(move || crate::skins::import(&root, std::path::Path::new(&path)))
+        .await.map_err(|e| e.to_string())?
 }
 
-/// 列出已导入的自定义皮肤（skins/*/skin.json）。
 #[tauri::command]
 pub async fn skins_list() -> Result<Vec<serde_json::Value>, String> {
-    let mut out = Vec::new();
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let root = std::path::PathBuf::from(appdata).join("com.shidrive.desktop").join("skins");
-        if let Ok(dirs) = std::fs::read_dir(&root) {
-            for d in dirs.flatten() {
-                let mf = d.path().join("skin.json");
-                if let Ok(raw) = std::fs::read_to_string(&mf) {
-                    if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                        v["dir"] = serde_json::json!(d.path().to_string_lossy().to_string());
-                        out.push(v);
-                    }
-                }
-            }
-        }
-    }
-    Ok(out)
+    let root = crate::skins::root()?;
+    tauri::async_runtime::spawn_blocking(move || crate::skins::list(&root))
+        .await.map_err(|e| e.to_string())?
 }
 
-/// 读取自定义皮肤资源，返回 data-url（前端缓存使用）。
 #[tauri::command]
 pub async fn skin_asset_data(skin_dir: String, file: String) -> Result<String, String> {
-    let name = std::path::Path::new(&file)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .ok_or("非法文件名")?;
-    let p = std::path::PathBuf::from(&skin_dir).join(&name);
-    let data = std::fs::read(&p).map_err(|e| format!("读取失败: {e}"))?;
-    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("png").to_lowercase();
-    let mime = match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        _ => "application/octet-stream",
-    };
-    use std::io::Write;
-    let mut b64 = String::new();
-    {
-        let mut encoder = base64_like(&data);
-        b64 = encoder;
-    }
-    Ok(format!("data:{mime};base64,{b64}"))
-}
-
-// 简易 base64（避免引入新依赖）
-fn base64_like(data: &[u8]) -> String {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
-    }
-    out
+    let root = crate::skins::root()?;
+    tauri::async_runtime::spawn_blocking(move || crate::skins::asset(&root, &skin_dir, &file))
+        .await.map_err(|e| e.to_string())?
 }
 
 /// 写文本到系统剪贴板。
@@ -662,7 +573,7 @@ pub async fn node_download(db: DbState<'_>) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn agent_config_get(agents: AgentsState<'_>, agent_type: String) -> Result<AgentLaunch, String> {
-    agents.launch_for(&agent_type).await
+    Ok(agents.override_for(&agent_type).await)
 }
 
 #[tauri::command]

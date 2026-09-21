@@ -2,7 +2,9 @@
   import { md } from "../markdown";
   import type { DisplayItem } from "../state.svelte";
   import { api } from "../ipc";
-  import { toast } from "../state.svelte";
+  import { toast, currentProject } from "../state.svelte";
+  import { t as tr } from "../i18n";
+  import { localLinkPath } from "../markdown";
 
   let { item }: { item: DisplayItem } = $props();
 
@@ -21,27 +23,27 @@
     const done = tools.filter((t) => t.status === "completed").length;
     const failed = tools.filter((t) => t.status === "failed").length;
     const live = tools.filter((t) => t.status === "in_progress" || t.status === "pending").length;
-    const parts: string[] = [`${tools.length} 次调用`];
-    if (live) parts.push(`${live} 进行中`);
-    if (done) parts.push(`${done} 已完成`);
-    if (failed) parts.push(`${failed} 失败`);
+    const parts: string[] = [tr("{count} 次调用", { count: tools.length })];
+    if (live) parts.push(tr("{count} 进行中", { count: live }));
+    if (done) parts.push(tr("{count} 已完成", { count: done }));
+    if (failed) parts.push(tr("{count} 失败", { count: failed }));
     return parts.join(" · ");
   });
 
   const toolStatusClass = (s?: string) =>
     s === "completed" ? "ok" : s === "failed" ? "danger" : s === "in_progress" ? "accent" : "warn";
   const toolStatusText = (s?: string) =>
-    ({ pending: "等待中", in_progress: "执行中", completed: "已完成", failed: "失败" }[s ?? "pending"] ?? s ?? "等待中");
+    tr({ pending: "等待中", in_progress: "执行中", completed: "已完成", failed: "失败" }[s ?? "pending"] ?? s ?? "等待中");
   const toolIcon = (kind?: string) =>
     ({ read: "📖", edit: "✏️", delete: "🗑", move: "📂", search: "🔍", execute: "▶", think: "🤔", fetch: "🌐", plan: "🗺", other: "🔧" }[kind ?? "other"] ??
     "🔧");
 
   function toolDetail(t: { rawInput?: unknown; rawOutput?: unknown }): string {
     const parts: string[] = [];
-    if (t.rawInput !== undefined) parts.push("输入：\n" + JSON.stringify(t.rawInput, null, 2));
+    if (t.rawInput !== undefined) parts.push(tr("输入：") + "\n" + JSON.stringify(t.rawInput, null, 2));
     if (t.rawOutput !== undefined) {
       const out = typeof t.rawOutput === "string" ? t.rawOutput : JSON.stringify(t.rawOutput, null, 2);
-      parts.push("输出：\n" + (out.length > 4000 ? out.slice(0, 4000) + "\n…(截断)" : out));
+      parts.push(tr("输出：") + "\n" + (out.length > 4000 ? out.slice(0, 4000) + "\n" + tr("…(截断)") : out));
     }
     return parts.join("\n\n");
   }
@@ -82,6 +84,7 @@
       }, MD_THROTTLE);
     }
   });
+  $effect(() => () => { if (mdTimer) clearTimeout(mdTimer); });
   const thoughtHtml = $derived(item.kind === "thought" ? html : "");
 
   // ---------- 正文交互：双击 URL 打开浏览器；右键 复制/打开路径目录 ----------
@@ -89,64 +92,70 @@
   import type { MenuItem } from "./menu-item";
   let ctxMenu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
 
+  function onBubbleClick(e: MouseEvent) {
+    if ((e.target as Element).closest?.("a[href]")) e.preventDefault();
+  }
+
   function onBubbleDblclick(e: MouseEvent) {
-    const a = (e.target as HTMLElement).closest?.("a[href]") as HTMLAnchorElement | null;
+    const a = (e.target as Element).closest?.("a[href]");
     const href = a?.getAttribute("href");
-    if (!href) return;
+    if (!href || !/^https?:\/\//i.test(href)) return;
     e.preventDefault();
+    e.stopPropagation();
     void api.fsOpenDefault(href).catch((err) => toast("error", String(err)));
   }
 
   function onBubbleContext(e: MouseEvent) {
-    const target = e.target as HTMLElement;
+    e.preventDefault();
+    e.stopPropagation();
+    const target = e.target as Element;
     const items: MenuItem[] = [];
-    // 选中文字 → 复制选中；否则 → 复制整条消息
-    const sel = window.getSelection()?.toString().trim() ?? "";
-    if (sel) {
-      items.push({ label: "⧉ 复制选中", run: () => void api.clipboardWriteText(sel).then(() => toast("ok", "已复制选中内容")) });
-    }
-    const fileSpan = target.closest(".md-file") as HTMLElement | null;
-    const path = fileSpan?.dataset.path;
-    if (path) {
+    const sel = window.getSelection()?.toString() ?? "";
+    const copy = (text: string, message: string) => void api.clipboardWriteText(text).then(() => toast("ok", tr(message))).catch((err) => toast("error", String(err)));
+    if (sel) items.push({ label: "⧉ 复制选中", run: () => copy(sel, "已复制选中内容") });
+    const file = target.closest<HTMLElement>("[data-path]")?.dataset.path;
+    const href = target.closest("a[href]")?.getAttribute("href");
+    const rawPath = file ?? (href ? localLinkPath(href) : null);
+    if (rawPath) {
+      const path = /^(?:[a-z]:[\\/]|[\\/])/i.test(rawPath) ? rawPath : `${currentProject()?.root_path ?? ""}/${rawPath}`;
       items.push(
         { label: "📂 打开所在目录", run: () => void api.fsOpenExplorer(path).catch((err) => toast("error", String(err))) },
-        { label: "🚀 打开文件/目录", run: () => void api.fsOpenDefault(path).catch((err) => toast("error", String(err))) },
+        { label: "⧉ 复制路径", run: () => copy(rawPath, "已复制路径") },
       );
     }
-    items.push({ label: "⧉ 复制全文", run: () => void api.clipboardWriteText(item.text).then(() => toast("ok", "已复制全文")) });
-    e.preventDefault();
+    items.push({ label: "⧉ 复制全文", run: () => copy(item.text, "已复制全文") });
     ctxMenu = { x: e.clientX, y: e.clientY, items };
   }
 </script>
 
 {#if item.kind === "user"}
   <div class="row user">
-    <div class="bubble user-bubble content" ondblclick={onBubbleDblclick} oncontextmenu={onBubbleContext}>{@html html}</div>
+    <div class="bubble user-bubble content" onclick={onBubbleClick} ondblclick={onBubbleDblclick} oncontextmenu={onBubbleContext}>{@html html}</div>
   </div>
 {:else if item.kind === "assistant"}
   <div class="row">
     <div class="avatar ai">AI</div>
-    <div class="bubble ai-bubble content" class:streaming={item.streaming} ondblclick={onBubbleDblclick} oncontextmenu={onBubbleContext}>{@html html}</div>
+    <div class="bubble ai-bubble content" class:streaming={item.streaming} onclick={onBubbleClick} ondblclick={onBubbleDblclick} oncontextmenu={onBubbleContext}>{@html html}</div>
   </div>
 {:else if item.kind === "thought"}
   <div class="row">
     <div class="avatar thought">💭</div>
-    <div class="bubble thought-bubble content">
+    <div class="bubble thought-bubble content" onclick={onBubbleClick} ondblclick={onBubbleDblclick} oncontextmenu={onBubbleContext}>
       <details open={item.streaming}>
-        <summary>思考过程 {item.streaming ? "…" : ""}</summary>
+        <summary>{tr("思考过程")} {item.streaming ? "…" : ""}</summary>
         <div class="inner">{@html thoughtHtml}</div>
       </details>
     </div>
   </div>
 {:else if item.kind === "error"}
   <div class="row">
-    <div class="bubble error-bubble">{item.text}</div>
+    <div class="bubble error-bubble" oncontextmenu={onBubbleContext}>{item.text}</div>
   </div>
 {:else if isTool}
-  <div class="tools">
+  <div class="tools" oncontextmenu={onBubbleContext}>
     <div class="tools-group" role="button" tabindex="0" onclick={() => (groupOpen = !groupOpen)} onkeydown={(e) => e.key === "Enter" && (groupOpen = !groupOpen)}>
       <span class="tg-icon">🔧</span>
-      <span class="tg-title">工具调用</span>
+      <span class="tg-title">{tr("工具调用")}</span>
       <span class="tg-summary">{groupSummary}</span>
       <span class="tg-arrow">{groupOpen ? "▾" : "▸"}</span>
     </div>
@@ -154,7 +163,7 @@
       {#each item.tools ?? [] as t (t.toolCallId)}
       {#if t.toolCallId === "__plan__"}
         <div class="tool plan">
-          <div class="thead"><span>🗺 计划</span></div>
+          <div class="thead"><span>🗺 {tr("计划")}</span></div>
           <ul class="plan-list">
             {#each planEntries(t.rawOutput) as e}
               <li class={e.status}>
@@ -167,7 +176,7 @@
       {:else}
         <div class="tool">
           <div class="thead" role="button" tabindex="0" onclick={() => (expandedTools[t.toolCallId] = !expandedTools[t.toolCallId])}>
-            <span>{toolIcon(t.kind)} {t.title ?? t.kind ?? "工具调用"}</span>
+            <span>{toolIcon(t.kind)} {t.title ?? t.kind ?? tr("工具调用")}</span>
             <span class="meta">
               {#if t.locations?.length}
                 {#each t.locations.slice(0, 2) as loc (loc.path + (loc.line ?? ""))}
@@ -186,7 +195,7 @@
             </span>
           </div>
           {#if expandedTools[t.toolCallId]}
-            <pre class="tdetail">{toolDetail(t) || "（无详情）"}</pre>
+            <pre class="tdetail">{toolDetail(t) || tr("（无详情）")}</pre>
           {/if}
         </div>
       {/if}

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../i18n";
   // 常用提示词: CRUD + insert into chat composer.
   import { app, toast, savePrompts, nextId } from "../state.svelte";
   import Icon from "./Icon.svelte";
@@ -49,26 +50,26 @@
   }
 
   function copy(content: string) {
-    navigator.clipboard.writeText(content).then(() => toast("ok", "已复制")).catch((e) => toast("error", String(e)));
+    navigator.clipboard.writeText(content).then(() => toast("ok", t("已复制"))).catch((e) => toast("error", String(e)));
   }
 </script>
 
 {#if app.overlay === "prompts"}
-  <div class="panel" role="dialog" aria-label="常用提示词">
+  <div class="panel" role="dialog" aria-label={t("常用提示词")}>
     <div class="head">
-      <Icon name="prompts" size={15} /> 常用提示词
+      <Icon name="prompts" size={15} /> {t("常用提示词")}
       <span class="spacer"></span>
-      <button class="btn sm" onclick={add}><Icon name="plus" size={12} /> 新增</button>
+      <button class="btn sm" onclick={add}><Icon name="plus" size={12} /> {t("新增")}</button>
       <button class="btn ghost sm" onclick={() => (app.overlay = null)}>✕</button>
     </div>
     <div class="list">
       {#if editingId}
         <div class="edit">
-          <input placeholder="标题" bind:value={editTitle} />
-          <textarea rows="4" placeholder="提示词内容" bind:value={editContent}></textarea>
+          <input placeholder={t("标题")} bind:value={editTitle} />
+          <textarea rows="4" placeholder={t("提示词内容")} bind:value={editContent}></textarea>
           <div class="rowbtns">
-            <button class="btn sm primary" onclick={save}>保存</button>
-            <button class="btn sm" onclick={() => (editingId = null)}>取消</button>
+            <button class="btn sm primary" onclick={save}>{t("保存")}</button>
+            <button class="btn sm" onclick={() => (editingId = null)}>{t("取消")}</button>
           </div>
         </div>
       {/if}
@@ -79,19 +80,19 @@
             <div class="content dim">{p.content}</div>
           </div>
           <div class="acts">
-            <button class="btn sm primary" onclick={() => insert(p.content)}>插入</button>
-            <button class="btn ghost sm" title="复制" onclick={() => copy(p.content)}><Icon name="copy" size={13} /></button>
-            <button class="btn ghost sm" onclick={() => startEdit(p.id)}>编辑</button>
+            <button class="btn sm primary" onclick={() => insert(p.content)}>{t("插入")}</button>
+            <button class="btn ghost sm" title={t("复制")} onclick={() => copy(p.content)}><Icon name="copy" size={13} /></button>
+            <button class="btn ghost sm" onclick={() => startEdit(p.id)}>{t("编辑")}</button>
             <button class="btn ghost sm danger" onclick={() => del(p.id)}>✕</button>
           </div>
         </div>
       {:else}
         {#if !editingId}
-          <p class="none">还没有常用提示词，点「新增」创建</p>
+          <p class="none">{t("还没有常用提示词，点「新增」创建")}</p>
         {/if}
       {/each}
     </div>
-    <p class="tip">「插入」会填到当前上下文聊天的输入框。</p>
+    <p class="tip">{t("「插入」会填到当前上下文聊天的输入框。")}</p>
   </div>
 {/if}
 

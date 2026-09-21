@@ -12,6 +12,7 @@ mod manager;
 mod models;
 mod node_rt;
 mod setup;
+mod skins;
 
 use std::sync::Arc;
 

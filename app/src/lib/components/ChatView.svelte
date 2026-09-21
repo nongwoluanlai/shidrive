@@ -143,18 +143,18 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   async function newSession() {
     if (!ctx) return;
     if (streaming) {
-      toast("warn", "会话正在进行中，请先停止");
+      toast("warn", t("会话正在进行中，请先停止"));
       return;
     }
-    if (!(await confirmDialog({ title: "新建会话", message: "创建新会话？当前绑定的 AI 会话将被解绑（AI 端历史仍保留）。" }))) return;
+    if (!(await confirmDialog({ title: t("新建会话"), message: t("创建新会话？当前绑定的 AI 会话将被解绑（AI 端历史仍保留）。") }))) return;
     try {
       await api.bindingUnbind(ctx.id, app.agent);
       clearChat(key);
       const sid = await api.acpSessionNew(ctx, app.agent);
       app.bindingSession[key] = sid;
-      bindingTitle = "新会话";
+      bindingTitle = t("新会话");
       stickToBottom = true;
-      toast("ok", `已创建新会话（${app.agent === "codex" ? "Codex" : "ZCode"}）`);
+      toast("ok", t("已创建新会话（{agent}）", { agent: agentLabel(app.agent) }));
     } catch (e) {
       toast("error", String(e));
     }
@@ -165,7 +165,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     try {
       const sid = await api.acpSessionNew(ctx, app.agent);
       app.bindingSession[key] = sid;
-      toast("ok", "已恢复绑定的会话");
+      toast("ok", t("已恢复绑定的会话"));
     } catch (e) {
       toast("error", String(e));
     }
@@ -185,7 +185,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     try {
       const res = await api.acpPrompt(ctx, app.agent, text, imgs);
       const stop = res?.stopReason ?? "end_turn";
-      if (stop !== "end_turn") toast("info", `回合结束（${stop}）`);
+      if (stop !== "end_turn") toast("info", t("回合结束（{reason}）", { reason: String(stop) }));
     } catch (e) {
       pushLocal(key, { kind: "error", text: String(e) });
     } finally {
@@ -206,7 +206,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     if (!ctx) return;
     try {
       await api.acpCancel(ctx.id, app.agent);
-      toast("info", "已发送取消请求");
+      toast("info", t("已发送取消请求"));
     } catch (e) {
       toast("error", String(e));
     }
@@ -216,7 +216,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     if (!ctx) return;
     try {
       await api.acpSetConfigOption(ctx.id, app.agent, "model", modelId);
-      toast("ok", "模型已切换");
+      toast("ok", t("模型已切换"));
     } catch (e) {
       toast("error", String(e));
     }
@@ -308,8 +308,8 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   const zhMode = (name: string, id?: string) =>
     MODE_NAMES[(id ?? "").toLowerCase()] ?? MODE_NAMES[name.toLowerCase()] ?? MODE_NAME_TEXT[name.toLowerCase()] ?? name;
   const zhLabel = (id: string | undefined, fallback: string) =>
-    (id ? OPT_LABELS[id.toLowerCase()] : undefined) ?? OPT_LABELS[fallback.toLowerCase()] ?? fallback;
-  const zhValue = (v: string) => OPT_VALUES[v.toLowerCase()] ?? v;
+    t((id ? OPT_LABELS[id.toLowerCase()] : undefined) ?? OPT_LABELS[fallback.toLowerCase()] ?? fallback);
+  const zhValue = (v: string) => t(OPT_VALUES[v.toLowerCase()] ?? v);
 
   const caps = $derived.by(() => {
     const c = app.agentCaps[app.agent];
@@ -326,7 +326,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       const cur = models.currentModelId ?? models.currentModel ?? "";
       out.push({
         id: "model",
-        label: "模型",
+        label: t("模型"),
         value: cur,
         options: models.availableModels.map((m) => ({ value: m.modelId, name: m.name })),
       });
@@ -339,7 +339,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
         const v = String(x.value);
         const zh = zhValue(v);
         // 值有中文映射用映射；否则尝试按英文名映射；都没有保留原名
-        const name = zh !== v ? zh : (MODE_NAME_TEXT[String(x.name ?? "").toLowerCase()] ?? x.name);
+        const name = zh !== v ? zh : t(MODE_NAME_TEXT[String(x.name ?? "").toLowerCase()] ?? x.name);
         return { value: v, name };
       });
       if (!opts.length) continue;
@@ -358,13 +358,13 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     if (!sessionId) {
       // 会话尚未创建：暂存，session-ready 后自动应用
       app.pendingCfg[app.agent] = { id, value };
-      toast("info", "已记录选择，创建会话后自动应用");
+      toast("info", t("已记录选择，创建会话后自动应用"));
       return;
     }
     if (!ctx) return;
     void api
       .acpSetConfigOption(ctx.id, app.agent, id, value)
-      .then(() => toast("ok", "已应用"))
+      .then(() => toast("ok", t("已应用")))
       .catch((e) => toast("error", String(e)));
   }
 
@@ -379,7 +379,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
         .acpSetConfigOption(ctx.id, app.agent, "model", target)
         .then(() => {
           if (sessionInfo?.response?.models) sessionInfo.response.models.currentModelId = target;
-          toast("info", `原模型已下线，已切换为 ${models[0]?.name ?? target}`);
+          toast("info", t("原模型已下线，已切换为 {model}", { model: models[0]?.name ?? target }));
         })
         .catch(() => {});
     }
@@ -448,8 +448,12 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
 
   // ---------- 输入框右键粘贴 ----------
   let pasteMenu = $state<{ x: number; y: number } | null>(null);
+  let pasteRange = { start: 0, end: 0 };
   function onInputContext(e: MouseEvent) {
     e.preventDefault();
+    e.stopPropagation();
+    const ta = e.currentTarget as HTMLTextAreaElement;
+    pasteRange = { start: ta.selectionStart, end: ta.selectionEnd };
     pasteMenu = { x: e.clientX, y: e.clientY };
   }
   async function pasteIntoInput() {
@@ -462,8 +466,8 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
         input = (input ? input + "\n" : "") + text;
         return;
       }
-      const start = ta.selectionStart ?? input.length;
-      const end = ta.selectionEnd ?? input.length;
+      const start = Math.min(pasteRange.start, input.length);
+      const end = Math.min(pasteRange.end, input.length);
       input = input.slice(0, start) + text + input.slice(end);
       setTimeout(() => {
         ta.focus();
@@ -586,44 +590,44 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     <div class="session-meta">
       {#if sessionId}
         <span class="badge accent badge-title" title={bindingTitle ?? sessionId}>
-          {bindingTitle || "会话 " + sessionId.slice(0, 8) + "…"}
+          {bindingTitle || t("会话 {id}", { id: sessionId.slice(0, 8) + "…" })}
         </span>
         <button
           class="btn ghost sm"
-          title="修改会话标题（本地备注）"
+          title={t("修改会话标题（本地备注）")}
           onclick={async () => {
             if (!ctx) return;
-            const t = await promptDialog({ title: "会话标题", label: "标题（本地备注）", initial: bindingTitle ?? "" });
-            if (t === null) return;
+            const newTitle = await promptDialog({ title: t("会话标题"), label: t("标题（本地备注）"), initial: bindingTitle ?? "" });
+            if (newTitle === null) return;
             try {
-              await api.bindingSetTitle(ctx.id, app.agent, t);
-              bindingTitle = t;
-              app.bindingTitleMap[chatKey(ctx.id, app.agent)] = t;
-              toast("ok", "标题已更新");
+              await api.bindingSetTitle(ctx.id, app.agent, newTitle);
+              bindingTitle = newTitle;
+              app.bindingTitleMap[chatKey(ctx.id, app.agent)] = newTitle;
+              toast("ok", t("标题已更新"));
             } catch (e) {
               toast("error", String(e));
             }
           }}
         >✏️</button>
       {:else}
-        <span class="badge">未绑定会话</span>
+        <span class="badge">{t("未绑定会话")}</span>
       {/if}
-      <button class="btn sm" onclick={() => (app.historyBind = app.agent)} title="绑定 / 切换适配器中的历史会话">绑定</button>
-      <button class="btn sm" onclick={sessionId ? resumeSession : newSession} title={sessionId ? "重新加载会话" : "创建新会话"}>
-        {sessionId ? "重新连接" : "新会话"}
+      <button class="btn sm" onclick={() => (app.historyBind = app.agent)} title={t("绑定 / 切换适配器中的历史会话")}>绑定</button>
+      <button class="btn sm" onclick={sessionId ? resumeSession : newSession} title={sessionId ? t("重新加载会话") : t("创建新会话")}>
+        {sessionId ? t("重新连接") : t("新会话")}
       </button>
       <button
         class="btn sm"
-        title="复制共享上下文接入提示词，发送给 Agent 后即可通过 MCP 同步上下文"
+        title={t("复制共享上下文接入提示词，发送给 Agent 后即可通过 MCP 同步上下文")}
         onclick={() => {
           if (!ctx) return;
           navigator.clipboard
             .writeText(sharedContextPrompt(ctx.id))
-            .then(() => toast("ok", "接入提示词已复制，粘贴发送给 Agent 即可"))
+            .then(() => toast("ok", t("接入提示词已复制，粘贴发送给 Agent 即可")))
             .catch((e) => toast("error", String(e)));
         }}
       >
-        复制接入提示词
+        {t("复制接入提示词")}
       </button>
     </div>
   </div>
@@ -635,16 +639,16 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     {#if loadingHere && items.length === 0}
       <div class="chat-loading">
         <span class="chat-spinner"></span>
-        <p class="lt">正在从 {agentLabel(app.agent)} 会话加载历史…</p>
-        <p class="ld dim">适配器启动与历史回放可能需要几秒，请稍候</p>
+        <p class="lt">{t("正在从 {agent} 会话加载历史…", { agent: agentLabel(app.agent) })}</p>
+        <p class="ld dim">{t("适配器启动与历史回放可能需要几秒，请稍候")}</p>
       </div>
     {:else}
       {#if items.length === 0}
         <div class="empty">
-          <p><b>{agentLabel(app.agent)}</b> 会话（{ctx?.name}）</p>
-          <p class="dim">发送第一条消息开始工作。Agent 会读取项目目录并执行任务；<br/>权限请求会弹出对话框，工具调用会实时展示。</p>
+          <p>{t("{agent} 会话（{context}）", { agent: agentLabel(app.agent), context: ctx?.name ?? "" })}</p>
+          <p class="dim">{t("发送第一条消息开始工作。Agent 会读取项目目录并执行任务；")}<br/>{t("权限请求会弹出对话框，工具调用会实时展示。")}</p>
           {#if !sessionId}
-            <p class="dim">首次发送时将自动创建并绑定新会话。</p>
+            <p class="dim">{t("首次发送时将自动创建并绑定新会话。")}</p>
           {/if}
         </div>
       {/if}
@@ -654,10 +658,10 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
         </div>
       {/each}
       {#if loadingHere}
-        <div class="syncing"><span class="chat-spinner sm"></span> 正在同步最新历史…</div>
+        <div class="syncing"><span class="chat-spinner sm"></span> {t("正在同步最新历史…")}</div>
       {/if}
       {#if streaming}
-        <div class="thinking"><span class="dot accent pulse"></span> {agentLabel(app.agent)} 正在工作中…</div>
+        <div class="thinking"><span class="dot accent pulse"></span> {t("{agent} 正在工作中…", { agent: agentLabel(app.agent) })}</div>
       {/if}
     {/if}
       </div>
@@ -670,8 +674,8 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       <div class="thumbs">
         {#each pendingImages as img, i}
           <div class="thumb">
-            <img src={img.preview} alt="待发送图片" />
-            <button class="thumb-x" title="移除" onclick={() => removeImage(i)}>✕</button>
+            <img src={img.preview} alt={t("待发送图片")} />
+            <button class="thumb-x" title={t("移除")} onclick={() => removeImage(i)}>✕</button>
           </div>
         {/each}
       </div>
@@ -680,9 +684,9 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     <div class="chat-search">
       <input placeholder={t("搜索正文…")} bind:value={searchQuery} oninput={runSearch} onkeydown={onSearchKeydown} />
       <span class="count">{searchHits.length ? `${searchIdx + 1}/${searchHits.length}` : searchQuery ? "0/0" : ""}</span>
-      <button class="btn ghost sm" title="上一个（Shift+Enter）" onclick={() => stepSearch(-1)}>↑</button>
-      <button class="btn ghost sm" title="下一个（Enter）" onclick={() => stepSearch(1)}>↓</button>
-      <button class="btn ghost sm" title="关闭（Esc）" onclick={closeSearch}>✕</button>
+      <button class="btn ghost sm" title={t("上一个（Shift+Enter）")} onclick={() => stepSearch(-1)}>↑</button>
+      <button class="btn ghost sm" title={t("下一个（Enter）")} onclick={() => stepSearch(1)}>↓</button>
+      <button class="btn ghost sm" title={t("关闭（Esc）")} onclick={closeSearch}>✕</button>
     </div>
   {/if}
 
@@ -700,12 +704,12 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
         {/each}
       </div>
     {/if}
-    <div class="grow-handle" title="拖拽调整输入框高度" onpointerdown={startResize}><span></span></div>
+    <div class="grow-handle" title={t("拖拽调整输入框高度")} onpointerdown={startResize}><span></span></div>
     <div class="input-row">
     <textarea
       rows="3"
       style={composerH ? `height:${composerH}px` : ""}
-      placeholder="给 {agentLabel(app.agent)} 下达任务…（{app.enterSend ? "Enter 发送，Shift+Enter 换行" : "Enter 换行，Ctrl+Enter 发送"}，可粘贴图片）"
+      placeholder={t("给 {agent} 下达任务…（{shortcut}，可粘贴图片）", { agent: agentLabel(app.agent), shortcut: app.enterSend ? t("Enter 发送，Shift+Enter 换行") : t("Enter 换行，Ctrl+Enter 发送") })}
       bind:value={input}
       onkeydown={onKeydown}
       onpaste={onPaste}

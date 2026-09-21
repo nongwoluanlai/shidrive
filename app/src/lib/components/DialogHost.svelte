@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../i18n";
   // 全局对话框宿主：confirm / prompt，Enter 确认，Esc 取消。
   import { dialogBox, settleDialog } from "../dialog.svelte";
 
@@ -50,8 +51,8 @@
         {/if}
       </div>
       <footer>
-        <button class="btn" onclick={cancel}>取消</button>
-        <button class="btn {d.danger ? 'danger' : 'primary'}" onclick={confirm}>{d.confirmText}</button>
+        <button class="btn" onclick={cancel}>{t("取消")}</button>
+        <button class="btn {d.danger ? 'danger' : 'primary'}" onclick={confirm}>{t(d.confirmText)}</button>
       </footer>
     </div>
   </div>

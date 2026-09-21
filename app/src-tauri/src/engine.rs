@@ -22,8 +22,6 @@ struct RunControl {
     stop: Arc<AtomicBool>,
     /// pids of running shell children (killed via taskkill /T)
     shell_pids: Mutex<Vec<u32>>,
-    /// (context_id, agent_type) of running agent nodes
-    agent_ctxs: Mutex<Vec<(String, String)>>,
 }
 
 pub struct Engine {
@@ -62,7 +60,9 @@ fn effective_edges(w: &Workflow) -> (Vec<(usize, usize)>, bool) {
     if w.edges.is_empty() {
         return (seq, true);
     }
-    let raw: Vec<(usize, usize)> = w.edges.iter().map(|e| (e.from as usize, e.to as usize)).collect();
+    let mut raw: Vec<(usize, usize)> = w.edges.iter().map(|e| (e.from as usize, e.to as usize)).collect();
+    raw.sort_unstable();
+    raw.dedup();
     let bounds_ok = raw.iter().all(|(f, t)| f < &n && t < &n && f != t);
     if !bounds_ok {
         return (seq, false);
@@ -162,12 +162,8 @@ impl Engine {
             for pid in ctrl.shell_pids.lock().unwrap().drain(..) {
                 kill_tree(pid);
             }
-            for (ctx_id, agent_type) in ctrl.agent_ctxs.lock().unwrap().drain(..) {
-                let agents = self.agents.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = agents.cancel(&ctx_id, &agent_type).await;
-                });
-            }
+            // Agent nodes observe stop and drop their prompt future. Its session
+            // guard cancels the actual Temp/Explicit session, not the UI binding.
         }
     }
 
@@ -184,7 +180,6 @@ impl Engine {
         let ctrl = Arc::new(RunControl {
             stop: Arc::new(AtomicBool::new(false)),
             shell_pids: Mutex::new(Vec::new()),
-            agent_ctxs: Mutex::new(Vec::new()),
         });
         self.controls.lock().unwrap().insert(run_id.clone(), ctrl.clone());
 
@@ -260,7 +255,7 @@ impl Engine {
 
         // drains naturally: successors are pushed as predecessors complete
         while let Some((idx, ok)) = futures.next().await {
-            if ctrl.stop.load(Ordering::SeqCst) {
+            if ctrl.stop.load(Ordering::SeqCst) && failed_at.is_none() {
                 stopped = true;
             }
             let step_failed = !ok && !w.steps[idx].continue_on_error();
@@ -269,12 +264,6 @@ impl Engine {
                 ctrl.stop.store(true, Ordering::SeqCst);
                 for pid in ctrl.shell_pids.lock().unwrap().drain(..) {
                     kill_tree(pid);
-                }
-                for (ctx_id, agent_type) in ctrl.agent_ctxs.lock().unwrap().drain(..) {
-                    let agents = self.agents.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let _ = agents.cancel(&ctx_id, &agent_type).await;
-                    });
                 }
                 self.log(run_id, &format!("✕ 节点「{}」失败，已停止其余节点", step_name(&w.steps[idx], idx)));
             }
@@ -415,151 +404,10 @@ impl Engine {
             std::env::temp_dir().to_string_lossy().to_string()
         };
 
-        let mut cmd = tokio::process::Command::new("cmd");
-        let display: String;
-        match shell_kind {
-            "python" => {
-                let py = python_path.unwrap_or("python");
-                display = format!("[python] {command}");
-                cmd = tokio::process::Command::new(py);
-                cmd.arg("-c").arg(command);
-            }
-            "powershell" => {
-                display = format!("[ps] {command}");
-                cmd = tokio::process::Command::new("powershell");
-                cmd.args(["-NoProfile", "-Command", command]);
-            }
-            _ => {
-                let joined = command.replace("\r\n", " & ").replace('\n', " & ");
-                let t = joined.trim().to_string();
-                // 单个带引号程序（"C:\path\app.exe"）：cmd /C 传参时引号会被转义成命令名的一部分，
-                // 直接 spawn 该程序（GUI 程序不等待退出）
-                if t.len() > 2 && t.starts_with('"') && t.ends_with('"') && !t[1..t.len() - 1].contains('"') {
-                    let exe = t[1..t.len() - 1].to_string();
-                    self.log(run_id, &format!("▶ 直接启动 {exe}"));
-                    let mut guicmd = tokio::process::Command::new(&exe);
-                    guicmd.current_dir(&dir);
-                    #[cfg(windows)]
-                    guicmd.creation_flags(0x0800_0000);
-                    match guicmd.spawn() {
-                        Ok(_) => return (true, 0, String::new(), String::new()),
-                        Err(e) => {
-                            self.log(run_id, &format!("启动失败: {e}"));
-                            return (false, -1, String::new(), String::new());
-                        }
-                    }
-                }
-                // 其余带引号路径的命令改写为 start "" 形式，规避 cmd 引号解析问题
-                let effective = if t.starts_with('"') {
-                    format!("start \"\" {}", t)
-                } else {
-                    joined.clone()
-                };
-                display = effective.clone();
-                // /d 跳过 AutoRun（注册表里的 cmd 自启动脚本可能切换工作目录，
-                // 导致 TortoiseGit 这类相对路径工具报"路径在仓库外"）
-                cmd.args(["/d", "/C", &effective]);
-            }
-        }
-        self.log(run_id, &format!("$ {display}   （目录：{dir}）"));
-
-        cmd.current_dir(&dir);
-        // expose workflow vars to the child process (%VAR% in cmd, $env:VAR in ps, os.environ in python)
-        cmd.envs(env);
-        cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-        #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                self.log(run_id, &format!("启动失败: {e}"));
-                return (false, -1, String::new(), String::new());
-            }
-        };
-        let pid = child.id().unwrap_or(0);
-        ctrl.shell_pids.lock().unwrap().push(pid);
-        let out = child.stdout.take();
-        let err = child.stderr.take();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u8, String)>();
-        let tx2 = tx.clone();
-        let out_buf = collect_pipe(out, 0, tx2);
-        let err_buf = collect_pipe(err, 1, tx);
-
-        let mut wait = std::pin::pin!(child.wait());
-        let timeout = timeout_sec.unwrap_or(u64::MAX / 2);
-
-        // 流式接收输出并实时写运行日志；收完（channel 关闭）或进程退出即结束
-        let mut streamed = (0usize, 0usize); // (stdout 行数, stderr 行数)
-        let outcome = loop {
-            tokio::select! {
-                msg = rx.recv() => {
-                    match msg {
-                        Some((kind, line)) => {
-                            if kind == 0 {
-                                if streamed.0 < 200 { self.log(run_id, &line); }
-                                streamed.0 += 1;
-                            } else {
-                                if streamed.1 < 100 { self.log(run_id, &format!("  ⚠ {line}")); }
-                                streamed.1 += 1;
-                            }
-                        }
-                        None => {
-                            // 两个读任务均已结束；等待进程退出状态
-                            match tokio::time::timeout(Duration::from_secs(timeout), &mut wait).await {
-                                Ok(r) => break r,
-                                Err(_) => {
-                                    kill_tree(pid);
-                                    self.log(run_id, &format!("命令超时（{timeout}s），已终止"));
-                                    break Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
-                                }
-                            }
-                        }
-                    }
-                }
-                r = &mut wait => {
-                    // 进程先退出：排干管道剩余输出再收尾
-                    while let Some((kind, line)) = rx.recv().await {
-                        if kind == 0 {
-                            if streamed.0 < 200 { self.log(run_id, &line); }
-                            streamed.0 += 1;
-                        } else {
-                            if streamed.1 < 100 { self.log(run_id, &format!("  ⚠ {line}")); }
-                            streamed.1 += 1;
-                        }
-                    }
-                    break r;
-                }
-            }
-        };
-
-        let stdout_txt = out_buf.lock().unwrap().join("
-");
-        let stderr_txt = err_buf.lock().unwrap().join("
-");
-        ctrl.shell_pids.lock().unwrap().retain(|&p| p != pid);
-        if streamed.0 > 200 { self.log(run_id, &format!("…（stdout 其余 {} 行已截断）", streamed.0 - 200)); }
-        if streamed.1 > 100 { self.log(run_id, &format!("…（stderr 其余 {} 行已截断）", streamed.1 - 100)); }
-
-        if ctrl.stop.load(Ordering::SeqCst) {
-            kill_tree(pid);
-            self.log(run_id, "命令已被终止");
-            return (false, -1, stdout_txt, stderr_txt);
-        }
-        match outcome {
-            Ok(status) => {
-                let code = status.code().unwrap_or(-1);
-                if code != 0 {
-                    self.log(run_id, &format!("命令退出码 {code}"));
-                    return (false, code, stdout_txt, stderr_txt);
-                }
-                (true, code, stdout_txt, stderr_txt)
-            }
-            Err(e) => {
-                self.log(run_id, &format!("等待命令失败（可能已超时终止）: {e}"));
-                (false, -1, stdout_txt, stderr_txt)
-            }
-        }
+        self.log(run_id, &format!("$ [{shell_kind}] {command}   （目录：{dir}）"));
+        let mut cmd = shell_command(shell_kind, command, python_path);
+        cmd.current_dir(&dir).envs(env);
+        execute_shell(cmd, ctrl, timeout_sec, |line| self.log(run_id, line)).await
     }
 
     async fn run_agent(
@@ -576,7 +424,6 @@ impl Engine {
             self.log(run_id, &format!("上下文 {context_id} 不存在"));
             return false;
         };
-        ctrl.agent_ctxs.lock().unwrap().push((context_id.to_string(), agent_type.to_string()));
         let target_note = match &target {
             SessionTarget::Explicit(sid) => format!("（复用会话 {sid}）"),
             SessionTarget::Temp => "（临时会话）".to_string(),
@@ -585,19 +432,10 @@ impl Engine {
         self.log(run_id, &format!("→ [{agent_type}]{target_note} {}", first_line(prompt)));
 
         let agents = self.agents.clone();
-        let fut = agents.prompt_with(&ctx, agent_type, target, prompt, &[]);
-        let result = match timeout_sec {
-            Some(t) => match tokio::time::timeout(Duration::from_secs(t), fut).await {
-                Ok(r) => r,
-                Err(_) => {
-                    self.log(run_id, &format!("Agent 节点超时（{t}s）"));
-                    ctrl.agent_ctxs.lock().unwrap().retain(|(c, a)| !(c == context_id && a == agent_type));
-                    return false;
-                }
-            },
-            None => fut.await,
+        let result = tokio::select! {
+            result = wait_for_agent(agents.prompt_with(&ctx, agent_type, target, prompt, &[]), timeout_sec) => result,
+            _ = wait_for_stop(ctrl.stop.clone()) => Err("Agent 节点已停止".to_string()),
         };
-        ctrl.agent_ctxs.lock().unwrap().retain(|(c, a)| !(c == context_id && a == agent_type));
 
         match result {
             Ok(res) => {
@@ -662,24 +500,191 @@ impl Engine {
     }
 }
 
-/// 流式读取子进程输出：每行经 channel 上报（实时写运行日志），
-/// 同时在本地保留全文用于结果变量。0=stdout，1=stderr。
-fn collect_pipe<R>(pipe: Option<R>, kind: u8, tx: tokio::sync::mpsc::UnboundedSender<(u8, String)>) -> Arc<Mutex<Vec<String>>>
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    let buf: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let Some(pipe) = pipe else { return buf };
-    let sink = buf.clone();
-    tauri::async_runtime::spawn(async move {
-        use tokio::io::AsyncBufReadExt;
-        let mut lines = tokio::io::BufReader::new(pipe).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            sink.lock().unwrap().push(line.clone());
-            let _ = tx.send((kind, line));
+async fn wait_for_stop(stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_agent<T>(future: impl Future<Output = Result<T, String>>, timeout_sec: Option<u64>) -> Result<T, String> {
+    match timeout_sec {
+        Some(t) => tokio::time::timeout(Duration::from_secs(t), future).await
+            .map_err(|_| format!("Agent 节点超时（{t}s）"))?,
+        None => future.await,
+    }
+}
+
+/// cmd.exe parses its own command tail; CRT argument escaping changes embedded
+/// quotes into literal backslashes. /S strips only our extra outer quote pair.
+fn shell_command(kind: &str, command: &str, python_path: Option<&str>) -> tokio::process::Command {
+    match kind {
+        "python" => {
+            let mut cmd = tokio::process::Command::new(python_path.filter(|p| !p.is_empty()).unwrap_or("python"));
+            cmd.arg("-c").arg(command);
+            cmd
         }
-    });
-    buf
+        "powershell" => {
+            let mut cmd = tokio::process::Command::new("powershell");
+            cmd.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+            cmd
+        }
+        _ => {
+            let mut cmd = tokio::process::Command::new("cmd");
+            let command = command.replace("\r\n", " & ").replace('\n', " & ");
+            cmd.args(["/d", "/s", "/c"]);
+            #[cfg(windows)]
+            cmd.raw_arg(format!("\"{command}\""));
+            #[cfg(not(windows))]
+            cmd.arg(command);
+            cmd
+        }
+    }
+}
+
+// Bound both retained output and individual streamed lines. Read bytes rather
+// than UTF-8 lines: a single legacy-codepage byte must not stop draining a pipe.
+const MAX_CAPTURE_BYTES: usize = 80_000;
+const MAX_LOG_LINE_BYTES: usize = 4096;
+#[derive(Default)]
+struct PipeCapture {
+    bytes: Vec<u8>,
+    line: Vec<u8>,
+    lines: usize,
+    truncated: bool,
+}
+
+impl PipeCapture {
+    fn emit_line(&mut self, stderr: bool, log: &impl Fn(&str)) {
+        if self.lines < if stderr { 100 } else { 200 } {
+            let text = String::from_utf8_lossy(&self.line);
+            let text = text.trim_end_matches('\r');
+            if stderr { log(&format!("  [stderr] {text}")); } else { log(text); }
+        }
+        self.lines += 1;
+        self.line.clear();
+    }
+
+    fn push(&mut self, bytes: &[u8], stderr: bool, log: &impl Fn(&str)) {
+        let keep = bytes.len().min(MAX_CAPTURE_BYTES - self.bytes.len());
+        self.bytes.extend_from_slice(&bytes[..keep]);
+        self.truncated |= keep < bytes.len();
+        for &byte in bytes {
+            if byte == b'\n' {
+                self.emit_line(stderr, log);
+            } else {
+                self.line.push(byte);
+                if self.line.len() == MAX_LOG_LINE_BYTES {
+                    self.emit_line(stderr, log);
+                }
+            }
+        }
+    }
+
+    fn finish(mut self, stderr: bool, log: &impl Fn(&str)) -> String {
+        if !self.line.is_empty() { self.emit_line(stderr, log); }
+        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
+        if self.truncated { text.push_str("\n…（输出过长，已截断）"); }
+        text
+    }
+}
+
+async fn execute_shell(
+    mut cmd: tokio::process::Command,
+    ctrl: Arc<RunControl>,
+    timeout_sec: Option<u64>,
+    log: impl Fn(&str),
+) -> (bool, i32, String, String) {
+    use tokio::io::AsyncReadExt;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let deadline = timeout_sec.and_then(|t| tokio::time::Instant::now().checked_add(Duration::from_secs(t)));
+    if ctrl.stop.load(Ordering::SeqCst) {
+        return (false, -1, String::new(), String::new());
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            log(&format!("启动失败: {e}"));
+            return (false, -1, String::new(), e.to_string());
+        }
+    };
+    let pid = child.id().unwrap_or(0);
+    ctrl.shell_pids.lock().unwrap().push(pid);
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let (mut out, mut err) = (PipeCapture::default(), PipeCapture::default());
+    let (mut out_bytes, mut err_bytes) = ([0u8; 8192], [0u8; 8192]);
+    let (mut out_open, mut err_open) = (true, true);
+    let mut status = None;
+    let mut drain_deadline = None;
+    let mut failure = None;
+    let mut poll = tokio::time::interval(Duration::from_millis(25));
+    loop {
+        let now = tokio::time::Instant::now();
+        if ctrl.stop.load(Ordering::SeqCst) {
+            failure = Some("命令已被终止".to_string());
+            break;
+        }
+        if deadline.is_some_and(|d| now >= d) {
+            failure = Some(format!("命令超时（{}s），已终止", timeout_sec.unwrap()));
+            break;
+        }
+        if status.is_some() && !out_open && !err_open { break; }
+        // A detached descendant may inherit stdout/stderr indefinitely. The
+        // shell's exit must not leave a collector task or block the workflow.
+        if drain_deadline.is_some_and(|d| now >= d) {
+            log("子进程已退出；输出管道仍被后代进程占用，停止收集");
+            break;
+        }
+        tokio::select! {
+            _ = poll.tick() => {},
+            result = child.wait(), if status.is_none() => {
+                match result {
+                    Ok(exit) => {
+                        status = Some(exit);
+                        ctrl.shell_pids.lock().unwrap().retain(|&p| p != pid);
+                        drain_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+                    }
+                    Err(e) => { failure = Some(format!("等待命令失败: {e}")); break; }
+                }
+            },
+            result = stdout.read(&mut out_bytes), if out_open => {
+                match result {
+                    Ok(0) => out_open = false,
+                    Ok(n) => out.push(&out_bytes[..n], false, &log),
+                    Err(e) => { failure = Some(format!("读取 stdout 失败: {e}")); break; }
+                }
+            },
+            result = stderr.read(&mut err_bytes), if err_open => {
+                match result {
+                    Ok(0) => err_open = false,
+                    Ok(n) => err.push(&err_bytes[..n], true, &log),
+                    Err(e) => { failure = Some(format!("读取 stderr 失败: {e}")); break; }
+                }
+            },
+        }
+    }
+    if failure.is_some() && status.is_none() {
+        // Only kill a still-owned process ID; a reaped PID may be reused.
+        if pid != 0 {
+            let _ = tokio::task::spawn_blocking(move || kill_tree(pid)).await;
+        }
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    }
+    ctrl.shell_pids.lock().unwrap().retain(|&p| p != pid);
+    let stdout = out.finish(false, &log);
+    let stderr = err.finish(true, &log);
+    if let Some(error) = failure {
+        log(&error);
+        return (false, -1, stdout, stderr);
+    }
+    let code = status.and_then(|s| s.code()).unwrap_or(-1);
+    if code != 0 { log(&format!("命令退出码 {code}")); }
+    (code == 0, code, stdout, stderr)
 }
 
 fn step_output_key(step: &WorkflowStep, i: usize) -> String {
@@ -887,3 +892,191 @@ fn parse_hhmm(s: &str) -> (u32, u32) {
     let m = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     (h.min(23), m.min(59))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn control() -> Arc<RunControl> {
+        Arc::new(RunControl {
+            stop: Arc::new(AtomicBool::new(false)),
+            shell_pids: Mutex::new(Vec::new()),
+        })
+    }
+
+    struct Fixture(std::path::PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target/test-fixtures").join(uuid::Uuid::new_v4().to_string());
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn capture_drains_invalid_utf8_and_bounds_unterminated_lines() {
+        let mut output = PipeCapture::default();
+        output.push(b"before\xffafter\n", false, &|_| {});
+        output.push(&vec![b'x'; MAX_CAPTURE_BYTES * 3], false, &|_| {});
+        assert_eq!(output.bytes.len(), MAX_CAPTURE_BYTES);
+        assert!(output.line.len() < MAX_LOG_LINE_BYTES);
+        let text = output.finish(false, &|_| {});
+        assert!(text.starts_with("before\u{fffd}after\n"));
+        assert!(text.ends_with("（输出过长，已截断）"));
+    }
+
+    #[tokio::test]
+    async fn agent_timeout_and_stop_drop_the_inflight_future() {
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+        }
+        for timeout in [true, false] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let flag = dropped.clone();
+            let future = async move {
+                let _guard = Guard(flag);
+                std::future::pending::<Result<(), String>>().await
+            };
+            if timeout {
+                assert!(wait_for_agent(future, Some(0)).await.is_err());
+            } else {
+                let stop = Arc::new(AtomicBool::new(false));
+                let signal = stop.clone();
+                let cancel = async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    signal.store(true, Ordering::SeqCst);
+                };
+                let wait = async {
+                    tokio::select! {
+                        _ = future => panic!("pending prompt returned"),
+                        _ = wait_for_stop(stop) => {},
+                    }
+                };
+                tokio::join!(wait, cancel);
+            }
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn duplicate_edges_do_not_underflow_graph_indegrees() {
+        let workflow: Workflow = serde_json::from_value(json!({
+            "id":"w", "project_id":"p", "name":"w", "description":"", "enabled":true,
+            "trigger_type":"manual", "schedule":null,
+            "steps":[{"type":"start"},{"type":"note"}],
+            "edges":[{"from":0,"to":1},{"from":0,"to":1}],
+            "last_run_at":null,"next_run_at":null,"created_at":"","updated_at":""
+        })).unwrap();
+        assert_eq!(effective_edges(&workflow), (vec![(0, 1)], true));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn quoted_command_waits_preserves_env_and_exit_status() {
+        let fixture = Fixture::new();
+        let script = fixture.0.join("quoted script.cmd");
+        std::fs::write(&script, "@echo off\r\necho %SHIDRIVE_TEST_VALUE%\r\necho problem 1>&2\r\nexit /b 7\r\n").unwrap();
+        let mut command = shell_command("cmd", &format!("\"{}\"", script.display()), None);
+        command.current_dir(&fixture.0).env("SHIDRIVE_TEST_VALUE", "captured value");
+        let ctrl = control();
+        let (ok, code, out, err) = execute_shell(command, ctrl.clone(), Some(10), |_| {}).await;
+        assert!(!ok);
+        assert_eq!(code, 7);
+        assert!(out.contains("captured value"), "{out:?}");
+        assert!(err.contains("problem"), "{err:?}");
+        assert!(ctrl.shell_pids.lock().unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_deadline_applies_while_output_pipes_are_open() {
+        let fixture = Fixture::new();
+        let mut command = shell_command("powershell", "while ($true) { [Console]::WriteLine('alive'); Start-Sleep -Milliseconds 20 }", None);
+        command.current_dir(&fixture.0);
+        let ctrl = control();
+        let result = tokio::time::timeout(Duration::from_secs(10), execute_shell(command, ctrl.clone(), Some(1), |_| {})).await.unwrap();
+        assert!(!result.0);
+        assert_eq!(result.1, -1);
+        assert!(ctrl.shell_pids.lock().unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_without_deadline_returns_complete_output() {
+        let fixture = Fixture::new();
+        let mut command = shell_command("cmd", "echo hello & echo error 1>&2", None);
+        command.current_dir(&fixture.0);
+        let result = execute_shell(command, control(), None, |_| {}).await;
+        assert!(result.0);
+        assert_eq!(result.1, 0);
+        assert!(result.2.contains("hello"));
+        assert!(result.3.contains("error"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn quoted_command_preserves_arguments_and_redirection() {
+        let fixture = Fixture::new();
+        let script = fixture.0.join("with args.cmd");
+        std::fs::write(&script, "@echo off\r\necho [%~1]\r\nexit /b 9\r\n").unwrap();
+        let text = format!("\"{}\" \"two words\" > result.txt", script.display());
+        let mut command = shell_command("cmd", &text, None);
+        command.current_dir(&fixture.0);
+        let result = execute_shell(command, control(), Some(10), |_| {}).await;
+        assert_eq!(result.1, 9, "{result:?}");
+        assert!(std::fs::read_to_string(fixture.0.join("result.txt")).unwrap().contains("[two words]"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn deadline_is_not_reset_when_pipes_close() {
+        let fixture = Fixture::new();
+        let mut command = shell_command("powershell", "[Console]::Out.Close(); [Console]::Error.Close(); Start-Sleep -Seconds 30", None);
+        command.current_dir(&fixture.0);
+        let result = tokio::time::timeout(Duration::from_secs(10), execute_shell(command, control(), Some(1), |_| {})).await.unwrap();
+        assert!(!result.0);
+        assert_eq!(result.1, -1);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn inherited_pipes_do_not_keep_shell_collectors_alive() {
+        let fixture = Fixture::new();
+        let script = "$child = Start-Process powershell -ArgumentList @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 15') -NoNewWindow -PassThru; [Console]::WriteLine($child.Id)";
+        let mut command = shell_command("powershell", script, None);
+        command.current_dir(&fixture.0);
+        let started = std::time::Instant::now();
+        let result = execute_shell(command, control(), None, |_| {}).await;
+        // Clean up only the harmless child created by this fixture, even if the
+        // elapsed assertion below detects a collector regression.
+        if let Ok(pid) = result.2.trim().parse::<u32>() {
+            tokio::task::spawn_blocking(move || kill_tree(pid)).await.unwrap();
+        }
+        assert!(result.0, "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(8), "inherited pipe blocked completion");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancellation_is_observed_without_external_taskkill() {
+        let fixture = Fixture::new();
+        let mut command = shell_command("powershell", "Start-Sleep -Seconds 30", None);
+        command.current_dir(&fixture.0);
+        let ctrl = control();
+        let stop = ctrl.clone();
+        let cancel = async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            stop.stop.store(true, Ordering::SeqCst);
+        };
+        let run = execute_shell(command, ctrl.clone(), None, |_| {});
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(run, cancel) }).await.unwrap();
+        assert!(!result.0);
+        assert!(ctrl.shell_pids.lock().unwrap().is_empty());
+    }
+}
+

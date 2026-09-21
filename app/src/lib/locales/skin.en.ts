@@ -1,0 +1,17 @@
+export const skinEn: Record<string, string> = {
+  "皮肤加载失败，已恢复基础主题": "Skin could not load; the base theme has been restored",
+  "皮肤插件": "Skins",
+  "启用皮肤": "Enable skin",
+  "皮肤提供独立配色；关闭后恢复上方基础主题。人物仅在左下角独立区域显示。": "Skins use their own palette. Turn off to restore the base theme above. Characters stay in a separate area at the bottom left.",
+  "命运石之门": "Steins;Gate",
+  "地狱乐": "Hell’s Paradise",
+  "荧绿实验室 · CRT 终端": "Fluorescent lab · CRT terminal",
+  "深红和风 · 山林薄雾": "Crimson lacquer · mountain mist",
+  "自定义皮肤": "Custom skin",
+  "导入皮肤包": "Import skin package",
+  "皮肤 zip 路径": "Skin ZIP path",
+  "皮肤已导入并启用": "Skin imported and enabled",
+  "正在导入…": "Importing…",
+  "导入皮肤包（zip）": "Import skin (ZIP)",
+  "皮肤开发指南": "Skin author guide",
+};

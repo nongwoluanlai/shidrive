@@ -842,39 +842,103 @@ pub fn export_backup(&self) -> Result<serde_json::Value, String> {
     })
 }
 
-/// 导入（INSERT OR REPLACE，按 id 覆盖）。返回各表写入行数。
+/// Merge a backup atomically. Updating a parent must never delete its children.
 pub fn import_backup(&self, data: &serde_json::Value) -> Result<Vec<(String, usize)>, String> {
-    self.with(|c| {
-        let mut counts = Vec::new();
-        for (table, cols) in BACKUP_TABLES {
-            let Some(rows) = data.get(*table).and_then(|v| v.as_array()) else { continue };
-            let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
-            let sql = format!(
-                "INSERT OR REPLACE INTO {table} ({}) VALUES ({})",
-                cols.join(","),
-                placeholders.join(",")
-            );
-            let mut n = 0;
-            for row in rows {
-                let vals: Vec<rusqlite::types::Value> = cols
-                    .iter()
-                    .map(|col| match row.get(*col) {
-                        Some(serde_json::Value::String(s)) => rusqlite::types::Value::Text(s.clone()),
-                        Some(serde_json::Value::Number(num)) => num
-                            .as_i64()
-                            .map(rusqlite::types::Value::Integer)
-                            .unwrap_or(rusqlite::types::Value::Real(num.as_f64().unwrap_or(0.0))),
-                        _ => rusqlite::types::Value::Null,
-                    })
-                    .collect();
-                c.execute(&sql, rusqlite::params_from_iter(vals.iter()))?;
-                n += 1;
+    let data = data.as_object().ok_or("backup must be an object")?;
+    if data.get("app").and_then(|v| v.as_str()) != Some("shidrive") {
+        return Err("backup must have app=shidrive".into());
+    }
+    if !BACKUP_TABLES.iter().any(|(table, _)| data.contains_key(*table)) {
+        return Err("backup contains no supported tables".into());
+    }
+    let conn = self.conn.lock().map_err(|_| "db lock poisoned".to_string())?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let mut counts = Vec::new();
+    for (table, cols) in BACKUP_TABLES {
+        let Some(value) = data.get(*table) else { continue };
+        let rows = value.as_array().ok_or_else(|| format!("{table} must be an array"))?;
+        let mut ids = std::collections::HashSet::new();
+        for (index, row) in rows.iter().enumerate() {
+            let location = format!("{table}[{index}]");
+            let row = row.as_object().ok_or_else(|| format!("{location} must be an object"))?;
+            let id = row.get("id").and_then(|v| v.as_str()).filter(|v| !v.trim().is_empty())
+                .ok_or_else(|| format!("{location}.id must be a nonempty string"))?;
+            if !ids.insert(id) {
+                return Err(format!("{location}: duplicate id {id}"));
             }
-            counts.push((table.to_string(), n));
+            let mut names = Vec::new();
+            let mut vals = Vec::new();
+            for &col in *cols {
+                // Old backups predate these columns. Omit them so an update preserves
+                // the current value and an insert uses the schema default.
+                if *table == "workflows" && matches!(col, "env" | "edges" | "sort") && !row.contains_key(col) {
+                    continue;
+                }
+                let value = row.get(col).ok_or_else(|| format!("{location}.{col} is missing"))?;
+                let value = if matches!(col, "sort" | "enabled") {
+                    let n = value.as_i64().ok_or_else(|| format!("{location}.{col} must be an integer"))?;
+                    if col == "enabled" && n != 0 && n != 1 {
+                        return Err(format!("{location}.enabled must be 0 or 1"));
+                    }
+                    rusqlite::types::Value::Integer(n)
+                } else if *table == "workflows" && col == "schedule" && value.is_null() {
+                    // Historical schema permits NULL, but the workflow reader expects text.
+                    rusqlite::types::Value::Text(String::new())
+                } else if *table == "workflows" && matches!(col, "last_run_at" | "next_run_at") && value.is_null() {
+                    rusqlite::types::Value::Null
+                } else {
+                    let text = value.as_str().ok_or_else(|| format!("{location}.{col} must be a string"))?;
+                    if matches!(col, "project_id" | "context_id") && text.trim().is_empty() {
+                        return Err(format!("{location}.{col} must not be empty"));
+                    }
+                    if *table == "workflows" {
+                        validate_backup_workflow_json(col, text).map_err(|e| format!("{location}.{col}: {e}"))?;
+                    }
+                    rusqlite::types::Value::Text(text.to_string())
+                };
+                names.push(col);
+                vals.push(value);
+            }
+            let placeholders: Vec<String> = (1..=names.len()).map(|i| format!("?{i}")).collect();
+            let updates: Vec<String> = names.iter().filter(|&&c| c != "id")
+                .map(|c| format!("{c}=excluded.{c}")).collect();
+            let sql = format!(
+                "INSERT INTO {table} ({}) VALUES ({}) ON CONFLICT(id) DO UPDATE SET {}",
+                names.join(","), placeholders.join(","), updates.join(",")
+            );
+            tx.execute(&sql, rusqlite::params_from_iter(vals.iter()))
+                .map_err(|e| format!("{location}: {e}"))?;
+            let parent = match *table {
+                "contexts" | "workflows" => Some(("projects", "project_id")),
+                "context_entries" => Some(("contexts", "context_id")),
+                _ => None,
+            };
+            if let Some((parent_table, column)) = parent {
+                let exists: bool = tx.query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {parent_table} WHERE id=?1)"),
+                    params![row[column].as_str().unwrap()], |r| r.get(0),
+                ).map_err(|e| e.to_string())?;
+                if !exists {
+                    return Err(format!("{location}.{column} references a missing {parent_table} row"));
+                }
+            }
         }
-        Ok(counts)
-    })
+        counts.push((table.to_string(), rows.len()));
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(counts)
 }
+}
+
+fn validate_backup_workflow_json(column: &str, text: &str) -> Result<(), String> {
+    let result = match column {
+        "steps" => serde_json::from_str::<Vec<WorkflowStep>>(text).map(|_| ()),
+        "env" => serde_json::from_str::<std::collections::BTreeMap<String, String>>(text).map(|_| ()),
+        "edges" => serde_json::from_str::<Vec<Edge>>(text).map(|_| ()),
+        "schedule" if !text.is_empty() => serde_json::from_str::<ScheduleConfig>(text).map(|_| ()),
+        _ => return Ok(()),
+    };
+    result.map_err(|e| e.to_string())
 }
 
 fn row_project(r: &Row) -> rusqlite::Result<Project> {
@@ -999,7 +1063,90 @@ const BACKUP_TABLES: &[(&str, &[&str])] = &[
         "workflows",
         &[
             "id", "project_id", "name", "description", "enabled", "trigger_type", "schedule",
-            "steps", "last_run_at", "next_run_at", "created_at", "updated_at", "env", "edges",
+            "steps", "last_run_at", "next_run_at", "created_at", "updated_at", "env", "edges", "sort",
         ],
     ),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    fn fixture_db() -> Db { Db::open(Path::new(":memory:")).unwrap() }
+    fn project(id: &str, name: &str) -> serde_json::Value {
+        json!({"id":id,"name":name,"root_path":"","description":"","sort":0,"created_at":"now","updated_at":"now"})
+    }
+
+    #[test]
+    fn backup_merge_preserves_cascading_children() {
+        let db = fixture_db();
+        let p = db.create_project("original", "", "").unwrap();
+        db.with(|c| c.execute_batch("CREATE TABLE cascade_child (project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, value TEXT);")).unwrap();
+        db.with(|c| c.execute("INSERT INTO cascade_child VALUES (?1,'keep')", params![p.id])).unwrap();
+        db.import_backup(&json!({"app":"shidrive","projects":[project(&p.id,"updated")]})).unwrap();
+        assert_eq!(db.list_projects().unwrap().iter().find(|x| x.id == p.id).unwrap().name, "updated");
+        assert_eq!(db.with(|c| c.query_row("SELECT COUNT(*) FROM cascade_child", [], |r| r.get::<_, i64>(0))).unwrap(), 1);
+    }
+
+    #[test]
+    fn backup_rolls_back_all_tables_on_validation_or_sql_failure() {
+        let db = fixture_db();
+        let original = db.export_backup().unwrap();
+        db.with(|c| c.execute_batch("CREATE TRIGGER reject_project BEFORE INSERT ON projects WHEN NEW.id='reject' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;")).unwrap();
+        let cases = [
+            json!({"app":"shidrive","projects":[project("first","new"),project("reject","fail")]}),
+            json!({"app":"shidrive","projects":[project("first","new")],"contexts":{}}),
+            json!({"app":"shidrive","projects":[project("first","new")],"contexts":[{"id":"c","project_id":"missing","name":"c","overview":"","constraints":"","sort":0,"created_at":"now","updated_at":"now"}]}),
+        ];
+        for backup in cases {
+            assert!(db.import_backup(&backup).is_err());
+            let after = db.export_backup().unwrap();
+            for (table, _) in BACKUP_TABLES { assert_eq!(original[*table], after[*table], "{table}"); }
+        }
+    }
+
+    #[test]
+    fn backup_rejects_invalid_shapes_types_and_duplicate_ids() {
+        let db = fixture_db();
+        let mut bad_sort = project("p", "p");
+        bad_sort["sort"] = json!(1.5);
+        for backup in [
+            json!([]), json!({"app":"another","projects":[]}), json!({"app":"shidrive"}),
+            json!({"app":"shidrive","projects":[null]}),
+            json!({"app":"shidrive","projects":[project("", "p")]}),
+            json!({"app":"shidrive","projects":[bad_sort]}),
+            json!({"app":"shidrive","projects":[project("p","first"),project("p","second")]}),
+        ] { assert!(db.import_backup(&backup).is_err(), "{backup}"); }
+    }
+
+    #[test]
+    fn workflow_backup_roundtrip_and_legacy_columns() {
+        let db = fixture_db();
+        db.with(|c| c.execute("UPDATE workflows SET sort=42", [])).unwrap();
+        let mut backup = db.export_backup().unwrap();
+        assert_eq!(backup["workflows"][0]["sort"], 42);
+        db.import_backup(&backup).unwrap();
+        let row = backup["workflows"][0].as_object_mut().unwrap();
+        row.remove("sort"); row.remove("env"); row.remove("edges");
+        row.insert("schedule".into(), serde_json::Value::Null);
+        db.import_backup(&backup).unwrap();
+        assert!(db.get_workflow("rfw-0001").unwrap().is_some());
+        assert_eq!(db.export_backup().unwrap()["workflows"][0]["sort"], 42);
+        let fresh = fixture_db();
+        fresh.with(|c| c.execute("DELETE FROM workflows", [])).unwrap();
+        fresh.import_backup(&backup).unwrap();
+        assert_eq!(fresh.export_backup().unwrap()["workflows"][0]["env"], "{}");
+    }
+
+    #[test]
+    fn malformed_embedded_workflow_data_does_not_silently_empty_steps() {
+        let db = fixture_db();
+        for (column, value) in [("steps", "[{}]"), ("env", "[]"), ("edges", "[{}]"), ("schedule", "{}"), ("steps", "not json")] {
+            let mut backup = db.export_backup().unwrap();
+            backup["workflows"][0][column] = json!(value);
+            assert!(db.import_backup(&backup).is_err(), "{column}");
+            assert!(!db.get_workflow("rfw-0001").unwrap().unwrap().steps.is_empty());
+        }
+    }
+}
+
