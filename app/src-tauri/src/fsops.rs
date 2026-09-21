@@ -121,8 +121,9 @@ pub fn open_in_explorer(path: &str) -> Result<(), String> {
 
 pub fn open_in_terminal(path: &str) -> Result<(), String> {
     let script = format!("Set-Location -LiteralPath '{}'; Clear-Host", path.replace('\'', "''"));
-    std::process::Command::new("powershell")
-        .args(["-NoExit", "-Command", &script])
+    let mut c = std::process::Command::new("powershell");
+    new_console(&mut c);
+    c.args(["-NoExit", "-NoProfile", "-Command", &script])
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("打开终端失败: {e}"))
@@ -130,8 +131,9 @@ pub fn open_in_terminal(path: &str) -> Result<(), String> {
 
 /// Open cmd.exe kept open at the given directory.
 pub fn open_in_cmd(path: &str) -> Result<(), String> {
-    std::process::Command::new("cmd")
-        .args(["/K", "cd", "/d", path])
+    let mut c = std::process::Command::new("cmd");
+    new_console(&mut c);
+    c.args(["/D", "/K", &format!("cd /d \"{path}\"")])
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("打开 cmd 失败: {e}"))
@@ -160,12 +162,25 @@ pub fn open_in_vscode(code_path: &str, dir: &str) -> Result<(), String> {
         .map_err(|e| format!("启动 VS Code 失败: {e}"))
 }
 
+/// 终端子进程必须拿到独立的新控制台窗口：父进程带控制台时（dev 启动、
+/// bat 启动便携版），console 子进程默认依附父控制台，桌面上看不到任何窗口。
+#[cfg(windows)]
+fn new_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0000_0010) // CREATE_NEW_CONSOLE
+}
+
 /// 后台执行的控制台程序不弹窗（CREATE_NO_WINDOW）。
 #[cfg(windows)]
 fn hide_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
     use std::os::windows::process::CommandExt;
     cmd.creation_flags(0x0800_0000)
 }
+#[cfg(not(windows))]
+fn new_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd
+}
+
 #[cfg(not(windows))]
 fn hide_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
     cmd
