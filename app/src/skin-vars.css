@@ -1,25 +1,27 @@
 /* Skin tokens live on body: base-theme inline tokens on html remain intact. */
+/* Steins;Gate — huke 式低饱和暖调：暗褐/黑底色、焦橙琥珀光、铁锈红警示，
+   绿只保留为复古信号色（见 --ok）。 */
 body[data-skin="steins-gate"] {
   color-scheme: dark;
-  --bg: #0c120e;
-  --bg-panel: #111c15;
-  --bg-elev: #1a2a1e;
-  --bg-elev2: #253a28;
-  --border: #526c45;
-  --border-soft: #344b36;
-  --text: #eef7e8;
-  --text-dim: #c3d4b8;
-  --text-faint: #a1b295;
-  --accent: #baff62;
-  --accent-contrast: #102008;
-  --accent-soft: #2c4220;
-  --danger: #ff9393;
-  --ok: #baff62;
-  --warn: #ffd079;
-  --code-bg: #0e1911;
-  --scroll: #5b7451;
+  --bg: #17130d;
+  --bg-panel: #1f1911;
+  --bg-elev: #2b2216;
+  --bg-elev2: #3b2f1f;
+  --border: #71593a;
+  --border-soft: #483927;
+  --text: #f2e8d5;
+  --text-dim: #cfbd9f;
+  --text-faint: #a08b6a;
+  --accent: #d89123;
+  --accent-contrast: #201405;
+  --accent-soft: #4a3413;
+  --danger: #d2320a;
+  --ok: #9aa84e;
+  --warn: #e2b45c;
+  --code-bg: #14100a;
+  --scroll: #71593a;
   --shadow: 0 12px 36px #0009;
-  --radius: 7px;
+  --radius: 4px;
   --skin-bg: url("/skins/steins-gate/bg.png");
   --skin-character: url("/skins/steins-gate/character.png");
 }

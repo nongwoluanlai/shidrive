@@ -22,6 +22,7 @@
   import HistoryBindModal from "./lib/components/HistoryBindModal.svelte";
   import DialogHost from "./lib/components/DialogHost.svelte";
   import Icon from "./lib/components/Icon.svelte";
+import SkinCharacter from "./lib/components/SkinCharacter.svelte";
   import logo from "./assets/logo.png";
   import { t } from "./lib/i18n";
 
@@ -206,6 +207,8 @@
 <PermissionDialog />
 <Toasts />
 <DialogHost />
+<!-- 皮肤人物：顶层悬浮于左下角，不占布局、不挡操作 -->
+<SkinCharacter />
 
 <style>
   .root {

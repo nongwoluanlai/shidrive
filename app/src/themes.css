@@ -58,21 +58,25 @@ body[data-skin="hell"] .btn.primary:hover:not(:disabled) { background: #be4356; 
 /* Built-in skins carry their own artwork through the same --skin-bg layer. */
 body[data-skin="steins-gate"] .root {
   --skin-bg: url("/skins/steins-gate/bg.png");
-  --skin-veil: rgba(6, 10, 8, calc(1 - var(--skin-opacity, 1) * 0.72));
+  --skin-veil: rgba(12, 10, 7, calc(1 - var(--skin-opacity, 1) * 0.72));
 }
 body[data-skin="hell"] .root {
   --skin-bg: url("/skins/hell/bg.png");
   --skin-veil: rgba(16, 14, 12, calc(1 - var(--skin-opacity, 1) * 0.6));
 }
 
-/* An actual flex child in Sidebar, after its scrollable lists. Character art only:
-   transparent-background PNG shown as-is, no background compositing, no controls. */
+/* Top-most floating character: a pointer-transparent overlay pinned to the
+   bottom-left corner. It takes no layout space (the sidebar keeps its full
+   height underneath) and never blocks clicks, scrolling or selection. */
 .skin-character-stage { display: none; }
 body[data-skin-character="true"] .skin-character-stage {
   display: block;
-  position: relative;
-  flex: 0 0 clamp(220px, 44vh, 480px);
-  width: 100%;
+  position: fixed;
+  left: 0;
+  bottom: 0;
+  z-index: 300;
+  width: min(34vw, 400px);
+  height: clamp(220px, 42vh, 460px);
   overflow: hidden;
   pointer-events: none;
   user-select: none;
@@ -84,7 +88,7 @@ body[data-skin-character="true"] .skin-character-stage {
   background: var(--skin-character, none) left bottom / contain no-repeat;
   filter: drop-shadow(3px 2px 7px #0006);
 }
-@media (max-height: 580px) { body[data-skin-character="true"] .skin-character-stage { flex-basis: 140px; } }
+@media (max-height: 580px) { body[data-skin-character="true"] .skin-character-stage { width: min(26vw, 300px); height: 160px; } }
 @media (max-height: 420px) { body[data-skin-character="true"] .skin-character-stage { display: none; } }
 @media (prefers-reduced-motion: reduce) {
   body[data-skin]:not([data-skin=""]) *, body[data-skin]:not([data-skin=""]) *::before, body[data-skin]:not([data-skin=""]) *::after {

@@ -2,6 +2,7 @@
   import { t } from "../i18n";
   // 会话时间线：按消息流定位的导航条，hover 预览发出消息，点击滚动定位。
   import type { DisplayItem } from "../state.svelte";
+  import SkinTimelineArt from "./SkinTimelineArt.svelte";
 
   let { items, onJump }: { items: DisplayItem[]; onJump: (id: string) => void } = $props();
 
@@ -36,6 +37,7 @@
 </script>
 
 <div class="timeline" role="navigation" aria-label={t("会话时间线")}>
+  <SkinTimelineArt />
   <div class="rail"></div>
   {#each markers as m, mi (m.item.id)}
     <div

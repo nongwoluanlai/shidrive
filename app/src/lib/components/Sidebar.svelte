@@ -4,7 +4,6 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { api } from "../ipc";
   import ContextMenu from "./ContextMenu.svelte";
   import Icon from "./Icon.svelte";
-  import SkinCharacter from "./SkinCharacter.svelte";
   import type { MenuItem } from "./menu-item";
   import { scheduleText } from "./wf-shared";
   import { t } from "../i18n";
@@ -364,7 +363,6 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     </div>
   </div>
 
-  <SkinCharacter />
 </aside>
 
 

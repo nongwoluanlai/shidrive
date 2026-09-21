@@ -43,7 +43,7 @@
 <section class="skin-settings">
   <h3>{t("皮肤插件")}</h3>
   <label class="skin-toggle"><input type="checkbox" checked={!!app.skin} onchange={(e) => choose(e.currentTarget.checked ? lastSkin : "")} />{t("启用皮肤")}</label>
-  <p class="skin-note">{t("皮肤提供独立配色；关闭后恢复上方基础主题。人物仅在左下角独立区域显示。")}</p>
+  <p class="skin-note">{t("皮肤提供独立配色；关闭后恢复上方基础主题。人物悬浮于左下角顶层，不遮挡操作。")}</p>
   <div class="skin-cards">
     {#each builtinSkins as skin (skin.id)}
       <button class="skin-card" class:on={app.skin === skin.id} aria-pressed={app.skin === skin.id} onclick={() => choose(skin.id)}>

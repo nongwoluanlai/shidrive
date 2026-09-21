@@ -11,7 +11,7 @@ export interface SkinManifest {
   css?: string;
 }
 export const builtinSkins = [
-  { id: "steins-gate", name: "命运石之门", en: "Steins;Gate", description: "荧绿实验室 · CRT 终端", descriptionEn: "Fluorescent lab · CRT terminal", preview: "/skins/steins-gate/bg.png" },
+  { id: "steins-gate", name: "命运石之门", en: "Steins;Gate", description: "琥珀暖光 · 复古实验室", descriptionEn: "Amber lab light · retro terminal", preview: "/skins/steins-gate/bg.png" },
   { id: "hell", name: "地狱乐", en: "Hell’s Paradise", description: "深红和风 · 山林薄雾", descriptionEn: "Crimson lacquer · mountain mist", preview: "/skins/hell/bg.png" },
 ];
 const colorVars = new Set(["--bg", "--bg-panel", "--bg-elev", "--bg-elev2", "--text", "--text-dim", "--text-faint", "--accent", "--accent-contrast", "--accent-soft", "--border", "--border-soft", "--code-bg", "--ok", "--warn", "--danger", "--scroll"]);
