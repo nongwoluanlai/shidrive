@@ -267,6 +267,9 @@ pub enum WorkflowStep {
         /// 变量备注（key → 展示名），画布优先显示备注
         #[serde(default)]
         labels: std::collections::BTreeMap<String, String>,
+        /// 手动调整后的高度（px）
+        #[serde(default)]
+        h: Option<f64>,
         #[serde(default)]
         x: f64,
         #[serde(default)]

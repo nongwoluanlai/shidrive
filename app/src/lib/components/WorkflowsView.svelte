@@ -290,6 +290,29 @@
   let dragOff = { x: 0, y: 0 };
   let canvasEl: HTMLDivElement | null = $state(null);
 
+  let resizing: { index: number; startH: number; startY: number } | null = null;
+  function startStepResize(e: PointerEvent, i: number) {
+    if (!selected) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const st = selected.steps[i] as WorkflowStep & { h?: number };
+    const el = document.querySelector('.node[data-index="' + i + '"]') as HTMLElement | null;
+    resizing = { index: i, startH: st.h ?? (el?.offsetHeight ?? 90), startY: e.clientY };
+    const move = (ev: PointerEvent) => {
+      if (!resizing) return;
+      const step = selected?.steps[resizing.index] as (WorkflowStep & { h?: number }) | undefined;
+      if (!step) return;
+      step.h = Math.max(60, Math.min(600, Math.round(resizing.startH + (ev.clientY - resizing.startY))));
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      resizing = null;
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }
+
   function nodeDown(e: PointerEvent, i: number) {
     if (!selected || e.button !== 0) return;
     selectedStep = i;
@@ -711,13 +734,20 @@
                   class="node"
                   class:sel={selectedStep === i}
                   data-index={i}
-                  style="left:{step.x}px; top:{step.y}px; width:{step.type === "note" || step.type === "env" ? 290 : NODE_W}px"
+                  style="left:{step.x}px; top:{step.y}px; width:{step.type === "note" || step.type === "env" ? 290 : NODE_W}px;{(step.type === "note" || step.type === "env") && step.h ? `height:${step.h}px` : ""}"
                   onpointerdown={(e) => nodeDown(e, i)}
                   ondblclick={(e) => { e.stopPropagation(); selectedStep = i; selectedEdge = null; nodeDlg = i; }}
                   oncontextmenu={(e) => nodeContextMenu(e, i)}
                 >
                   {#if step.type !== "start"}
                     <div class="port-in" title={t("输入")}></div>
+                  {/if}
+                  {#if step.type === "note" || step.type === "env"}
+                    <div
+                      class="rsz"
+                      title={t("拖拽调整高度")}
+                      onpointerdown={(e) => startStepResize(e, i)}
+                    ></div>
                   {/if}
                   <div class="nhead">
                     <span class="nnum">{i + 1}</span>
@@ -1139,6 +1169,26 @@
     flex: none;
     font-size: 0.9em;
   }
+  .rsz {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -3px;
+    height: 8px;
+    cursor: ns-resize;
+    pointer-events: auto;
+  }
+  .rsz::after {
+    content: "";
+    position: absolute;
+    left: calc(50% - 18px);
+    bottom: 1px;
+    width: 36px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--border);
+  }
+  .rsz:hover::after { background: var(--text-faint); }
   .node {
     position: absolute;
     touch-action: none;

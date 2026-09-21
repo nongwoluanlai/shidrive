@@ -120,6 +120,8 @@ export type WorkflowStep =
       type: "note";
       name: string;
       text: string;
+      /** 手动调整后的高度（px）；缺省按内容自适应 */
+      h?: number;
       x: number;
       y: number;
     }
@@ -166,6 +168,8 @@ export type WorkflowStep =
       name: string;
       vars: Record<string, string>;
       labels?: Record<string, string>;
+      /** 手动调整后的高度（px） */
+      h?: number;
       x: number;
       y: number;
     };

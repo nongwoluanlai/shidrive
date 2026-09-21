@@ -92,6 +92,9 @@ pub fn run(args: &[String]) -> i32 {
         if !token.is_empty() { "token".to_string() } else if !auth_user.is_empty() { "basic".to_string() } else { "open(仅本机建议)".to_string() },
         if exec_enabled { "on" } else { "off" }
     );
+    if !token.is_empty() {
+        eprintln!("[coding-mcp] token: {token}");
+    }
     let cfg = std::sync::Arc::new(Cfg {
         root,
         token: token.clone(),

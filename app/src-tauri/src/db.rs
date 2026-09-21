@@ -139,27 +139,43 @@ impl Db {
                     params![crate::models::NO_PROJECT_ID],
                 );
                 let exist = c.query_row("SELECT COUNT(*) FROM workflows WHERE id='rfw-0001'", [], |r| r.get::<_, i64>(0))? > 0;
+                // 旧内置定义为「启动/停止切换 + 隐藏窗口」，与本版的前台常驻语义不同：
+                // 若用户未改名（仍是 runfromweb），自动升级为新的常驻定义
+                if exist {
+                    // 未改名（用户没定制过）或旧脚本无常驻日志尾随时，自动升级为最新定义
+                    let old_name: String = c.query_row("SELECT name FROM workflows WHERE id='rfw-0001'", [], |r| r.get(0))?;
+                    let old_steps: String = c.query_row("SELECT steps FROM workflows WHERE id='rfw-0001'", [], |r| r.get(0))?;
+                    let stale = old_name == "runfromweb" || !old_steps.contains("Get-Content $errFile");
+                    if stale {
+                        c.execute("DELETE FROM workflows WHERE id='rfw-0001'", [])?;
+                    }
+                }
+                let exist = c.query_row("SELECT COUNT(*) FROM workflows WHERE id='rfw-0001'", [], |r| r.get::<_, i64>(0))? > 0;
                 if !exist {
                     let ts = now();
-                    let toggle_ps = r#"$port='{{env.CODING_MCP_PORT}}'
-$existing = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($existing) { Stop-Process -Id $existing.OwningProcess -Force; "stopped pid $($existing.OwningProcess)"; exit }
-$cli = @('--coding-mcp','--port',$port,'--root','{{env.CODING_MCP_ROOT}}')
-if ('{{env.CODING_MCP_TOKEN}}') { $cli += @('--token','{{env.CODING_MCP_TOKEN}}') }
-if ('{{env.CODING_MCP_BIND}}') { $cli += @('--bind','{{env.CODING_MCP_BIND}}') }
-if ('{{env.CODING_MCP_AUTH_USER}}') { $cli += @('--auth-user','{{env.CODING_MCP_AUTH_USER}}','--auth-pass','{{env.CODING_MCP_AUTH_PASS}}') }
-if ('{{env.CODING_MCP_ALLOW_EXEC}}' -eq '0') { $cli += @('--exec','0') }
-Start-Process -FilePath '{{env.__app__}}' -ArgumentList $cli -WindowStyle Hidden
-'started'"#;
+                    // 前台常驻：直接在节点内运行 coding-mcp，启动日志（监听地址、
+                    // 令牌提示）实时写入运行日志；停止用「运行中任务」的停止按钮
+                    let resident_ps = r#"$app='{{env.__app__}}'
+$cliArgs=@('--coding-mcp','--port','{{env.CODING_MCP_PORT}}','--root','{{env.CODING_MCP_ROOT}}')
+if ('{{env.CODING_MCP_TOKEN}}') { $cliArgs += @('--token','{{env.CODING_MCP_TOKEN}}') }
+if ('{{env.CODING_MCP_BIND}}') { $cliArgs += @('--bind','{{env.CODING_MCP_BIND}}') }
+if ('{{env.CODING_MCP_AUTH_USER}}') { $cliArgs += @('--auth-user','{{env.CODING_MCP_AUTH_USER}}','--auth-pass','{{env.CODING_MCP_AUTH_PASS}}') }
+if ('{{env.CODING_MCP_ALLOW_EXEC}}' -eq '0') { $cliArgs += @('--exec','0') }
+$errFile = Join-Path $env:TEMP ('coding-mcp-' + [guid]::NewGuid().ToString('N') + '.log')
+$p = Start-Process -FilePath $app -ArgumentList $cliArgs -NoNewWindow -RedirectStandardError $errFile -PassThru
+"started pid $($p.Id)"
+Get-Content $errFile -Wait | ForEach-Object { "[coding-mcp] $_" }
+Remove-Item $errFile -ErrorAction SilentlyContinue"#;
                     let steps = vec![
                         WorkflowStep::Start { name: String::new(), x: 60.0, y: 140.0 },
                         WorkflowStep::Note {
                             name: "作用".into(),
-                            text: "Coding MCP（runfromweb）：不随使驾启动的独立 MCP 服务，供网络侧模型（如 ChatGPT）通过 HTTP 使用本地文件与命令能力。\n再次运行本工作流 = 切换状态：已启动则停止，未启动则启动。\n端点 http://127.0.0.1:端口/mcp；对外暴露建议设置令牌或 HTTP 认证并自行配置反向代理。".into(),
+                            text: "外部编程 MCP：不随使驾启动的独立 MCP 服务，供网络侧模型（如 ChatGPT）通过 HTTP 使用本地文件与命令能力。\n前台常驻运行：启动日志（监听地址、令牌提示）实时显示在运行日志；在「运行中任务」可停止。\n端点 http://127.0.0.1:端口/mcp；对外暴露建议设置令牌或 HTTP 认证并自行配置反向代理。".into(),
                             x: 330.0, y: 60.0,
                         },
                         WorkflowStep::EnvSet {
                             name: "服务配置".into(),
+                            h: None,
                             vars: [
                                 ("CODING_MCP_PORT", "51667"),
                                 ("CODING_MCP_ROOT", "D:\\"),
@@ -181,11 +197,11 @@ Start-Process -FilePath '{{env.__app__}}' -ArgumentList $cli -WindowStyle Hidden
                             x: 330.0, y: 250.0,
                         },
                         WorkflowStep::Shell {
-                            name: "启动/停止(toggle)".into(),
-                            command: toggle_ps.to_string(),
+                            name: "启动外部编程 MCP（常驻）".into(),
+                            command: resident_ps.to_string(),
                             cwd: String::new(),
                             shell: "powershell".into(),
-                            timeout_sec: Some(30),
+                            timeout_sec: None,
                             continue_on_error: false,
                             x: 680.0, y: 140.0,
                         },
@@ -197,7 +213,7 @@ Start-Process -FilePath '{{env.__app__}}' -ArgumentList $cli -WindowStyle Hidden
                         Edge { from: 2, to: 3 },
                     ]).unwrap_or_default();
                     c.execute(
-                        "INSERT INTO workflows (id,project_id,name,description,enabled,trigger_type,schedule,steps,last_run_at,next_run_at,created_at,updated_at,env,edges) VALUES ('rfw-0001',?1,'runfromweb','Coding MCP 独立服务（内置）：运行=切换 启动/停止',1,'manual','',?2,NULL,NULL,?3,?3,'{}',?4)",
+                        "INSERT INTO workflows (id,project_id,name,description,enabled,trigger_type,schedule,steps,last_run_at,next_run_at,created_at,updated_at,env,edges) VALUES ('rfw-0001',?1,'外部编程mcp','外部编程 MCP（内置）：前台常驻启动，运行日志实时可见',1,'manual','',?2,NULL,NULL,?3,?3,'{}',?4)",
                         params![crate::models::NO_PROJECT_ID, steps_json, ts, edges_json],
                     )?;
                 }

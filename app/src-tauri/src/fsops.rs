@@ -100,13 +100,19 @@ pub fn delete_path(path: &str) -> Result<(), String> {
 }
 
 pub fn open_in_explorer(path: &str) -> Result<(), String> {
-    let p = std::path::Path::new(path);
+    // 归一化分隔符（Markdown 里的路径常是正斜杠），避免 /select 静默失败
+    let normalized = path.replace('/', "\\");
+    let p = std::path::Path::new(&normalized);
+    if !p.exists() {
+        return Err(format!("路径不存在: {normalized}"));
+    }
     if p.is_dir() {
-        open::that_detached(path).map_err(|e| e.to_string())
+        open::that_detached(&normalized).map_err(|e| e.to_string())
     } else {
         // select the file in its folder
-        std::process::Command::new("explorer")
-            .arg(format!("/select,{path}"))
+        let mut c = std::process::Command::new("explorer");
+        hide_window(&mut c)
+            .arg(format!("/select,{normalized}"))
             .spawn()
             .map(|_| ())
             .map_err(|e| e.to_string())

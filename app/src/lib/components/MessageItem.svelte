@@ -117,10 +117,13 @@
     const href = target.closest("a[href]")?.getAttribute("href");
     const rawPath = file ?? (href ? localLinkPath(href) : null);
     if (rawPath) {
-      const path = /^(?:[a-z]:[\\/]|[\\/])/i.test(rawPath) ? rawPath : `${currentProject()?.root_path ?? ""}/${rawPath}`;
+      // 相对路径按当前项目根目录补全；统一反斜杠，便于资源管理器定位
+      const abs = /^(?:[a-z]:[\\/]|[\\/]{2})/i.test(rawPath)
+        ? rawPath.replace(/\//g, "\\")
+        : `${(currentProject()?.root_path ?? "").replace(/[\\/]+$/, "")}\\${rawPath.replace(/\//g, "\\").replace(/^\\+/, "")}`;
       items.push(
-        { label: "📂 打开所在目录", run: () => void api.fsOpenExplorer(path).catch((err) => toast("error", String(err))) },
-        { label: "⧉ 复制路径", run: () => copy(rawPath, "已复制路径") },
+        { label: "📂 打开所在目录", run: () => void api.fsOpenExplorer(abs).catch((err) => toast("error", String(err))) },
+        { label: "🚀 打开文件/目录", run: () => void api.fsOpenDefault(abs).catch((err) => toast("error", String(err))) },
       );
     }
     items.push({ label: "⧉ 复制全文", run: () => copy(item.text, "已复制全文") });
