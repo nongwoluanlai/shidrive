@@ -59,8 +59,10 @@
     const id = expanded;
     if (!id || drafts[id]) return;
     const r = registry.find((x) => x.id === id);
-    // 环境变量草稿预填自动探测值（ZCODE_BIN/ZCODE_NODE/CODEX_PATH…），可编辑后保存
+    // 环境变量草稿预填自动探测值（ZCODE_BIN/ZCODE_NODE/CODEX_PATH…），可编辑后保存；
+    // api 类（DEEPSEEK_API_KEY 等）只作检测展示，绝不预填
     const autoEnv = Object.entries(r?.auto_env ?? {})
+      .filter(([k]) => !DIR_ENV_TARGETS[k]?.api)
       .map(([k, v]) => `${k}=${v}`)
       .join("\n");
     drafts[id] = { command: r?.manual_command ?? "", args: "", env: autoEnv };
@@ -193,11 +195,11 @@
     void saveConfig(r);
   }
 
-  // 安装目录 → 推导该 Agent 已知的路径/环境变量，填充到草稿（可再手改）
-  const DIR_ENV_TARGETS: Record<string, { env: string; rel: string }> = {
+  // 安装目录 / 密钥 → 推导该 Agent 已知的环境变量，填充到草稿（可再手改）
+  const DIR_ENV_TARGETS: Record<string, { env: string; rel: string; api?: boolean }> = {
     zcode: { env: "ZCODE_BIN", rel: "resources\\glm\\zcode.cjs" },
     codex: { env: "CODEX_PATH", rel: "codex.exe" },
-    deepseek: { env: "DSH_HOME", rel: "" },
+    deepseek: { env: "DEEPSEEK_API_KEY", rel: "", api: true },
   };
 
   async function fillFromInstallDir(r: AgentEnvStatusItem) {
@@ -209,7 +211,13 @@
       if (line) return line.slice(target.env.length + 1).replace(new RegExp("\\\\+(resources\\\\glm)?\\\\zcode\\.cjs$", "i"), "").replace(/\\codex\.exe$/i, "");
       return (r.auto_env?.[target.env] ?? "").replace(/\\(resources\\glm\\)?zcode\.cjs$/i, "").replace(/\\codex\.exe$/i, "");
     })();
-    const dir = await import("../dialog.svelte").then((m) => m.promptDialog({ title: t("安装目录"), label: t("{name} 的安装目录", { name: r.name }), initial }));
+    const dir = await import("../dialog.svelte").then((m) =>
+      m.promptDialog({
+        title: t(target.api ? "API Key" : "安装目录"),
+        label: target.api ? t("填入 {name} 的 API Key", { name: r.name }) : t("{name} 的安装目录", { name: r.name }),
+        initial,
+      }),
+    );
     if (dir === null || !dir.trim()) return;
     const clean = dir.trim().replace(/[\\/]+$/, "");
     const d = draftOf(r);
@@ -272,8 +280,13 @@
             {/if}
             {#if DIR_ENV_TARGETS[r.id]}
               <div class="cfg-line">
-                <button class="btn sm" onclick={() => fillFromInstallDir(r)}>{t("从安装目录填充")}</button>
-                <span class="pend">{t("输入软件安装目录，自动推导环境变量")}</span>
+                <button class="btn sm" onclick={() => fillFromInstallDir(r)}>
+                  {DIR_ENV_TARGETS[r.id].api ? t("填充 API Key") : t("从安装目录填充")}
+                </button>
+                <span class="pend">{DIR_ENV_TARGETS[r.id].api ? t("填入后保存配置，连接时注入环境变量") : t("输入软件安装目录，自动推导环境变量")}</span>
+                {#if DIR_ENV_TARGETS[r.id].api && r.auto_env?.[DIR_ENV_TARGETS[r.id].env] === "set"}
+                  <span class="badge ok">{t("已检测到 {key}（系统环境）", { key: DIR_ENV_TARGETS[r.id].env })}</span>
+                {/if}
               </div>
             {/if}
             <div class="field"><label>{t("命令（{hint}）", { hint: r.npm ? t("覆盖自动检测，留空=自动") : t("必填：可执行文件完整路径") })}</label>

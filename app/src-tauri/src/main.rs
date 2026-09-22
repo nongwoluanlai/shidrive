@@ -10,6 +10,7 @@ mod fsops;
 mod mcp;
 mod manager;
 mod models;
+mod remote_mcp;
 mod node_rt;
 mod setup;
 mod skins;
@@ -157,6 +158,7 @@ fn main() {
             app.manage(db);
             app.manage(agents);
             app.manage(engine);
+            app.manage(crate::remote_mcp::RemoteManager::new());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -224,6 +226,16 @@ fn main() {
             commands::settings_get,
             commands::settings_set,
             commands::setup_status,
+            commands::remote_mcp_start,
+            commands::remote_mcp_stop,
+            commands::remote_mcp_status,
+            commands::remote_grants_list,
+            commands::remote_grant_create,
+            commands::remote_grant_revoke,
+            commands::remote_grant_delete,
+            commands::remote_cloudflared_install,
+            commands::remote_cloudflared_status,
+            commands::remote_cloudflared_set_path,
             commands::skin_import,
             commands::skins_list,
             commands::skin_asset_data,

@@ -5,10 +5,11 @@
   import SkinSettings from "./SkinSettings.svelte";
   import { isEnabled as autoStartEnabled, enable as autoStartEnable, disable as autoStartDisable } from "@tauri-apps/plugin-autostart";
   import AgentsAdmin from "./AgentsAdmin.svelte";
+  import RemoteMcpSettings from "./RemoteMcpSettings.svelte";
   import { t } from "../i18n";
   import type { AgentEnvStatusItem, NodeStat } from "../types";
 
-  let tab = $state<"agents" | "theme" | "paths">("agents");
+  let tab = $state<"agents" | "remote" | "theme" | "paths">("agents");
   let registry = $state<AgentEnvStatusItem[]>([]);
 
   // --- paths / ports editing state ---
@@ -172,9 +173,10 @@
     <div class="modal settings">
       <header>{t("设置")} <button class="btn ghost sm" onclick={close}>✕</button></header>
       <div class="tabs">
-        <button class:active={tab === "agents"} onclick={() => { tab = "agents"; void loadRegistry(); }}>{t("Agent 管理")}</button>
-        <button class:active={tab === "paths"} onclick={() => (tab = "paths")}>{t("环境与路径")}</button>
-        <button class:active={tab === "theme"} onclick={() => (tab = "theme")}>{t("外观主题")}</button>
+        <button class:active={tab === "agents"} onclick={() => { tab = "agents"; void loadRegistry(); }}>Agent 管理</button>
+        <button class:active={tab === "remote"} onclick={() => { tab = "remote"; void loadRegistry(); }}>外部编程接入</button>
+        <button class:active={tab === "paths"} onclick={() => (tab = "paths")}>环境与路径</button>
+        <button class:active={tab === "theme"} onclick={() => (tab = "theme")}>外观主题</button>
       </div>
 
       <div class="body">
@@ -223,6 +225,8 @@
           <SkinSettings />
         {:else if tab === "agents"}
           <AgentsAdmin bind:registry loadRegistry={loadRegistry} />
+        {:else if tab === "remote"}
+          <RemoteMcpSettings />
         {:else}
           <div class="sec">
             <h3>{t("通用")}</h3>

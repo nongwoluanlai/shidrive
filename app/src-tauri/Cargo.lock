@@ -3163,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "shidrive"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "env_logger",
@@ -3173,6 +3173,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "socket2 0.5.10",
  "tauri",
  "tauri-build",

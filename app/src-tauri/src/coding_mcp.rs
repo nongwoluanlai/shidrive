@@ -40,9 +40,10 @@ pub fn run(args: &[String]) -> i32 {
     let bind = env_flag("--bind", "CODING_MCP_BIND").unwrap_or_else(|| "127.0.0.1".into());
     let auth_user = env_flag("--auth-user", "CODING_MCP_AUTH_USER").unwrap_or_default();
     let auth_pass = env_flag("--auth-pass", "CODING_MCP_AUTH_PASS").unwrap_or_default();
+    // FIX-05：默认关闭命令执行；确需开启时显式传 --exec 1 / CODING_MCP_ALLOW_EXEC=1
     let exec_enabled = env_flag("--exec", "CODING_MCP_ALLOW_EXEC")
-        .map(|v| v != "0" && v.to_lowercase() != "false")
-        .unwrap_or(true);
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
 
     let root = PathBuf::from(root);
     if !root.is_dir() {
@@ -92,9 +93,6 @@ pub fn run(args: &[String]) -> i32 {
         if !token.is_empty() { "token".to_string() } else if !auth_user.is_empty() { "basic".to_string() } else { "open(仅本机建议)".to_string() },
         if exec_enabled { "on" } else { "off" }
     );
-    if !token.is_empty() {
-        eprintln!("[coding-mcp] token: {token}");
-    }
     let cfg = std::sync::Arc::new(Cfg {
         root,
         token: token.clone(),
@@ -116,12 +114,12 @@ pub fn run(args: &[String]) -> i32 {
     0
 }
 
-struct Cfg {
-    root: PathBuf,
-    token: String,
-    auth_user: String,
-    auth_pass: String,
-    exec_enabled: bool,
+pub(crate) struct Cfg {
+    pub(crate) root: PathBuf,
+    pub(crate) token: String,
+    pub(crate) auth_user: String,
+    pub(crate) auth_pass: String,
+    pub(crate) exec_enabled: bool,
 }
 
 fn handle_conn(mut stream: TcpStream, cfg: &Cfg) -> std::io::Result<()> {
@@ -385,17 +383,45 @@ fn tool_definitions(cfg: &Cfg) -> Value {
 
 // ---------- helpers ----------
 
+/// Windows 下 canonicalize 返回 \?\ 开头的 verbatim 路径，直接 starts_with 会因
+/// 前缀类型不同而恒为 false。统一剥前缀 + 小写比较。
+fn norm_prefix(p: &Path) -> String {
+    let s = p.to_string_lossy().to_string();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
+    let s = s.replace('/', "\\");
+    s.trim_end_matches(['\\', '/']).to_ascii_lowercase()
+}
+
+fn within_root(child: &Path, root: &Path) -> bool {
+    let c = norm_prefix(child);
+    let r = norm_prefix(root);
+    c.starts_with(&r)
+}
+
 fn safe_path(cfg: &Cfg, raw: &str) -> Result<PathBuf, String> {
     let p = Path::new(raw);
     let joined = if p.is_absolute() { p.to_path_buf() } else { cfg.root.join(p) };
     let canon = std::fs::canonicalize(&joined).map_err(|e| format!("路径不存在（{}）：{e}", joined.display()))?;
-    if !canon.starts_with(&cfg.root) {
+    if !within_root(&canon, &cfg.root) {
         return Err(format!("路径越界：{} 不在根目录 {} 之内。", canon.display(), cfg.root.display()));
     }
     Ok(canon)
 }
 
-fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
+/// 原子写入：同目录临时文件 + flush + rename；失败清理临时文件。
+fn atomic_write(full: &Path, content: &str) -> Result<usize, String> {
+    use std::io::Write;
+    let tmp = full.with_extension("tmp-shidrive");
+    {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {e}"))?;
+        f.write_all(content.as_bytes()).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("写入失败: {e}") })?;
+        f.flush().map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("flush 失败: {e}") })?;
+    }
+    std::fs::rename(&tmp, full).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("替换失败: {e}") })?;
+    Ok(content.len())
+}
+
+pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
     match name {
         "pc.fs.read" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
@@ -418,11 +444,15 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             })))
         }
         "pc.fs.write" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
-            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or_default();
+            let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
+                return Err("缺少必填参数 path".into());
+            };
+            let Some(content) = args.get("content").and_then(|v| v.as_str()) else {
+                return Err("缺少必填参数 content（如需清空文件请传空字符串）".into());
+            };
             let full = safe_path_parent(cfg, path)?;
-            std::fs::write(&full, content).map_err(|e| format!("写入失败: {e}"))?;
-            Ok(json_bytes(&json!({ "written": true, "path": full.to_string_lossy(), "bytes": content.len() })))
+            let bytes = atomic_write(&full, content)?;
+            Ok(json_bytes(&json!({ "written": true, "path": full.to_string_lossy(), "bytes": bytes })))
         }
         "pc.fs.mkdir" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
@@ -489,17 +519,24 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
 fn safe_path_parent(cfg: &Cfg, raw: &str) -> Result<PathBuf, String> {
     let p = Path::new(raw);
     let joined = if p.is_absolute() { p.to_path_buf() } else { cfg.root.join(p) };
+    if joined.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err("路径包含 ..，已拒绝。".into());
+    }
     let parent = joined.parent().unwrap_or(&cfg.root);
     let parent_canon = std::fs::canonicalize(parent).map_err(|e| format!("父目录不存在（{}）：{e}", parent.display()))?;
-    if !parent_canon.starts_with(&cfg.root) {
+    if !within_root(&parent_canon, &cfg.root) {
         return Err(format!("路径越界：{} 不在根目录 {} 之内。", joined.display(), cfg.root.display()));
     }
-    // 拼回文件名，保留原大小写
+    // 拼回文件名，保留原大小写；若目标已是符号链接/重解析点，同样拒绝（防逃逸）
     let file = joined.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
     if file.is_empty() {
         return Err("路径缺少文件名。".into());
     }
-    Ok(parent_canon.join(file))
+    let full = parent_canon.join(&file);
+    if full.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        return Err(format!("目标是符号链接，已拒绝：{}", full.display()));
+    }
+    Ok(full)
 }
 
 fn skip_dir(name: &str) -> bool {
@@ -589,31 +626,55 @@ fn run_exec(command: &str, dir: &Path, timeout: u64, max_chars: usize) -> Result
     let pid = child.id();
     let out = child.stdout.take();
     let err = child.stderr.take();
-    let out_handle = {
-        let pipe = out;
+    // FIX-06：限额流式缓冲——超限后继续排空管道（不阻塞子进程），仅保留尾部 keep 字节
+    fn drain<R: std::io::Read + Send + 'static>(
+        pipe: Option<R>,
+        keep: usize,
+    ) -> std::thread::JoinHandle<(Vec<u8>, u64)> {
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut dropped: u64 = 0;
+            let mut chunk = [0u8; 8192];
             if let Some(mut p) = pipe {
-                let _ = std::io::Read::read_to_end(&mut p, &mut buf);
+                loop {
+                    match std::io::Read::read(&mut p, &mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.len() > keep {
+                                let excess = buf.len() - keep;
+                                buf.drain(..excess);
+                                dropped += excess as u64;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
-            buf
+            (buf, dropped)
         })
-    };
-    let err_handle = {
-        let pipe = err;
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut p) = pipe {
-                let _ = std::io::Read::read_to_end(&mut p, &mut buf);
-            }
-            buf
-        })
-    };
+    }
+    let out_handle = drain(out, 512 * 1024);
+    let err_handle = drain(err, 512 * 1024);
+    // FIX-03：超时先终止进程树，再限时回收读取线程（防止后代持管道卡死）
     let status = wait_with_timeout(&mut child, timeout);
-    let stdout_raw = out_handle.join().unwrap_or_default();
-    let stderr_raw = err_handle.join().unwrap_or_default();
+    let timed_out = status.is_none();
+    if timed_out {
+        let mut killer = std::process::Command::new("taskkill");
+        killer.args(["/F", "/T", "/PID", &pid.to_string()]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            killer.creation_flags(0x0800_0000);
+        }
+        let _ = killer.output();
+        let _ = child.wait();
+    }
+    let (stdout_raw, stdout_dropped) = out_handle.join().unwrap_or((Vec::new(), 0));
+    let (stderr_raw, stderr_dropped) = err_handle.join().unwrap_or((Vec::new(), 0));
     let stdout_txt = String::from_utf8_lossy(&stdout_raw);
     let stderr_txt = String::from_utf8_lossy(&stderr_raw);
+    let trunc_note = |dropped: u64| if dropped > 0 { format!("（另有 {dropped} 字节超限丢弃）") } else { String::new() };
     let cut = |s: &str| -> String {
         if s.chars().count() > max_chars {
             s.chars().take(max_chars).collect::<String>() + "\n…(截断)"
@@ -627,9 +688,12 @@ fn run_exec(command: &str, dir: &Path, timeout: u64, max_chars: usize) -> Result
             "stdout": cut(&stdout_txt),
             "stderr": cut(&stderr_txt),
             "workdir": dir.to_string_lossy(),
+            "stdout_dropped_bytes": stdout_dropped,
+            "stderr_dropped_bytes": stderr_dropped,
+            "stdout_truncated_note": trunc_note(stdout_dropped),
+            "stderr_truncated_note": trunc_note(stderr_dropped),
         }))),
         None => {
-            let _ = std::process::Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
             Err(format!("命令超时（{timeout}s），已终止进程树。已捕获输出：\n{}", cut(&stdout_txt)))
         }
     }

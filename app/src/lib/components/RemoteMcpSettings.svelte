@@ -1,0 +1,391 @@
+<script lang="ts">
+  // 设置 → 外部编程接入（MCP）：远端服务生命周期 + 项目授权列表 + 临时隧道
+  import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
+  import { app, currentProject, toast } from "../state.svelte";
+  import { api } from "../ipc";
+  import { t } from "../i18n";
+  import type { Project, Context } from "../types";
+
+  interface RemoteStatus {
+    running: boolean;
+    port: number;
+    started_at: string | null;
+    public_url: string | null;
+    grants_active: number;
+    tunnel_running: boolean;
+    logs: string[];
+  }
+  interface RemoteGrant {
+    id: string;
+    project_id: string;
+    project_name: string;
+    project_root: string;
+    context_id: string | null;
+    context_name: string;
+    context_enabled: boolean;
+    fs_write: boolean;
+    exec_allowed: boolean;
+    created_at: string;
+    revoked_at: string | null;
+  }
+
+  let status = $state<RemoteStatus | null>(null);
+  let grants = $state<RemoteGrant[]>([]);
+  let busy = $state(false);
+  let exposure = $state<"custom" | "quick_tunnel">("custom");
+  let customUrl = $state("");
+  let lastToken = $state("");
+  let adding = $state(false);
+  let addProjectId = $state("");
+  let addContextEnabled = $state(false);
+  let addFsWrite = $state(false);
+  let addExec = $state(false);
+  let logOpen = $state(false);
+  let cf = $state<{ installed: boolean; path: string; version: string } | null>(null);
+  let cfBusy = $state(false);
+
+  const projects = $derived(app.projects.filter((p) => !p.id.startsWith("00000000")));
+  const contexts = $derived<Context[]>([]);
+  const publicUrl = $derived(status?.running ? (exposure === "custom" && customUrl.trim() ? customUrl.trim().replace(/\/+$/, "") : status.public_url ?? "") : "");
+
+  async function refresh() {
+    status = await api.remoteMcpStatus().catch(() => null);
+    try {
+      grants = (await api.remoteGrantsList()) as unknown as RemoteGrant[];
+    } catch {
+      grants = [];
+    }
+  }
+
+  async function refreshCf() {
+    cf = await api.remoteCloudflaredStatus().catch(() => null);
+  }
+
+  onMount(() => {
+    void refresh();
+    void refreshCf();
+    const un = listen("remote://tunnel", (e) => {
+      const d = (e.payload ?? {}) as { publicUrl?: string; error?: string };
+      if (d.publicUrl) { void refresh(); toast("ok", t("隧道地址已获取")); }
+      else if (d.error) { toast("error", t("隧道地址获取失败，请查看运行日志")); void refresh(); }
+    });
+    return () => { void un.then((f) => f()); };
+  });
+
+  // 选用 Cloudflare 临时隧道时立即检测环境；未安装则提示安装入口
+  $effect(() => {
+    if (exposure === "quick_tunnel") void refreshCf();
+  });
+
+  async function installCloudflared() {
+    cfBusy = true;
+    try {
+      toast("info", t("正在下载 cloudflared（约 15MB）…"));
+      const msg = await api.remoteCloudflaredInstall();
+      toast("ok", msg);
+      await refreshCf();
+    } catch (e) {
+      toast("error", String(e));
+    } finally {
+      cfBusy = false;
+    }
+  }
+
+  async function pickCloudflared() {
+    const initial = cf?.path ?? "";
+    const p = await import("../dialog.svelte").then((m) =>
+      m.promptDialog({ title: t("指定 cloudflared"), label: t("cloudflared.exe 的完整路径"), initial }),
+    );
+    if (p === null) return;
+    try {
+      await api.remoteCloudflaredSetPath(p.trim());
+      toast("ok", t("已保存 cloudflared 路径"));
+      await refreshCf();
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
+  async function startService() {
+    if (exposure === "quick_tunnel") {
+      cf = await api.remoteCloudflaredStatus().catch(() => null);
+      if (cf && !cf.installed) {
+        toast("warn", t("未找到 cloudflared：请先「快捷安装」或「指定已有程序」"));
+        return;
+      }
+    }
+    busy = true;
+    try {
+      await api.remoteMcpStart({ listenHost: "0.0.0.0", port: 51688, quickTunnel: exposure === "quick_tunnel" });
+      await refresh();
+      toast("ok", t("外部编程 MCP 服务已启动"));
+    } catch (e) {
+      toast("error", String(e));
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function stopService() {
+    busy = true;
+    try {
+      await api.remoteMcpStop();
+      await refresh();
+      toast("ok", t("外部编程 MCP 服务已停止"));
+    } catch (e) {
+      toast("error", String(e));
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function copyAddress() {
+    const url = publicUrl ? `${publicUrl}/mcp` : "";
+    if (!url) { toast("warn", t("服务未启动，暂无接入地址")); return; }
+    try { await navigator.clipboard.writeText(url); toast("ok", t("接入地址已复制")); } catch { toast("error", t("复制失败")); }
+  }
+
+  function startAdd() {
+    adding = true;
+    addProjectId = projects[0]?.id ?? "";
+    addContextEnabled = false;
+    addFsWrite = false;
+    addExec = false;
+  }
+
+  function cancelAdd() {
+    adding = false;
+  }
+
+  async function saveAdd() {
+    const project = app.projects.find((p) => p.id === addProjectId);
+    if (!project) { toast("warn", t("请先选择项目")); return; }
+    busy = true;
+    try {
+      const res = await api.remoteGrantCreate({
+        projectId: project.id,
+        projectName: project.name,
+        projectRoot: project.root_path,
+        contextId: null,
+        contextName: "",
+        contextEnabled: addContextEnabled,
+        fsWrite: addFsWrite,
+        execAllowed: addExec,
+      });
+      const token = (res as { token?: string }).token ?? "";
+      lastToken = token;
+      adding = false;
+      await refresh();
+      toast("ok", t("授权已创建，Token 仅显示一次，请立即复制"));
+    } catch (e) {
+      toast("error", String(e));
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function revokeGrant(id: string) {
+    try {
+      await api.remoteGrantRevoke(id);
+      await refresh();
+      toast("ok", t("授权已撤销"));
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
+  async function deleteGrant(id: string) {
+    try {
+      await api.remoteGrantDelete(id);
+      await refresh();
+      toast("ok", t("授权记录已删除"));
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
+  function copyPrompt(g: RemoteGrant) {
+    const base = publicUrl ? `${publicUrl}/mcp` : "";
+    if (!base) { toast("warn", t("服务未启动，暂无接入地址")); return; }
+    const lines = [
+      `接入地址：${base}?passcode=${g.id}`,
+      "",
+      t("这是 ShiDrive Coding MCP，你可以借助它完成已授权项目的远端开发任务。"),
+      `${t("项目")}: ${g.project_name}`,
+      `${t("开放目录")}: ${g.project_root}`,
+      `${t("文件权限")}: ${g.fs_write ? t("读写") : t("只读")}`,
+      `${t("命令执行")}: ${g.exec_allowed ? t("允许") : t("禁用")}`,
+      "",
+      t("请先完成 MCP 初始化并读取工具列表，再在授权范围内开展工作。"),
+      t("执行删除、覆盖、发布等高风险操作前，请先征得我的确认。"),
+      t("本链接包含临时访问凭据，请勿写入项目文件、提交记录或日志。"),
+    ];
+    if (g.context_enabled && g.context_name) {
+      lines.push("", t("此接入已开放共享上下文，绑定上下文：{name}", { name: g.context_name }));
+      lines.push(t("开始任务前，调用 context_get 获取最新目标、约束、待办与版本。"));
+      lines.push(t("完成一个阶段后，记录进展、关键决策、未完成事项及涉及文件。"));
+      lines.push(t("提交时使用读取到的 base_version，只更新实际修改的部分。"));
+      lines.push(t("如果版本冲突，请重新读取、合并后提交，不要强行覆盖。"));
+      lines.push(t("共享上下文用于工作交接，不代替代码版本管理。"));
+    }
+    void navigator.clipboard.writeText(lines.join("\n")).then(
+      () => toast("ok", t("接入提示词已复制")),
+      () => toast("error", t("复制失败")),
+    );
+  }
+</script>
+
+<section class="remote-mcp">
+  <div class="status-row">
+    <span class="dot {status?.running ? 'on' : 'off'}"></span>
+    <span>{t("服务")}：{status?.running ? t("运行中") : t("未启动")}</span>
+    <span class="sep">·</span>
+    <span>{t("隧道")}：{status?.tunnel_running ? t("已连接") : t("未连接")}</span>
+    <span class="sep">·</span>
+    <span>{t("授权")}：{status?.grants_active ?? 0}</span>
+    <span class="grow"></span>
+    {#if status?.running}
+      <button class="btn sm" onclick={stopService}>{t("停止服务")}</button>
+    {:else}
+      <button class="btn sm primary" onclick={startService}>{t("启动服务")}</button>
+    {/if}
+  </div>
+
+  <div class="sec">
+    <h3>{t("接入方式")}</h3>
+    <div class="row">
+      <label class="radio"><input type="radio" bind:group={exposure} value="custom" /> {t("自定义地址 / 已有 frp 或反代")}</label>
+      <label class="radio"><input type="radio" bind:group={exposure} value="quick_tunnel" /> {t("Cloudflare 临时隧道")}</label>
+    </div>
+    {#if exposure === "custom"}
+      <div class="row">
+        <input class="grow" placeholder={t("https://your-domain.com（已有 frp / 反向代理）")} bind:value={customUrl} />
+        <button class="btn sm" onclick={copyAddress} disabled={!publicUrl}>{t("复制接入地址")}</button>
+      </div>
+    {:else}
+      <p class="note">{t("Quick Tunnel 为临时开发入口：无 SLA、不支持 SSE、有 200 在途请求上限；地址随重启变化。")}</p>
+      <div class="row cf-row">
+        <span class="lbl">{t("cloudflared")}：</span>
+        {#if cf?.installed}
+          <span class="badge ok">{t("已检测")}{cf.version ? ` · ${cf.version}` : ""}</span>
+          <span class="dim mono cf-path" title={cf.path}>{cf.path}</span>
+        {:else}
+          <span class="badge warn">{t("未安装")}</span>
+          <button class="btn sm primary" disabled={cfBusy} onclick={installCloudflared}>{cfBusy ? t("下载中…") : t("快捷安装")}</button>
+        {/if}
+        <button class="btn sm" onclick={pickCloudflared}>{t("指定已有程序")}</button>
+      </div>
+    {/if}
+    <div class="row">
+      <span class="lbl">{t("接入地址")}：</span>
+      <code>{publicUrl ? `${publicUrl}/mcp` : "—"}</code>
+      <button class="btn ghost sm" onclick={copyAddress} disabled={!publicUrl}>{t("复制")}</button>
+    </div>
+  </div>
+
+  <div class="sec">
+    <h3>{t("全局选项")}</h3>
+    <label class="check"><input type="checkbox" bind:checked={addExec} /> {t("允许执行命令（默认关闭；最终权限 = 全局 AND 授权行）")}</label>
+    <p class="note">{t("目录限制不等于命令沙箱：开启命令执行后，程序以当前系统用户权限运行。")}</p>
+  </div>
+
+  <div class="sec">
+    <div class="sec-head-row">
+      <h3>{t("开放目录与上下文")}</h3>
+      <button class="btn sm" onclick={() => (adding = !adding)}>{adding ? t("收起") : t("添加授权")}</button>
+    </div>
+    {#if adding}
+      <div class="add-form">
+        <div class="row">
+          <label class="lbl">{t("项目")}</label>
+          <select bind:value={addProjectId}>
+            {#each projects as p (p.id)}
+              <option value={p.id}>{p.name} · {p.root_path}</option>
+            {/each}
+          </select>
+        </div>
+        <label class="check"><input type="checkbox" bind:checked={addFsWrite} /> {t("文件读写（默认只读）")}</label>
+        <label class="check"><input type="checkbox" bind:checked={addExec} /> {t("允许命令执行")}</label>
+        {#if addContextEnabled}
+          <p class="note">{t("注意：需要所属项目存在共享上下文；未绑定上下文的授权无法使用共享上下文工具。")}</p>
+        {/if}
+        <div class="rowbtns">
+          <button class="btn sm primary" onclick={saveAdd}>{t("创建授权")}</button>
+          <button class="btn sm" onclick={cancelAdd}>{t("取消")}</button>
+        </div>
+      </div>
+    {/if}
+    <div class="tbl-wrap">
+      <table class="tbl">
+        <thead>
+          <tr><th>{t("项目 / 目录")}</th><th>{t("上下文")}</th><th>{t("权限")}</th><th>{t("状态")}</th><th>{t("操作")}</th></tr>
+        </thead>
+        <tbody>
+          {#each grants as g (g.id)}
+            <tr class:revoked={!!g.revoked_at}>
+              <td>{g.project_name}<br /><span class="dim mono">{g.project_root}</span></td>
+              <td>{g.context_enabled ? (g.context_name || t("已开放")) : t("未开放")}</td>
+              <td>
+                {[g.fs_write ? t("读写") : t("只读"), g.exec_allowed ? t("可执行") : null].filter(Boolean).join(" · ") || "—"}
+              </td>
+              <td>{g.revoked_at ? t("已撤销") : t("有效")}</td>
+              <td class="op">
+                {#if !g.revoked_at}
+                  <button class="btn ghost sm" onclick={() => copyPrompt(g)}>{t("复制提示词")}</button>
+                  <button class="btn ghost sm" onclick={() => revokeGrant(g.id)}>{t("撤销")}</button>
+                {/if}
+                <button class="btn ghost sm" onclick={() => deleteGrant(g.id)}>{t("删除")}</button>
+              </td>
+            </tr>
+          {:else}
+            <tr><td colspan="5" class="none">{t("暂无授权。添加授权后复制接入提示词发给外部 AI。")}</td></tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="sec">
+    <h3>{t("运行日志")}</h3>
+    <button class="btn sm" onclick={() => (logOpen = !logOpen)}>{logOpen ? t("隐藏日志") : t("查看日志")}</button>
+    {#if logOpen}
+      <pre class="logs">{(status?.logs ?? []).join("\n") || t("暂无日志")}</pre>
+    {/if}
+  </div>
+</section>
+
+<style>
+  .remote-mcp { display: flex; flex-direction: column; gap: 14px; }
+  .status-row { display: flex; align-items: center; gap: 8px; font-size: .92em; }
+  .status-row .grow { flex: 1; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .dot.on { background: #34c77b; box-shadow: 0 0 6px #34c77b; }
+  .dot.off { background: var(--text-faint); }
+  .sep { color: var(--text-faint); }
+  .sec h3 { font-size: .9em; color: var(--text-dim); margin-bottom: 8px; }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+  .radio, .check { display: inline-flex; align-items: center; gap: 6px; font-size: .88em; color: var(--text-dim); }
+  .lbl { font-size: .86em; color: var(--text-dim); }
+  .grow { flex: 1; }
+  code { font-family: var(--mono); font-size: .86em; user-select: text; }
+  .note { font-size: .82em; color: var(--text-faint); line-height: 1.5; }
+  .sec-head-row { display: flex; align-items: center; justify-content: space-between; }
+  .add-form { border: 1px solid var(--border-soft); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+  .rowbtns { display: flex; gap: 8px; }
+  .tbl-wrap { overflow: auto; max-height: 300px; }
+  .tbl { width: 100%; border-collapse: collapse; font-size: .86em; }
+  .tbl th, .tbl td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+  .tbl thead th { color: var(--text-dim); white-space: nowrap; position: sticky; top: 0; background: var(--bg-panel); }
+  .tbl tr.revoked td { opacity: .5; }
+  .dim { color: var(--text-faint); }
+  .mono { font-family: var(--mono); font-size: .92em; }
+  .op { white-space: nowrap; }
+  .none { color: var(--text-faint); text-align: center; padding: 14px; }
+  .logs { max-height: 220px; overflow: auto; background: var(--code-bg); border-radius: 6px; padding: 8px; font-family: var(--mono); font-size: .8em; user-select: text; }
+  .cf-row { align-items: baseline; }
+  .cf-path { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .82em; }
+  .badge { font-size: .82em; padding: 1px 8px; border-radius: 10px; }
+  .badge.ok { background: rgba(52, 199, 123, .15); color: #2c9c63; }
+  .badge.warn { background: rgba(240, 170, 40, .15); color: #b57e17; }
+</style>

@@ -125,98 +125,24 @@ impl Db {
             let _ = c.execute_batch("ALTER TABLE workflows ADD COLUMN sort INTEGER NOT NULL DEFAULT 0");
             let _ = c.execute_batch("ALTER TABLE agent_bindings ADD COLUMN status TEXT NOT NULL DEFAULT ''");
             let _ = c.execute_batch("ALTER TABLE agent_bindings ADD COLUMN model TEXT NOT NULL DEFAULT ''");
+            // 外部编程接入（MCP）：项目级授权
+            let _ = c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS remote_grants (                  id TEXT PRIMARY KEY,                  project_id TEXT NOT NULL,                  project_name TEXT NOT NULL DEFAULT '',                  project_root TEXT NOT NULL,                  context_id TEXT,                  context_name TEXT NOT NULL DEFAULT '',                  context_enabled INTEGER NOT NULL DEFAULT 0,                  fs_write INTEGER NOT NULL DEFAULT 0,                  exec_allowed INTEGER NOT NULL DEFAULT 0,                  token_hash TEXT NOT NULL UNIQUE,                  created_at TEXT NOT NULL,                  revoked_at TEXT,                  last_used_at TEXT                )",
+            );
+            let _ = c.execute_batch("CREATE INDEX IF NOT EXISTS idx_remote_grants_project ON remote_grants(project_id)");
+
             // 内置「无项目」常驻
             c.execute(
                 "INSERT OR IGNORE INTO projects (id,name,root_path,description,sort,created_at,updated_at) VALUES (?1,?2,'','存放便捷工作流与本地服务，不绑定目录',-1,?3,?3)",
                 params![crate::models::NO_PROJECT_ID, crate::models::NO_PROJECT_NAME, now()],
             )?;
-            // 内置 runfromweb（Coding MCP）：单一 toggle 工作流（run=已启动则停止，否则启动）
+            // MCP-10：内置「外部编程mcp」工作流已迁移到「设置 → 外部编程接入」独立服务；
+            // 未被用户定制的内置副本直接移除，用户自行创建/改名的工作流保留
             {
-                // 清理旧内置（拆分为启/停两条的历史版本）
-                let _ = c.execute("DELETE FROM workflows WHERE id IN ('rfw-start-0001','rfw-stop-0001')", []);
                 let _ = c.execute(
-                    "DELETE FROM workflows WHERE project_id=?1 AND name LIKE 'runfromweb%' AND id <> 'rfw-0001'",
-                    params![crate::models::NO_PROJECT_ID],
+                    "DELETE FROM workflows WHERE id='rfw-0001' AND name IN ('runfromweb','外部编程mcp')",
+                    [],
                 );
-                let exist = c.query_row("SELECT COUNT(*) FROM workflows WHERE id='rfw-0001'", [], |r| r.get::<_, i64>(0))? > 0;
-                // 旧内置定义为「启动/停止切换 + 隐藏窗口」，与本版的前台常驻语义不同：
-                // 若用户未改名（仍是 runfromweb），自动升级为新的常驻定义
-                if exist {
-                    // 未改名（用户没定制过）或旧脚本无常驻日志尾随时，自动升级为最新定义
-                    let old_name: String = c.query_row("SELECT name FROM workflows WHERE id='rfw-0001'", [], |r| r.get(0))?;
-                    let old_steps: String = c.query_row("SELECT steps FROM workflows WHERE id='rfw-0001'", [], |r| r.get(0))?;
-                    let stale = old_name == "runfromweb" || !old_steps.contains("Get-Content $errFile");
-                    if stale {
-                        c.execute("DELETE FROM workflows WHERE id='rfw-0001'", [])?;
-                    }
-                }
-                let exist = c.query_row("SELECT COUNT(*) FROM workflows WHERE id='rfw-0001'", [], |r| r.get::<_, i64>(0))? > 0;
-                if !exist {
-                    let ts = now();
-                    // 前台常驻：直接在节点内运行 coding-mcp，启动日志（监听地址、
-                    // 令牌提示）实时写入运行日志；停止用「运行中任务」的停止按钮
-                    let resident_ps = r#"$app='{{env.__app__}}'
-$cliArgs=@('--coding-mcp','--port','{{env.CODING_MCP_PORT}}','--root','{{env.CODING_MCP_ROOT}}')
-if ('{{env.CODING_MCP_TOKEN}}') { $cliArgs += @('--token','{{env.CODING_MCP_TOKEN}}') }
-if ('{{env.CODING_MCP_BIND}}') { $cliArgs += @('--bind','{{env.CODING_MCP_BIND}}') }
-if ('{{env.CODING_MCP_AUTH_USER}}') { $cliArgs += @('--auth-user','{{env.CODING_MCP_AUTH_USER}}','--auth-pass','{{env.CODING_MCP_AUTH_PASS}}') }
-if ('{{env.CODING_MCP_ALLOW_EXEC}}' -eq '0') { $cliArgs += @('--exec','0') }
-$errFile = Join-Path $env:TEMP ('coding-mcp-' + [guid]::NewGuid().ToString('N') + '.log')
-$p = Start-Process -FilePath $app -ArgumentList $cliArgs -NoNewWindow -RedirectStandardError $errFile -PassThru
-"started pid $($p.Id)"
-Get-Content $errFile -Wait | ForEach-Object { "[coding-mcp] $_" }
-Remove-Item $errFile -ErrorAction SilentlyContinue"#;
-                    let steps = vec![
-                        WorkflowStep::Start { name: String::new(), x: 60.0, y: 140.0 },
-                        WorkflowStep::Note {
-                            name: "作用".into(),
-                            text: "外部编程 MCP：不随使驾启动的独立 MCP 服务，供网络侧模型（如 ChatGPT）通过 HTTP 使用本地文件与命令能力。\n前台常驻运行：启动日志（监听地址、令牌提示）实时显示在运行日志；在「运行中任务」可停止。\n端点 http://127.0.0.1:端口/mcp；对外暴露建议设置令牌或 HTTP 认证并自行配置反向代理。".into(),
-                            x: 330.0, y: 60.0,
-                        },
-                        WorkflowStep::EnvSet {
-                            name: "服务配置".into(),
-                            h: None,
-                            vars: [
-                                ("CODING_MCP_PORT", "51667"),
-                                ("CODING_MCP_ROOT", "D:\\"),
-                                ("CODING_MCP_TOKEN", ""),
-                                ("CODING_MCP_BIND", ""),
-                                ("CODING_MCP_AUTH_USER", ""),
-                                ("CODING_MCP_AUTH_PASS", ""),
-                                ("CODING_MCP_ALLOW_EXEC", "1"),
-                            ].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-                            labels: [
-                                ("CODING_MCP_PORT", "服务端口"),
-                                ("CODING_MCP_ROOT", "允许访问的根目录"),
-                                ("CODING_MCP_TOKEN", "访问令牌(可空)"),
-                                ("CODING_MCP_BIND", "绑定地址(可空=仅本机)"),
-                                ("CODING_MCP_AUTH_USER", "HTTP认证用户名(可空)"),
-                                ("CODING_MCP_AUTH_PASS", "HTTP认证密码"),
-                                ("CODING_MCP_ALLOW_EXEC", "允许执行命令(1/0)"),
-                            ].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-                            x: 330.0, y: 250.0,
-                        },
-                        WorkflowStep::Shell {
-                            name: "启动外部编程 MCP（常驻）".into(),
-                            command: resident_ps.to_string(),
-                            cwd: String::new(),
-                            shell: "powershell".into(),
-                            timeout_sec: None,
-                            continue_on_error: false,
-                            x: 680.0, y: 140.0,
-                        },
-                    ];
-                    let steps_json = serde_json::to_string(&steps).unwrap_or_default();
-                    let edges_json = serde_json::to_string(&vec![
-                        Edge { from: 0, to: 1 },
-                        Edge { from: 1, to: 2 },
-                        Edge { from: 2, to: 3 },
-                    ]).unwrap_or_default();
-                    c.execute(
-                        "INSERT INTO workflows (id,project_id,name,description,enabled,trigger_type,schedule,steps,last_run_at,next_run_at,created_at,updated_at,env,edges) VALUES ('rfw-0001',?1,'外部编程mcp','外部编程 MCP（内置）：前台常驻启动，运行日志实时可见',1,'manual','',?2,NULL,NULL,?3,?3,'{}',?4)",
-                        params![crate::models::NO_PROJECT_ID, steps_json, ts, edges_json],
-                    )?;
-                }
             }
             // guard against duplicate seq from concurrent commits; ignore failure on legacy dup data
             let _ = c.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_sc_ctx_seq ON sc_commits(context_id, seq)");
@@ -1089,6 +1015,25 @@ mod tests {
     use super::*;
     use serde_json::json;
     fn fixture_db() -> Db { Db::open(Path::new(":memory:")).unwrap() }
+    /// MCP-10 后全新库不再内置工作流 seed，测试需要时自插一行最小工作流
+    /// （备份导入校验 project 外键，故连同项目行一起建）。
+    fn seed_test_workflow(db: &Db, id: &str) {
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO projects (id,name,root_path,description,sort,created_at,updated_at) VALUES ('p','p','',\"\",0,'now','now')",
+                [],
+            )
+        })
+        .unwrap();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO workflows (id,project_id,name,description,enabled,trigger_type,schedule,steps,last_run_at,next_run_at,created_at,updated_at,env,edges)
+                 VALUES (?1,'p','t','',1,'manual','','[{\"type\":\"start\"}]',NULL,NULL,'now','now','{}','[]')",
+                params![id],
+            )
+        })
+        .unwrap();
+    }
     fn project(id: &str, name: &str) -> serde_json::Value {
         json!({"id":id,"name":name,"root_path":"","description":"","sort":0,"created_at":"now","updated_at":"now"})
     }
@@ -1138,6 +1083,7 @@ mod tests {
     #[test]
     fn workflow_backup_roundtrip_and_legacy_columns() {
         let db = fixture_db();
+        seed_test_workflow(&db, "wf-test");
         db.with(|c| c.execute("UPDATE workflows SET sort=42", [])).unwrap();
         let mut backup = db.export_backup().unwrap();
         assert_eq!(backup["workflows"][0]["sort"], 42);
@@ -1146,7 +1092,7 @@ mod tests {
         row.remove("sort"); row.remove("env"); row.remove("edges");
         row.insert("schedule".into(), serde_json::Value::Null);
         db.import_backup(&backup).unwrap();
-        assert!(db.get_workflow("rfw-0001").unwrap().is_some());
+        assert!(db.get_workflow("wf-test").unwrap().is_some());
         assert_eq!(db.export_backup().unwrap()["workflows"][0]["sort"], 42);
         let fresh = fixture_db();
         fresh.with(|c| c.execute("DELETE FROM workflows", [])).unwrap();
@@ -1157,11 +1103,12 @@ mod tests {
     #[test]
     fn malformed_embedded_workflow_data_does_not_silently_empty_steps() {
         let db = fixture_db();
+        seed_test_workflow(&db, "wf-test");
         for (column, value) in [("steps", "[{}]"), ("env", "[]"), ("edges", "[{}]"), ("schedule", "{}"), ("steps", "not json")] {
             let mut backup = db.export_backup().unwrap();
             backup["workflows"][0][column] = json!(value);
             assert!(db.import_backup(&backup).is_err(), "{column}");
-            assert!(!db.get_workflow("rfw-0001").unwrap().unwrap().steps.is_empty());
+            assert!(!db.get_workflow("wf-test").unwrap().unwrap().steps.is_empty());
         }
     }
 }

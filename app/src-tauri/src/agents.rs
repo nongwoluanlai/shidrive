@@ -96,9 +96,9 @@ pub fn agent_specs() -> &'static [AgentSpec] {
     AgentSpec {
         id: "deepseek".into(),
         name: "DeepSeek".into(),
-        npm: Some("@deepseek-ai/dsh-acp".into()),
-        args: vec![],
-        help: "DeepSeek Harness 自动化 ACP 服务（@deepseek-ai/dsh-acp）。需要先安装 DeepSeek Harness 运行时（该包依赖 dsh-agent 等宿主组件）；安装后在环境变量里配置 DSH_HOME=<harness 安装目录>，或保证 dsh 命令可用。支持 session/list 与 session/resume（不支持 session/load 与思考流回放）。".into(),
+        npm: Some("@deepseek-ai/dsh".into()),
+        args: vec!["--profile".into(), "acp".into()],
+        help: "DeepSeek Harness CLI（npm 包 @deepseek-ai/dsh），以 `dsh --profile acp` 提供 ACP stdio 服务。安装适配器后需配置 DeepSeek API Key：展开本行点「填充 API Key」，或在环境变量里加 DEEPSEEK_API_KEY=<key>（也可用系统环境变量）。支持 session/list 与 session/resume（不支持 session/load，恢复不回放历史，由使驾侧补齐）。".into(),
     },
     ])
 }
@@ -404,6 +404,18 @@ pub fn registry_status(db: &Arc<Db>, tools: &Tools) -> Vec<AgentEnvStatus> {
                     let node = tools.node_exe();
                     if node.exists() {
                         auto_env.insert("ZCODE_NODE".to_string(), node.to_string_lossy().to_string());
+                    }
+                }
+                "deepseek" => {
+                    // 密钥只探测"是否已设置"，值为常量占位：绝不回显真实 Key，
+                    // 也绝不预填进可保存的草稿（保存会把明文落盘）
+                    if std::env::var("DEEPSEEK_API_KEY").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+                        auto_env.insert("DEEPSEEK_API_KEY".into(), "set".into());
+                    }
+                    if let Ok(home) = std::env::var("DSH_HOME") {
+                        if !home.trim().is_empty() {
+                            auto_env.insert("DSH_HOME".into(), home);
+                        }
                     }
                 }
                 _ => {}

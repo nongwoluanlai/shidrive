@@ -417,7 +417,7 @@ const KNOWN_TOOLS: [&str; 11] = [
     "workflow_run",
 ];
 
-fn call_tool(state: &McpState, _app: &AppHandle, name: &str, args: &Value) -> Result<Value, String> {
+pub(crate) fn call_tool(state: &McpState, _app: &AppHandle, name: &str, args: &Value) -> Result<Value, String> {
     // 工具名校验优先于 context 校验，报错指引才准确
     if !KNOWN_TOOLS.contains(&name) {
         return tool_error(format!(
@@ -482,12 +482,18 @@ fn call_tool(state: &McpState, _app: &AppHandle, name: &str, args: &Value) -> Re
             }
 
             // apply write-through to live tables
+            // FIX-01：同一请求可能同时带 overview 与 constraints —— 两次整行更新
+            // 会用旧值互相覆盖。先合并 patch，再一次写入。
             let updates = args.get("updates").cloned().unwrap_or(json!({}));
-            if let Some(v) = updates.get("overview").and_then(|v| v.as_str()) {
-                state.db.update_context(&ctx.id, &ctx.name, &clamp_str(v, MAX_OVERVIEW, "overview"), &ctx.constraints)?;
-            }
-            if let Some(v) = updates.get("constraints").and_then(|v| v.as_str()) {
-                state.db.update_context(&ctx.id, &ctx.name, &ctx.overview, &clamp_str(v, MAX_CONSTRAINTS, "constraints"))?;
+            let new_overview = updates.get("overview").and_then(|v| v.as_str()).map(|v| clamp_str(v, MAX_OVERVIEW, "overview"));
+            let new_constraints = updates.get("constraints").and_then(|v| v.as_str()).map(|v| clamp_str(v, MAX_CONSTRAINTS, "constraints"));
+            if new_overview.is_some() || new_constraints.is_some() {
+                state.db.update_context(
+                    &ctx.id,
+                    &ctx.name,
+                    new_overview.as_deref().unwrap_or(&ctx.overview),
+                    new_constraints.as_deref().unwrap_or(&ctx.constraints),
+                )?;
             }
             let conv = |list: &Value| -> Vec<ScEntry> {
                 list.as_array()

@@ -1,6 +1,6 @@
 [package]
 name = "shidrive"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "使驾 ShiDrive — AI 开发工作台"
 default-run = "shidrive"
@@ -25,6 +25,7 @@ trash = "5"
 open = "5"
 socket2 = "0.5"
 futures = "0.3"
+sha2 = "0.10"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 log = "0.4"

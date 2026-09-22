@@ -468,6 +468,161 @@ pub async fn skin_asset_data(skin_dir: String, file: String) -> Result<String, S
         .await.map_err(|e| e.to_string())?
 }
 
+// ---------- 外部编程接入（MCP） ----------
+
+type RemoteState<'a> = tauri::State<'a, crate::remote_mcp::RemoteManager>;
+
+#[derive(serde::Deserialize)]
+pub struct RemoteStartOpts {
+    #[serde(default = "default_listen_host")]
+    listen_host: String,
+    #[serde(default = "default_port")]
+    port: i64,
+    #[serde(default)]
+    quick_tunnel: bool,
+}
+fn default_listen_host() -> String { "0.0.0.0".into() }
+fn default_port() -> i64 { 51688 }
+
+#[tauri::command]
+pub async fn remote_mcp_start(
+    app: tauri::AppHandle,
+    remote: RemoteState<'_>,
+    db: DbState<'_>,
+    engine: EngineState<'_>,
+    opts: Option<RemoteStartOpts>,
+) -> Result<(), String> {
+    let o = opts.unwrap_or(RemoteStartOpts {
+        listen_host: default_listen_host(),
+        port: default_port(),
+        quick_tunnel: false,
+    });
+    let port = u16::try_from(o.port.clamp(1, 65535)).map_err(|_| "端口超出范围")?;
+    remote.start(app, db.inner().clone(), engine.inner().clone(), &o.listen_host, port, o.quick_tunnel)
+}
+
+#[tauri::command]
+pub async fn remote_mcp_stop(remote: RemoteState<'_>) -> Result<(), String> {
+    remote.stop();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remote_mcp_status(remote: RemoteState<'_>, db: DbState<'_>) -> Result<crate::remote_mcp::RemoteStatus, String> {
+    Ok(remote.status(db.inner()))
+}
+
+#[derive(serde::Deserialize)]
+pub struct RemoteGrantInputPayload {
+    pub project_id: String,
+    pub project_name: String,
+    pub project_root: String,
+    pub context_id: Option<String>,
+    pub context_name: Option<String>,
+    #[serde(default)]
+    pub context_enabled: bool,
+    #[serde(default)]
+    pub fs_write: bool,
+    #[serde(default)]
+    pub exec_allowed: bool,
+}
+
+#[tauri::command]
+pub async fn remote_grants_list(db: DbState<'_>) -> Result<serde_json::Value, String> {
+    let grants = crate::remote_mcp::grants_list(db.inner())?;
+    serde_json::to_value(grants).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn remote_grant_create(db: DbState<'_>, input: RemoteGrantInputPayload) -> Result<serde_json::Value, String> {
+    let input = crate::remote_mcp::RemoteGrantInput {
+        project_id: input.project_id,
+        project_name: input.project_name,
+        project_root: input.project_root,
+        context_id: input.context_id,
+        context_name: input.context_name.unwrap_or_default(),
+        context_enabled: input.context_enabled,
+        fs_write: input.fs_write,
+        exec_allowed: input.exec_allowed,
+    };
+    let (grant, token) = crate::remote_mcp::grant_create(db.inner(), &input)?;
+    serde_json::to_value(serde_json::json!({ "grant": grant, "token": token }))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn remote_grant_revoke(db: DbState<'_>, id: String) -> Result<(), String> {
+    crate::remote_mcp::grant_revoke(db.inner(), &id)
+}
+
+#[tauri::command]
+pub async fn remote_grant_delete(db: DbState<'_>, id: String) -> Result<(), String> {
+    crate::remote_mcp::grant_delete(db.inner(), &id)
+}
+
+/// 检测 cloudflared 环境：解析路径 + 读取版本（供设置页展示）。
+#[tauri::command]
+pub async fn remote_cloudflared_status(db: DbState<'_>) -> Result<crate::remote_mcp::CloudflaredStatus, String> {
+    Ok(crate::remote_mcp::cloudflared_status(db.inner()))
+}
+
+/// 保存手动指定的 cloudflared 路径（空串=清除）。
+#[tauri::command]
+pub async fn remote_cloudflared_set_path(db: DbState<'_>, path: String) -> Result<(), String> {
+    crate::remote_mcp::cloudflared_set_path(db.inner(), &path)
+}
+
+/// 下载 cloudflared（可选出站代理，仅作用于本次下载）。
+#[tauri::command]
+pub async fn remote_cloudflared_install(db: DbState<'_>) -> Result<String, String> {
+    let proxy = db
+        .get_setting("network.proxy")
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    tauri::async_runtime::spawn_blocking(move || {
+        let appdata = std::env::var("APPDATA").map_err(|_| "无法确定用户数据目录".to_string())?;
+        let dir = std::path::PathBuf::from(&appdata)
+            .join("com.shidrive.desktop")
+            .join("tools")
+            .join("cloudflared");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+        let dest = dir.join("cloudflared.exe");
+        let url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe";
+        let mut builder = ureq::AgentBuilder::new();
+        if let Some(p) = proxy.as_deref().filter(|p| !p.is_empty()) {
+            match ureq::Proxy::new(p) {
+                Ok(px) => builder = builder.proxy(px),
+                Err(e) => return Err(format!("代理配置无效: {e}")),
+            }
+        }
+        let agent = builder.build();
+        let resp = agent
+            .get(url)
+            .call()
+            .map_err(|e| format!("下载失败（可配置代理后重试）: {e}"))?;
+        let mut reader = resp.into_reader();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 65536];
+        loop {
+            let n = reader.read(&mut chunk).map_err(|e| format!("下载中断: {e}"))?;
+            if n == 0 { break; }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > 256 * 1024 * 1024 { return Err("下载超过 256MB 上限".into()); }
+        }
+        let tmp = dest.with_extension("download");
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("写入失败: {e}"))?;
+            std::io::Write::write_all(&mut f, &buf).map_err(|e| format!("写入失败: {e}"))?;
+        }
+        std::fs::rename(&tmp, &dest).map_err(|e| format!("安装失败: {e}"))?;
+        Ok(format!("cloudflared 已安装：{}", dest.display()))
+    })
+    .await
+    .map_err(|e| format!("任务失败: {e}"))?
+}
+
 /// 写文本到系统剪贴板。
 #[tauri::command]
 pub async fn clipboard_write_text(text: String) -> Result<(), String> {
