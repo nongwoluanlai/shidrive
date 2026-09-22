@@ -188,8 +188,8 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     if (!w) return;
     const items: MenuItem[] = [
       { label: t("▶ 运行"), run: () => {
-          app.tab = "workflows";
-          app.workflowSelected = id;
+          // 运行不切页：当前在会话页就留在会话页，仅提示结果
+          if (app.tab === "workflows") app.workflowSelected = id;
           api.workflowRun(id).then(() => toast("ok", t("已启动"))).catch((err) => toast("error", String(err)));
       } },
       { label: t("↻ 重新执行"), run: () => {
@@ -200,8 +200,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
               await api.workflowStop(r[0]);
               await new Promise((res) => setTimeout(res, 800));
             }
-            app.tab = "workflows";
-            app.workflowSelected = id;
+            if (app.tab === "workflows") app.workflowSelected = id;
             try {
               await api.workflowRun(id);
               toast("ok", t("已重新执行"));

@@ -164,4 +164,6 @@ export const workbenchEn: Record<string, string> = {
   "正在下载 cloudflared（约 15MB）…": "Downloading cloudflared (~15 MB)…",
   "隧道地址已获取": "Tunnel address acquired",
   "隧道地址获取失败，请查看运行日志": "Failed to acquire tunnel address; check the logs",
+  "保存路径（含文件名，可改）": "Save path (with file name; editable)",
+  "皮肤商店 ↗": "Skin store ↗",
 };

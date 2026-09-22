@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { app, chatKey, currentContext, finishTurn, setChatRows, pushLocal, toast, clearChat, sharedContextPrompt, switchAgent } from "../state.svelte";
+  import { app, chatKey, currentContext, finishTurn, setChatRows, pushLocal, toast, clearChat, sharedContextPrompt, switchAgent, loadChatLocal, saveCfgPref, fullAccessDefault } from "../state.svelte";
 import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { api } from "../ipc";
   import MessageItem from "./MessageItem.svelte";
@@ -112,14 +112,23 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     const agent = app.agent;
     if (!ctxId) return;
     stickToBottom = true; // 切换会话后回到贴底状态
+    input = app.drafts[chatKey(ctxId, agent)] ?? ""; // 恢复该会话未发送草稿
     void (async () => {
       try {
-        const b = await api.bindingGet(ctxId, agent);
         const k = chatKey(ctxId, agent);
+        // 先读本地快照，立即渲染（不等适配器）；本地为空时保持旧行为
+        const local = await loadChatLocal(k);
+        if (local && !app.chat[k]?.length && app.contextId === ctxId && app.agent === agent) {
+          app.chat[k] = local;
+          app.chatRev[k] = (app.chatRev[k] ?? 0) + 1;
+        }
+        const b = await api.bindingGet(ctxId, agent);
         app.bindingSession[k] = b?.session_id ?? null;
         app.bindingTitleMap[k] = b?.title ?? null;
         bindingTitle = b?.title ?? null;
-        if (b?.session_id && ctx && ctx.id === ctxId) {
+        // 历史展示以本地库为准（秒开）；仅本地为空时才等适配器全量重放。
+        // 有本地记录时跳过重放，回合结束后的 ensure_session 会在后台把会话装载回适配器。
+        if (b?.session_id && ctx && ctx.id === ctxId && !app.chat[k]?.length) {
           await refreshFromAdapter(ctxId, agent, b.session_id, b.title ?? undefined);
         }
       } catch {
@@ -234,6 +243,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     if (!text && !pendingImages.length) return;
     const imgs = pendingImages.map((p) => ({ data: p.data, mime: p.mime }));
     input = "";
+    app.drafts[key] = "";
     pendingImages = [];
     stickToBottom = true;
     pushLocal(key, { kind: "user", text: text + (imgs.length ? `\n\n[图片 ×${imgs.length}]` : "") });
@@ -406,6 +416,8 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   });
 
   function setCfg(id: string, value: string) {
+    // 记住用户选择：跨会话/重启生效（session-ready 后自动回放）
+    saveCfgPref(app.agent, id, value);
     // 更新本地显示（无论是否已有会话）
     if (id === "model" && sessionInfo?.response?.models) sessionInfo.response.models.currentModelId = value;
     if (sessionInfo?.response?.configOptions) {
@@ -424,6 +436,31 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       .then(() => toast("ok", t("已应用")))
       .catch((e) => toast("error", String(e)));
   }
+
+  // 会话配置记忆：session-ready / 重放刷新后，把用户记住的配置（模型/模式等）
+  // 重新套用，避免被适配器默认值刷掉。无记忆时，给支持"完全访问"类档位的
+  // 配置项一次性套默认完全访问（用户随后可改，改动即被记住）。
+  let cfgAppliedKey = "";
+  $effect(() => {
+    const info = sessionInfo;
+    const sid = sessionId;
+    if (!info?.response || !sid || !ctx) return;
+    const sig = JSON.stringify(info.response.configOptions ?? []) + JSON.stringify(info.response.models ?? {});
+    if (sig === cfgAppliedKey) return;
+    cfgAppliedKey = sig;
+    for (const item of cfgItems) {
+      const remembered = app.cfgPref[`${app.agent}:${item.id}`];
+      const desired = remembered ?? (item.id === "model" ? undefined : fullAccessDefault(item.id, item.options.map((o) => o.value)));
+      if (!desired || desired === item.value) continue;
+      if (!item.options.some((o) => o.value === desired)) continue;
+      // 本地立即生效 + 适配器同步（失败静默：个别项可能在当前会话不可切换）
+      if (item.id === "model" && info.response.models) info.response.models.currentModelId = desired;
+      const opt = info.response.configOptions?.find((o) => o.id === item.id);
+      if (opt) opt.currentValue = desired;
+      saveCfgPref(app.agent, item.id, desired);
+      void api.acpSetConfigOption(ctx.id, app.agent, item.id, desired).catch(() => {});
+    }
+  });
 
   // 旧模型下线时自动迁移到可用列表的第一个
   $effect(() => {
@@ -771,7 +808,11 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       rows="3"
       style={composerH ? `height:${composerH}px` : ""}
       placeholder={t("给 {agent} 下达任务…（{shortcut}，可粘贴图片）", { agent: agentLabel(app.agent), shortcut: app.enterSend ? t("Enter 发送，Shift+Enter 换行") : t("Enter 换行，Ctrl+Enter 发送") })}
-      bind:value={input}
+      value={input}
+      oninput={(e) => {
+        input = (e.target as HTMLTextAreaElement).value;
+        app.drafts[key] = input; // 未发送草稿按会话保留
+      }}
       onkeydown={onKeydown}
       onpaste={onPaste}
       oncontextmenu={onInputContext}

@@ -248,7 +248,7 @@ pub fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
 pub fn read_text_from_clipboard() -> Result<String, String> {
     let mut c = std::process::Command::new("powershell");
     let out = hide_window(&mut c)
-        .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
+        .args(["-NoProfile", "-Command", "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard -Raw"])
         .output()
         .map_err(|e| format!("执行失败: {e}"))?;
     if out.status.success() {
@@ -262,7 +262,7 @@ pub fn read_text_from_clipboard() -> Result<String, String> {
 pub fn desktop_dir() -> Result<String, String> {
     let mut c = std::process::Command::new("powershell");
     let out = hide_window(&mut c)
-        .args(["-NoProfile", "-Command", "[Environment]::GetFolderPath('Desktop')"])
+        .args(["-NoProfile", "-Command", "[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Environment]::GetFolderPath('Desktop')"])
         .output()
         .map_err(|e| format!("执行失败: {e}"))?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();

@@ -298,6 +298,24 @@ pub async fn fs_open_default(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+/// 读取会话的本地聊天记录 JSON（无记录返回空串）。
+pub async fn chat_store_get(db: DbState<'_>, key: String) -> Result<String, String> {
+    Ok(db.inner().chat_store_get(&key)?.unwrap_or_default())
+}
+
+/// 覆盖写入会话的本地聊天记录 JSON。
+#[tauri::command]
+pub async fn chat_store_set(db: DbState<'_>, key: String, itemsJson: String) -> Result<(), String> {
+    db.inner().chat_store_set(&key, &itemsJson)
+}
+
+/// 删除会话的本地聊天记录。
+#[tauri::command]
+pub async fn chat_store_delete(db: DbState<'_>, key: String) -> Result<(), String> {
+    db.inner().chat_store_delete(&key)
+}
+
+#[tauri::command]
 pub async fn fs_desktop_dir() -> Result<String, String> {
     fsops::desktop_dir()
 }

@@ -4,6 +4,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { app, currentContext, toast } from "../state.svelte";
   import { api } from "../ipc";
+  import { promptDialog } from "../dialog.svelte";
   import type { ContextEntry, ScCommit } from "../types";
 
   const ctx = $derived(currentContext());
@@ -79,8 +80,16 @@
     }
     const name = `context-${ctx.name.replace(/[\\/:*?"<>|]/g, "_")}-${new Date().toISOString().slice(0, 10)}.md`;
     try {
-      const dir = await api.fsDesktopDir();
-      const path = `${dir}\\${name}`;
+      const dir = await api.fsDesktopDir().catch(() => "");
+      const initial = dir ? `${dir}\\${name}` : name;
+      const target = await promptDialog({
+        title: t("导出 MD"),
+        label: t("保存路径（含文件名，可改）"),
+        initial,
+      });
+      if (target === null) return;
+      const path = target.trim();
+      if (!path) { toast("warn", t("路径不能为空")); return; }
       await api.fsWrite(path, lines.join("\n"));
       toast("ok", t("已导出到 {p0}", { p0: path }));
     } catch (e) {

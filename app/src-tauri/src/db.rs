@@ -131,6 +131,11 @@ impl Db {
             );
             let _ = c.execute_batch("CREATE INDEX IF NOT EXISTS idx_remote_grants_project ON remote_grants(project_id)");
 
+            // 会话对话本地持久化：key=ctxId:agent，整份条目 JSON，开聊天页秒开不再等适配器全量重放
+            let _ = c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS chat_store (                key TEXT PRIMARY KEY,                items_json TEXT NOT NULL,                updated_at TEXT NOT NULL          )",
+            );
+
             // 内置「无项目」常驻
             c.execute(
                 "INSERT OR IGNORE INTO projects (id,name,root_path,description,sort,created_at,updated_at) VALUES (?1,?2,'','存放便捷工作流与本地服务，不绑定目录',-1,?3,?3)",
@@ -747,6 +752,38 @@ impl Db {
                 "INSERT INTO settings (key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=?2",
                 params![key, value],
             )?;
+            Ok(())
+        })
+    }
+
+    /// 读取一个会话的本地聊天记录（JSON 数组字符串）。
+    pub fn chat_store_get(&self, key: &str) -> Result<Option<String>, String> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT items_json FROM chat_store WHERE key=?1")?;
+            let mut rows = st.query(params![key])?;
+            if let Some(r) = rows.next()? {
+                return Ok(Some(r.get::<_, String>(0)?));
+            }
+            Ok(None)
+        })
+    }
+
+    /// 覆盖写入一个会话的本地聊天记录（每回合结束时整份快照，简单可靠）。
+    pub fn chat_store_set(&self, key: &str, items_json: &str) -> Result<(), String> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO chat_store (key,items_json,updated_at) VALUES (?1,?2,?3)
+                 ON CONFLICT(key) DO UPDATE SET items_json=?2, updated_at=?3",
+                params![key, items_json, now()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 删除一个会话的本地聊天记录（新建会话时调用）。
+    pub fn chat_store_delete(&self, key: &str) -> Result<(), String> {
+        self.with(|c| {
+            c.execute("DELETE FROM chat_store WHERE key=?1", params![key])?;
             Ok(())
         })
     }

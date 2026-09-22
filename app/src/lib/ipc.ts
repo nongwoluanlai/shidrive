@@ -89,6 +89,9 @@ export const api = {
   fsCopyToClipboard: (paths: string[]) => invoke<void>("fs_copy_to_clipboard", { paths }),
   fsPasteFromClipboard: (dest_dir: string) => invoke<void>("fs_paste_from_clipboard", { destDir: dest_dir }),
   fsDesktopDir: () => invoke<string>("fs_desktop_dir"),
+  chatStoreGet: (key: string) => invoke<string>("chat_store_get", { key }),
+  chatStoreSet: (key: string, itemsJson: string) => invoke<void>("chat_store_set", { key, itemsJson }),
+  chatStoreDelete: (key: string) => invoke<void>("chat_store_delete", { key }),
   bindingSetTitle: (context_id: string, agent_type: string, title: string) =>
     invoke<void>("binding_set_title", { contextId: context_id, agentType: agent_type, title }),
   workflowMove: (id: string, dir: number) => invoke<void>("workflow_move", { id, dir }),

@@ -75,6 +75,10 @@ export const app = $state({
   agentCaps: {} as Record<string, { models?: unknown; configOptions?: unknown }>,
   /** config chosen before a session existed; applied on session-ready */
   pendingCfg: {} as Record<string, { id: string; value: string }>,
+  /** 用户显式选择的会话配置（模型/模式等），key=agent:cfgId；跨会话/重启记住 */
+  cfgPref: {} as Record<string, string>,
+  /** 每个会话未发送的输入草稿，key=ctxId:agent；切页/切会话不丢 */
+  drafts: {} as Record<string, string>,
   chat: {} as Record<string, DisplayItem[]>,
   /** bumped whenever a chat key is (re)loaded/cleared — scroll anchoring reads it */
   chatRev: {} as Record<string, number>,
@@ -166,15 +170,76 @@ export function historyToItems(rows: TranscriptRow[]): DisplayItem[] {
 export function setChatRows(key: string, rows: TranscriptRow[]) {
   app.chat[key] = historyToItems(rows);
   app.chatRev[key] = (app.chatRev[key] ?? 0) + 1;
+  void persistChat(key);
 }
 
 export function pushLocal(key: string, item: Omit<DisplayItem, "id">) {
   ensureChat(key).push({ id: nextId(), ...item });
+  void persistChat(key);
 }
 
 export function clearChat(key: string) {
   app.chat[key] = [];
   app.chatRev[key] = (app.chatRev[key] ?? 0) + 1;
+  void api.chatStoreDelete(key).catch(() => {});
+}
+
+// ---------- 会话本地持久化 ----------
+// 每回合结束（finishTurn）或历史装载（setChatRows）时把整份条目快照到 SQLite，
+// 打开聊天页先读本地立即渲染；适配器 session/load 全量重放只在本地为空时兜底。
+let persistTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+export function persistChat(key: string) {
+  const list = app.chat[key];
+  if (!list || !list.length) return;
+  clearTimeout(persistTimers[key]);
+  persistTimers[key] = setTimeout(() => {
+    const snapshot = (app.chat[key] ?? []).map((it) => ({ ...it, streaming: false }));
+    void api.chatStoreSet(key, JSON.stringify(snapshot)).catch(() => {});
+  }, 400);
+}
+
+/** 从本地库载入某会话的历史（无记录返回 null）。 */
+export async function loadChatLocal(key: string): Promise<DisplayItem[] | null> {
+  try {
+    const raw = await api.chatStoreGet(key);
+    if (!raw) return null;
+    const rows = JSON.parse(raw) as DisplayItem[];
+    return Array.isArray(rows) && rows.length ? rows : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------- 会话配置记忆（模型/模式等） ----------
+const CFG_PREF_KEY = "chat.cfgpref";
+export function loadCfgPrefs() {
+  void api
+    .settingsGet(CFG_PREF_KEY)
+    .then((raw) => {
+      if (raw) app.cfgPref = JSON.parse(raw) as Record<string, string>;
+    })
+    .catch(() => {});
+}
+export function saveCfgPref(agent: string, cfgId: string, value: string) {
+  app.cfgPref[`${agent}:${cfgId}`] = value;
+  void api.settingsSet(CFG_PREF_KEY, JSON.stringify(app.cfgPref)).catch(() => {});
+}
+/** 该配置项的"完全访问"类选项值（各适配器叫法不同，取交集语义）。 */
+const FULL_ACCESS_VALUES = new Set(["danger-full-access", "agent-full-access", "yolo", "bypasspermissions"]);
+/** 按 cfgId 匹配偏好的完全访问值（找不到返回 undefined 表示不适用）。 */
+export function fullAccessDefault(cfgId: string, optionValues: string[]): string | undefined {
+  const id = cfgId.toLowerCase();
+  const wanted =
+    id === "sandbox" || id === "sandbox_mode" || id.includes("sandbox")
+      ? ["danger-full-access"]
+      : id.includes("approval")
+        ? ["never", "agent"]
+        : id === "mode" || id.includes("mode") || id.includes("permission")
+          ? ["yolo", "bypasspermissions", "agent-full-access", "danger-full-access", "execute"]
+          : [];
+  for (const v of wanted) if (optionValues.includes(v)) return v;
+  for (const v of optionValues) if (FULL_ACCESS_VALUES.has(v)) return v;
+  return undefined;
 }
 
 function upsertTool(list: DisplayItem[], update: ToolCallUpdate) {
@@ -258,6 +323,7 @@ export function finishTurn(agentType: AgentType, contextId: string | null) {
   const list = app.chat[key];
   if (list) for (const it of list) it.streaming = false;
   app.streaming[key] = false;
+  void persistChat(key);
 }
 
 // ---------- settings persistence ----------

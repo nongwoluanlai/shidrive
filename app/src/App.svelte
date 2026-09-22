@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { app, loadProjects, currentProject, currentContext, loadPrompts, isNoProject } from "./lib/state.svelte";
+  import { app, loadProjects, currentProject, currentContext, loadPrompts, isNoProject, loadCfgPrefs } from "./lib/state.svelte";
   import { api } from "./lib/ipc";
   import { applyTheme } from "./lib/theme";
   import { activateSkin, loadSkinOpacity } from "./lib/skins.svelte";
@@ -113,6 +113,7 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
     }
     await loadProjects(true);
     await loadPrompts();
+    loadCfgPrefs();
     app.ready = true;
     for (const a of app.agents) {
       api

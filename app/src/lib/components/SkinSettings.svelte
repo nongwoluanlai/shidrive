@@ -59,7 +59,8 @@
   </div>
   <div class="skin-actions">
     <button class="btn sm" disabled={busy} onclick={importSkin}>{busy ? t("正在导入…") : t("导入皮肤包（zip）")}</button>
-    <a href="https://github.com/nongwoluanlai/shidrive/blob/main/docs/skin-guide.md" target="_blank" rel="noopener noreferrer">{t("皮肤开发指南")}</a>
+    <button class="linklike" onclick={() => void api.fsOpenDefault("https://github.com/nongwoluanlai/shidrive/blob/main/docs/skin-guide.md").catch((e) => toast("error", String(e)))}>{t("皮肤开发指南")}</button>
+    <button class="linklike" onclick={() => void api.fsOpenDefault("https://shidrive.nwll.top/skinstore").catch((e) => toast("error", String(e)))}>{t("皮肤商店 ↗")}</button>
   </div>
   {#if app.skin}
     <label class="skin-opacity-row">
@@ -88,5 +89,6 @@
   .skin-opacity-row { display: flex; align-items: center; gap: 8px; font-size: .86em; color: var(--text-dim); margin-top: 12px; }
   .skin-opacity-row input { flex: 1; max-width: 220px; accent-color: var(--accent); }
   .skin-opacity-row b { min-width: 38px; text-align: right; color: var(--text); }
-  .skin-actions a { color: var(--accent); font-size: .85em; }
+  .skin-actions :is(a, .linklike) { color: var(--accent); font-size: .85em; background: none; border: none; padding: 0; cursor: pointer; }
+  .skin-actions .linklike:hover { text-decoration: underline; }
 </style>
