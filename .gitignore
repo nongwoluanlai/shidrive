@@ -32,3 +32,6 @@ ShiDrive-portable-*.zip
 ShiDrive-portable-win-x64/
 ShiDrive-portable-win-x64-*.zip
 website/shidrive-admin-pw.txt
+
+# 产品站（不开源，仅本地部署）
+website/
