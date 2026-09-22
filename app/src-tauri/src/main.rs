@@ -239,6 +239,8 @@ fn main() {
             commands::remote_cloudflared_install,
             commands::remote_cloudflared_status,
             commands::remote_cloudflared_set_path,
+            commands::remote_tunnel_start,
+            commands::remote_tunnel_stop,
             commands::skin_import,
             commands::skins_list,
             commands::skin_asset_data,

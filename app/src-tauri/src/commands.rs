@@ -491,12 +491,13 @@ pub async fn skin_asset_data(skin_dir: String, file: String) -> Result<String, S
 type RemoteState<'a> = tauri::State<'a, crate::remote_mcp::RemoteManager>;
 
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteStartOpts {
-    #[serde(default = "default_listen_host")]
+    #[serde(default = "default_listen_host", alias = "listen_host")]
     listen_host: String,
     #[serde(default = "default_port")]
     port: i64,
-    #[serde(default)]
+    #[serde(default, alias = "quick_tunnel")]
     quick_tunnel: bool,
 }
 fn default_listen_host() -> String { "0.0.0.0".into() }
@@ -517,6 +518,23 @@ pub async fn remote_mcp_start(
     });
     let port = u16::try_from(o.port.clamp(1, 65535)).map_err(|_| "端口超出范围")?;
     remote.start(app, db.inner().clone(), engine.inner().clone(), &o.listen_host, port, o.quick_tunnel)
+}
+
+/// 运行中单独启动 Quick Tunnel（切换接入方式为 Cloudflare 时调用；幂等）。
+#[tauri::command]
+pub async fn remote_tunnel_start(
+    app: tauri::AppHandle,
+    remote: RemoteState<'_>,
+    db: DbState<'_>,
+) -> Result<(), String> {
+    remote.tunnel_start(app, db.inner().clone())
+}
+
+/// 运行中单独停止 Quick Tunnel 并清空地址（切回自定义地址时调用）。
+#[tauri::command]
+pub async fn remote_tunnel_stop(remote: RemoteState<'_>) -> Result<(), String> {
+    remote.tunnel_stop();
+    Ok(())
 }
 
 #[tauri::command]
@@ -591,9 +609,16 @@ pub async fn remote_cloudflared_set_path(db: DbState<'_>, path: String) -> Resul
     crate::remote_mcp::cloudflared_set_path(db.inner(), &path)
 }
 
-/// 下载 cloudflared（可选出站代理，仅作用于本次下载）。
+/// 下载 cloudflared（可选出站代理，仅作用于本次下载）。隧道运行中拒绝（Windows 下
+/// 正在运行的 exe 无法被覆盖，先装会失败到一半）。
 #[tauri::command]
-pub async fn remote_cloudflared_install(db: DbState<'_>) -> Result<String, String> {
+pub async fn remote_cloudflared_install(remote: RemoteState<'_>, db: DbState<'_>) -> Result<String, String> {
+    {
+        let st = remote.status(db.inner());
+        if st.tunnel_running {
+            return Err("隧道正在运行：请先停止服务再更新 cloudflared".into());
+        }
+    }
     let proxy = db
         .get_setting("network.proxy")
         .ok()

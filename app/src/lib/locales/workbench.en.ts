@@ -170,4 +170,5 @@ export const workbenchEn: Record<string, string> = {
   "（不开放）": "(not shared)",
   "已绑定：远端可直接读写该上下文": "Bound: the remote can read/write this context",
   "选择上下文后，远端可获得其 MCP 读写工具": "Pick a context to grant its MCP read/write tools",
+  "正在获取隧道地址…": "Acquiring tunnel address…",
 };

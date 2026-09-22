@@ -65,6 +65,9 @@
   onMount(() => {
     void refresh();
     void refreshCf();
+    void api.settingsGet("remote.exposure")
+      .then((v) => { if (v === "custom" || v === "quick_tunnel") exposure = v; })
+      .catch(() => {});
     const un = listen("remote://tunnel", (e) => {
       const d = (e.payload ?? {}) as { publicUrl?: string; error?: string };
       if (d.publicUrl) { void refresh(); toast("ok", t("隧道地址已获取")); }
@@ -72,6 +75,26 @@
     });
     return () => { void un.then((f) => f()); };
   });
+
+  // 切换接入方式：记住选择；服务运行中即时起/停隧道
+  async function onExposureChange(v: "custom" | "quick_tunnel") {
+    exposure = v;
+    void api.settingsSet("remote.exposure", v).catch(() => {});
+    if (!status?.running) return;
+    try {
+      if (v === "quick_tunnel") {
+        cf = await api.remoteCloudflaredStatus().catch(() => null);
+        if (cf && !cf.installed) { toast("warn", t("未找到 cloudflared：请先「快捷安装」或「指定已有程序」")); return; }
+        toast("info", t("正在获取隧道地址…"));
+        await api.remoteTunnelStart();
+      } else {
+        await api.remoteTunnelStop();
+      }
+      await refresh();
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
 
   // 选用 Cloudflare 临时隧道时立即检测环境；未安装则提示安装入口
   $effect(() => {
@@ -263,8 +286,8 @@
   <div class="sec">
     <h3>{t("接入方式")}</h3>
     <div class="row">
-      <label class="radio"><input type="radio" bind:group={exposure} value="custom" /> {t("自定义地址 / 已有 frp 或反代")}</label>
-      <label class="radio"><input type="radio" bind:group={exposure} value="quick_tunnel" /> {t("Cloudflare 临时隧道")}</label>
+      <label class="radio"><input type="radio" checked={exposure === "custom"} onchange={() => void onExposureChange("custom")} /> {t("自定义地址 / 已有 frp 或反代")}</label>
+      <label class="radio"><input type="radio" checked={exposure === "quick_tunnel"} onchange={() => void onExposureChange("quick_tunnel")} /> {t("Cloudflare 临时隧道")}</label>
     </div>
     {#if exposure === "custom"}
       <div class="row">
@@ -287,7 +310,13 @@
     {/if}
     <div class="row">
       <span class="lbl">{t("接入地址")}：</span>
-      <code>{publicUrl ? `${publicUrl}/mcp` : "—"}</code>
+      {#if publicUrl}
+        <code>{publicUrl}/mcp</code>
+      {:else if exposure === "quick_tunnel" && status?.running && status?.tunnel_running}
+        <span class="pend">{t("正在获取隧道地址…")}</span>
+      {:else}
+        <code>—</code>
+      {/if}
       <button class="btn ghost sm" onclick={copyAddress} disabled={!publicUrl}>{t("复制")}</button>
     </div>
   </div>

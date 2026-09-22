@@ -272,7 +272,14 @@ impl RemoteManager {
     ) -> Result<(), String> {
         {
             let guard = self.runtime.read().unwrap_or_else(|p| p.into_inner());
-            if guard.is_some() {
+            if let Some(rt) = guard.as_ref() {
+                // 已在运行：切到 Cloudflare 后再次点「启动」时补起隧道（其余情况幂等返回）
+                let tunnel_up = rt.cloudflared_pid.lock().map(|c| c.is_some()).unwrap_or(false);
+                if quick_tunnel && !tunnel_up {
+                    let rt = rt.clone();
+                    drop(guard);
+                    return start_quick_tunnel(rt, app, db);
+                }
                 return Ok(());
             }
         }
@@ -338,7 +345,7 @@ impl RemoteManager {
             let t_app = app.clone();
             let t_db = db.clone();
             std::thread::spawn(move || {
-                if let Err(e) = start_quick_tunnel(t_rt.clone(), t_rt.logs.clone(), t_app.clone(), t_db.clone(), port) {
+                if let Err(e) = start_quick_tunnel(t_rt.clone(), t_app.clone(), t_db.clone()) {
                     Self::log_into(&t_rt.logs, format!("隧道启动失败：{e}"));
                 }
             });
@@ -348,9 +355,40 @@ impl RemoteManager {
         Ok(())
     }
 
+    /// 运行中单独启动 Quick Tunnel（服务未启动时报错；已在跑则幂等）。
+    pub fn tunnel_start(&self, app: tauri::AppHandle, db: Arc<Db>) -> Result<(), String> {
+        let rt = {
+            let guard = self.runtime.read().unwrap_or_else(|p| p.into_inner());
+            guard.as_ref().ok_or("服务未启动：请先启动外部编程 MCP 服务")?.clone()
+        };
+        let tunnel_up = rt.cloudflared_pid.lock().map(|c| c.is_some()).unwrap_or(false);
+        if tunnel_up {
+            return Ok(());
+        }
+        Self::log_into(&rt.logs, "正在启动 Cloudflare 临时隧道…".into());
+        start_quick_tunnel(rt, app, db)
+    }
+
+    /// 运行中单独停止 Quick Tunnel（清 pid/地址，旧读线程按 generation 静默失效）。
+    pub fn tunnel_stop(&self) {
+        let guard = self.runtime.read().unwrap_or_else(|p| p.into_inner());
+        if let Some(rt) = guard.as_ref() {
+            rt.tunnel_generation.fetch_add(1, Ordering::SeqCst);
+            let pid = rt.cloudflared_pid.lock().unwrap_or_else(|p| p.into_inner()).take();
+            if let Ok(mut u) = rt.public_url.write() {
+                *u = None;
+            }
+            if let Some(pid) = pid {
+                let _ = crate::setup::hide_console(&mut std::process::Command::new("taskkill")).args(["/F", "/T", "/PID", &pid.to_string()]).output();
+                Self::log_into(&rt.logs, "隧道已停止，接入地址已清空".into());
+            }
+        }
+    }
+
     pub fn stop(&self) {
         let rt = self.runtime.write().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(rt) = rt {
+            rt.tunnel_generation.fetch_add(1, Ordering::SeqCst); // 旧读线程静默退出
             rt.stop_flag.store(true, Ordering::SeqCst);
             let _ = std::net::TcpStream::connect(("127.0.0.1", rt.port));
             if let Some(h) = rt.handle.lock().unwrap_or_else(|p| p.into_inner()).take() {
@@ -366,13 +404,9 @@ impl RemoteManager {
 
 
 /// 启动 cloudflared Quick Tunnel；从输出流严格校验并提取临时地址。
-fn start_quick_tunnel(
-    rt: Arc<RemoteRuntime>,
-    logs: Arc<Mutex<VecDeque<String>>>,
-    app: tauri::AppHandle,
-    db: Arc<Db>,
-    port: u16,
-) -> Result<(), String> {
+fn start_quick_tunnel(rt: Arc<RemoteRuntime>, app: tauri::AppHandle, db: Arc<Db>) -> Result<(), String> {
+    let logs = rt.logs.clone();
+    let port = rt.port;
     let exe = resolve_cloudflared(db.as_ref())?;
     let gen = rt.tunnel_generation.fetch_add(1, Ordering::SeqCst) + 1;
     let mut cmd = std::process::Command::new(&exe);
@@ -421,10 +455,15 @@ fn start_quick_tunnel(
         }
         // 轮询拼装文本：提取地址 → 成功上报；进程退出/超时 → 诊断 + 失败上报。
         // cloudflared 的原始输出增量转发到运行日志，便于网络问题自诊。
+        // generation 守卫：服务停止/隧道重启后，旧线程的迟到输出不再生效或误报。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         let mut logged = 0usize;
+        let still_current = || rt2.tunnel_generation.load(Ordering::SeqCst) == gen;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
+            if !still_current() {
+                break;
+            }
             let snapshot = text.lock().map(|t| t.clone()).unwrap_or_default();
             if snapshot.len() > logged {
                 for line in snapshot[logged..].lines().filter(|l| !l.trim().is_empty()) {
@@ -441,6 +480,13 @@ fn start_quick_tunnel(
                 break;
             }
             if readers.iter().all(|h| h.is_finished()) {
+                // 进程已退出：清 pid/地址让状态回到真实（隧道已断）
+                if let Some(mut p) = rt2.cloudflared_pid.lock().ok() {
+                    if *p == Some(pid2) { *p = None; }
+                }
+                if let Ok(mut u) = rt2.public_url.write() {
+                    *u = None;
+                }
                 rt_log_logs(&logs2, "隧道进程已退出且未提供地址".into());
                 let _ = app2.emit("remote://tunnel", serde_json::json!({ "error": "exited_without_url", "generation": gen }));
                 break;
@@ -448,6 +494,9 @@ fn start_quick_tunnel(
             if std::time::Instant::now() > deadline {
                 rt_log_logs(&logs2, "获取隧道地址超时（90s），已终止 cloudflared".into());
                 let _ = crate::setup::hide_console(&mut std::process::Command::new("taskkill")).args(["/F", "/T", "/PID", &pid2.to_string()]).output();
+                if let Some(mut p) = rt2.cloudflared_pid.lock().ok() {
+                    if *p == Some(pid2) { *p = None; }
+                }
                 let _ = app2.emit("remote://tunnel", serde_json::json!({ "error": "url_timeout", "generation": gen }));
                 break;
             }
@@ -606,18 +655,11 @@ fn handle_remote_http(
         }
     }
     if content_length > 8 * 1024 * 1024 {
-        return Err("请求体过大".into());
+        return write_http(stream, 413, "application/json", "{\"error\":\"请求体过大（上限 8MB）\"}");
     }
-    while buf.len() < header_end + content_length {
-        let n = stream.read(&mut chunk).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    let body = String::from_utf8_lossy(&buf[header_end..]).to_string();
 
-    // 鉴权：Authorization: Bearer / X-ShiDrive-Token / ?passcode=
+    // 鉴权前置于读 body：未授权连接在这里就被挡掉，不再消耗读体资源
+    // （Authorization: Bearer / X-ShiDrive-Token / ?passcode=）
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (target.clone(), String::new()),
@@ -647,6 +689,16 @@ fn handle_remote_http(
         return write_http(stream, 401, "application/json", "{\"error\":\"凭据无效或已撤销\"}");
     };
     grant_touch(&db, &grant.id);
+
+    // 鉴权通过后再读 body
+    while buf.len() < header_end + content_length {
+        let n = stream.read(&mut chunk).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let body = String::from_utf8_lossy(&buf[header_end..]).to_string();
 
     // OPTIONS 预检
     if method == "OPTIONS" {
@@ -771,7 +823,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn write_http(mut stream: std::net::TcpStream, status: u16, ctype: &str, body: &str) -> Result<(), String> {
     let text = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
         if status < 400 { "OK" } else { "Error" },
         body.len()
     );
