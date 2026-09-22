@@ -390,6 +390,19 @@ impl CmdFlags for std::process::Command {
     }
 }
 
+/// 后台控制台子进程不弹 cmd 窗口（Windows GUI 子系统下 spawn 控制台程序
+/// 会闪黑框）。非 Windows 平台为空操作。
+pub fn hide_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        cmd.no_window()
+    }
+    #[cfg(not(windows))]
+    {
+        cmd
+    }
+}
+
 fn provider_config_next_to(zc: &Path) -> Option<PathBuf> {
     let dir = zc.parent()?;
     [dir.join("provider").join("zcode-builtin.json"),

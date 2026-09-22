@@ -33,12 +33,13 @@
   let status = $state<RemoteStatus | null>(null);
   let grants = $state<RemoteGrant[]>([]);
   let busy = $state(false);
-  let exposure = $state<"custom" | "quick_tunnel">("custom");
+  let exposure = $state<"custom" | "quick_tunnel">("quick_tunnel");
   let customUrl = $state("");
   let lastToken = $state("");
   let adding = $state(false);
   let addProjectId = $state("");
-  let addContextEnabled = $state(false);
+  let addContextId = $state("");
+  let formContexts = $state<Context[]>([]);
   let addFsWrite = $state(false);
   let addExec = $state(false);
   let logOpen = $state(false);
@@ -46,7 +47,6 @@
   let cfBusy = $state(false);
 
   const projects = $derived(app.projects.filter((p) => !p.id.startsWith("00000000")));
-  const contexts = $derived<Context[]>([]);
   const publicUrl = $derived(status?.running ? (exposure === "custom" && customUrl.trim() ? customUrl.trim().replace(/\/+$/, "") : status.public_url ?? "") : "");
 
   async function refresh() {
@@ -149,9 +149,16 @@
   function startAdd() {
     adding = true;
     addProjectId = projects[0]?.id ?? "";
-    addContextEnabled = false;
+    addContextId = "";
     addFsWrite = false;
     addExec = false;
+    void loadFormContexts(addProjectId);
+  }
+
+  // 按项目载入上下文（选择上下文 = 一并开放该共享上下文的 MCP 工具）
+  async function loadFormContexts(projectId: string) {
+    formContexts = projectId ? await api.contextsList(projectId).catch(() => []) : [];
+    if (!formContexts.some((c) => c.id === addContextId)) addContextId = "";
   }
 
   function cancelAdd() {
@@ -163,13 +170,14 @@
     if (!project) { toast("warn", t("请先选择项目")); return; }
     busy = true;
     try {
+      const ctx = formContexts.find((c) => c.id === addContextId) ?? null;
       const res = await api.remoteGrantCreate({
         projectId: project.id,
         projectName: project.name,
         projectRoot: project.root_path,
-        contextId: null,
-        contextName: "",
-        contextEnabled: addContextEnabled,
+        contextId: ctx?.id ?? null,
+        contextName: ctx?.name ?? "",
+        contextEnabled: !!ctx,
         fsWrite: addFsWrite,
         execAllowed: addExec,
       });
@@ -299,17 +307,27 @@
       <div class="add-form">
         <div class="row">
           <label class="lbl">{t("项目")}</label>
-          <select bind:value={addProjectId}>
+          <select
+            bind:value={addProjectId}
+            onchange={() => { addContextId = ""; void loadFormContexts(addProjectId); }}
+          >
             {#each projects as p (p.id)}
               <option value={p.id}>{p.name} · {p.root_path}</option>
             {/each}
           </select>
         </div>
+        <div class="row">
+          <label class="lbl">{t("共享上下文")}</label>
+          <select bind:value={addContextId}>
+            <option value="">{t("（不开放）")}</option>
+            {#each formContexts as c (c.id)}
+              <option value={c.id}>{c.name}</option>
+            {/each}
+          </select>
+          <span class="pend">{addContextId ? t("已绑定：远端可直接读写该上下文") : t("选择上下文后，远端可获得其 MCP 读写工具")}</span>
+        </div>
         <label class="check"><input type="checkbox" bind:checked={addFsWrite} /> {t("文件读写（默认只读）")}</label>
         <label class="check"><input type="checkbox" bind:checked={addExec} /> {t("允许命令执行")}</label>
-        {#if addContextEnabled}
-          <p class="note">{t("注意：需要所属项目存在共享上下文；未绑定上下文的授权无法使用共享上下文工具。")}</p>
-        {/if}
         <div class="rowbtns">
           <button class="btn sm primary" onclick={saveAdd}>{t("创建授权")}</button>
           <button class="btn sm" onclick={cancelAdd}>{t("取消")}</button>

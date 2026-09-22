@@ -357,7 +357,7 @@ impl RemoteManager {
                 let _ = h.join();
             }
             if let Some(pid) = rt.cloudflared_pid.lock().unwrap_or_else(|p| p.into_inner()).take() {
-                let _ = std::process::Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+                let _ = crate::setup::hide_console(&mut std::process::Command::new("taskkill")).args(["/F", "/T", "/PID", &pid.to_string()]).output();
             }
             Self::log_into(&rt.logs, "服务已停止".into());
         }
@@ -375,12 +375,12 @@ fn start_quick_tunnel(
 ) -> Result<(), String> {
     let exe = resolve_cloudflared(db.as_ref())?;
     let gen = rt.tunnel_generation.fetch_add(1, Ordering::SeqCst) + 1;
-    let mut child = std::process::Command::new(&exe)
-        .args(["tunnel", "--no-autoupdate", "--url", &format!("http://127.0.0.1:{port}")])
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(["tunnel", "--no-autoupdate", "--url", &format!("http://127.0.0.1:{port}")])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("启动 cloudflared 失败: {e}"))?;
+        .stderr(std::process::Stdio::piped());
+    crate::setup::hide_console(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| format!("启动 cloudflared 失败: {e}"))?;
     let pid = child.id();
     if let Some(mut slot) = rt.cloudflared_pid.lock().ok() {
         *slot = Some(pid);
@@ -447,7 +447,7 @@ fn start_quick_tunnel(
             }
             if std::time::Instant::now() > deadline {
                 rt_log_logs(&logs2, "获取隧道地址超时（90s），已终止 cloudflared".into());
-                let _ = std::process::Command::new("taskkill").args(["/F", "/T", "/PID", &pid2.to_string()]).output();
+                let _ = crate::setup::hide_console(&mut std::process::Command::new("taskkill")).args(["/F", "/T", "/PID", &pid2.to_string()]).output();
                 let _ = app2.emit("remote://tunnel", serde_json::json!({ "error": "url_timeout", "generation": gen }));
                 break;
             }
@@ -524,10 +524,12 @@ pub fn cloudflared_status(db: &Db) -> CloudflaredStatus {
     let Some(exe) = resolve_cloudflared_opt(db) else {
         return CloudflaredStatus { installed: false, path: String::new(), version: String::new() };
     };
-    let version = std::process::Command::new(&exe)
-        .arg("--version")
+    let mut vc = std::process::Command::new(&exe);
+    vc.arg("--version")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    crate::setup::hide_console(&mut vc);
+    let version = vc
         .spawn()
         .ok()
         .and_then(|mut child| {

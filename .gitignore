@@ -27,3 +27,8 @@ ShiDrive/
 *.db-wal
 *.log
 ShiDrive-portable-*.zip
+
+# 发布打包产物
+ShiDrive-portable-win-x64/
+ShiDrive-portable-win-x64-*.zip
+website/shidrive-admin-pw.txt

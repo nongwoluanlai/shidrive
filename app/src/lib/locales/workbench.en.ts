@@ -166,4 +166,8 @@ export const workbenchEn: Record<string, string> = {
   "隧道地址获取失败，请查看运行日志": "Failed to acquire tunnel address; check the logs",
   "保存路径（含文件名，可改）": "Save path (with file name; editable)",
   "皮肤商店 ↗": "Skin store ↗",
+  "共享上下文": "Shared context",
+  "（不开放）": "(not shared)",
+  "已绑定：远端可直接读写该上下文": "Bound: the remote can read/write this context",
+  "选择上下文后，远端可获得其 MCP 读写工具": "Pick a context to grant its MCP read/write tools",
 };

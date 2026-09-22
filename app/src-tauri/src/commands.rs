@@ -531,6 +531,7 @@ pub async fn remote_mcp_status(remote: RemoteState<'_>, db: DbState<'_>) -> Resu
 }
 
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteGrantInputPayload {
     pub project_id: String,
     pub project_name: String,
