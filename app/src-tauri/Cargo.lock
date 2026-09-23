@@ -3163,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "shidrive"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "env_logger",

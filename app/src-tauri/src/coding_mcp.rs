@@ -928,6 +928,7 @@ fn run_exec(command: &str, dir: &Path, timeout: u64, max_chars: usize, stdin_dat
         cmd.arg("-c").arg(command);
     }
     let mut child = cmd.spawn().map_err(|e| format!("启动失败: {e}"))?;
+    crate::child_job::attach(&child);
     let pid = child.id();
     // FIX：stdin 参数——多行脚本从标准输入喂给解释器（python/node 等），
     // 彻底绕开 JSON→cmd→解释器 的命令行转义地狱。独立线程写入后随手柄关闭，

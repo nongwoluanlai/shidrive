@@ -611,6 +611,7 @@ async fn execute_shell(
             return (false, -1, String::new(), e.to_string());
         }
     };
+    crate::child_job::attach(&child); // 随宿主退出回收（含强杀）
     let pid = child.id().unwrap_or(0);
     ctrl.shell_pids.lock().unwrap().push(pid);
     let mut stdout = child.stdout.take().unwrap();

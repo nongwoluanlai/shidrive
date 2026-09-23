@@ -624,6 +624,7 @@ fn start_quick_tunnel(rt: Arc<RemoteRuntime>, app: tauri::AppHandle, db: Arc<Db>
         .stderr(std::process::Stdio::piped());
     crate::setup::hide_console(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| format!("启动 cloudflared 失败: {e}"))?;
+    crate::child_job::attach(&child); // 隧道随宿主退出回收
     let pid = child.id();
     let out = child.stdout.take();
     let err = child.stderr.take();

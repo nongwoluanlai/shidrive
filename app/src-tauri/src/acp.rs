@@ -111,6 +111,7 @@ impl AcpConnection {
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 
         let mut child = cmd.spawn().map_err(|e| format!("启动适配器失败 ({}): {e}", launch.command))?;
+        crate::child_job::attach(&child); // 随宿主退出回收（含其派生的 codex 等孙进程）
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let stderr = child.stderr.take().ok_or("no stderr")?;
@@ -244,6 +245,14 @@ impl AcpConnection {
             let _ = tx.send(json!({ "optionId": "__connection_closed__" }));
         }
         drop(perms);
+        // Windows：先按 PID 终止整棵进程树（适配器派生的 codex/node 孙进程
+        // 不随直接子进程死亡）；start_kill 作为兜底
+        #[cfg(windows)]
+        if let Some(pid) = self.child.lock().unwrap().as_ref().and_then(|c| c.id()) {
+            let _ = crate::setup::hide_console(&mut std::process::Command::new("taskkill"))
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .output();
+        }
         if let Some(child) = self.child.lock().unwrap().as_mut() { let _ = child.start_kill(); }
         for task in self.io_tasks.lock().unwrap().drain(..) { task.abort(); }
         self.emit_status("disconnected", None);

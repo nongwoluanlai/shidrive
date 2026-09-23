@@ -38,8 +38,13 @@ import type { DisplayItem } from "../state.svelte";
   const hMap = new Map<string, number>();
   let hVersion = $state(0);
   function estHeight(it: DisplayItem): number {
-    const base = it.kind === "user" ? 84 : it.kind === "error" ? 76 : it.kind === "thought" ? 64 : it.kind === "tools" ? 96 : 72;
-    return Math.min(base + Math.ceil((it.text?.length ?? 0) / 900) * 80, 4000);
+    // tools/thought 默认折叠为一行摘要：按折叠高度估算（此前按全文长度估，
+    // 一个 115 次调用的工具块会被估到 4000px 上限，而实际只有 ~60px，
+    // 折叠块一多，顶部占位出现数千像素空白——滚动上翻大片空白的根因）。
+    if (it.kind === "tools") return 88;
+    if (it.kind === "thought") return 64;
+    const base = it.kind === "user" ? 84 : it.kind === "error" ? 76 : 72;
+    return Math.min(base + Math.round((it.text?.length ?? 0) * 0.28), 2600);
   }
   function hOf(it: DisplayItem): number {
     void hVersion;
@@ -124,20 +129,32 @@ import type { DisplayItem } from "../state.svelte";
     if (endIdx - startIdx > MAX_RENDER) endIdx = startIdx + MAX_RENDER;
   }
 
-  // 上翻自动扩窗（距离顶部 60px 内触发），锚定首条保持视线不跳动
+  // 上翻自动扩窗：进入顶部占位区即触发（不再等滚到 60px——占位区若有偏差，
+  // 等到 60px 意味着要先滚过一大段空白）。触发后连续扩窗直到脱离占位区或到顶，
+  // 每轮以首条消息锚定视线，避免跳动。
   let loadingOlder = false;
   async function onListScrollTop() {
     if (loadingOlder || startIdx === 0 || !listEl) return;
-    if (listEl.scrollTop > 60) return;
+    const padZone = Math.min(480, topPad + 120);
+    if (listEl.scrollTop > padZone) return;
     loadingOlder = true;
-    const first = listEl.querySelector('.msgs-inner > div[id^="msg-"]') as HTMLElement | null;
-    const anchorTop = first?.getBoundingClientRect().top ?? 0;
-    startIdx = Math.max(0, startIdx - CHUNK);
-    if (endIdx - startIdx > MAX_RENDER) endIdx = startIdx + MAX_RENDER;
-    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    if (first) listEl.scrollTop += first.getBoundingClientRect().top - anchorTop;
-    measureRendered();
-    loadingOlder = false;
+    try {
+      for (let round = 0; round < 5; round++) {
+        const first = listEl.querySelector('.msgs-inner > div[id^="msg-"]') as HTMLElement | null;
+        const anchorTop = first?.getBoundingClientRect().top ?? 0;
+        const prevStart = startIdx;
+        startIdx = Math.max(0, startIdx - CHUNK);
+        if (endIdx - startIdx > MAX_RENDER) endIdx = startIdx + MAX_RENDER;
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        if (first) listEl.scrollTop += first.getBoundingClientRect().top - anchorTop;
+        measureRendered();
+        if (startIdx === 0 || startIdx === prevStart) break;
+        // 仍在占位区深处才继续扩；已离开则停
+        if (listEl.scrollTop > Math.min(480, topPad + 120)) break;
+      }
+    } finally {
+      loadingOlder = false;
+    }
   }
 
   // 下探扩窗：跳转到中部历史后继续向下读，接近底部时把窗口滑向下
@@ -295,12 +312,47 @@ import type { DisplayItem } from "../state.svelte";
     prevScrollTop = listEl.scrollTop;
     if (scrolledUp) {
       stickToBottom = false;
+      // 上滚同样要做顶部检查——此前此处直接 return，进入占位区永远不扩窗，
+      // 滚到顶只能看到大片空白（占位块）
+      if (startIdx > 0 && listEl.scrollTop < Math.min(480, topPad + 120)) {
+        void onListScrollTop();
+      } else if (startIdx > 0 && topPad > 0) {
+        void navigatePadIfNeeded();
+      }
       return;
     }
     const dist = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight;
     if (dist < 60) stickToBottom = true;
-    if (listEl.scrollTop < 60) void onListScrollTop();
+    if (startIdx > 0 && listEl.scrollTop < Math.min(480, topPad + 120)) void onListScrollTop();
     extendBottomIfNeeded(dist);
+  }
+
+  // 拖动滚动条直接跳进顶部占位区深处：按滚动比例换算目标索引，整窗重开到该处，
+  // 而不是从当前窗口按 30 条逐步扩（那要滚很多轮才能把数千像素占位消费完）。
+  async function navigatePadIfNeeded() {
+    if (!listEl || startIdx === 0 || topPad <= 0) return;
+    const first = listEl.querySelector('.msgs-inner > div[id^="msg-"]') as HTMLElement | null;
+    if (!first) return;
+    const listRect = listEl.getBoundingClientRect();
+    const firstTop = first.getBoundingClientRect().top - listRect.top;
+    if (firstTop < 240) return; // 首条已接近视口顶部，走正常分块扩窗路径
+    const frac = Math.min(0.999, Math.max(0, listEl.scrollTop / Math.max(1, topPad)));
+    const target = Math.max(0, Math.min(startIdx - 1, Math.round(frac * startIdx)));
+    const targetId = items[target]?.id;
+    if (!targetId) return;
+    ensureRendered(target);
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const el = document.getElementById("msg-" + targetId);
+    if (el && listEl) {
+      lastProgScrollAt = performance.now();
+      const r2 = listEl.getBoundingClientRect();
+      listEl.scrollTop += el.getBoundingClientRect().top - r2.top - 24;
+      prevScrollTop = listEl.scrollTop;
+      el.classList.remove("flash");
+      void el.offsetWidth;
+      el.classList.add("flash");
+    }
+    measureRendered();
   }
 
   // 内容高度一变（历史重放渲染完成、流式追加、图片/字体加载）即贴底：

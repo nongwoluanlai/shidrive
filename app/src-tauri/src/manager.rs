@@ -282,6 +282,11 @@ impl AgentManager {
         }
     }
 
+    /// 当前已连接的 agent id 快照（退出清理用）。
+    pub fn connection_ids(&self) -> Vec<String> {
+        tauri::async_runtime::block_on(async { self.conns.read().await.keys().cloned().collect() })
+    }
+
     pub async fn disconnect(&self, agent_type: &str) {
         let lock = self.connection_lock(agent_type);
         let _guard = lock.lock().await;

@@ -10,6 +10,7 @@ mod fsops;
 mod mcp;
 mod manager;
 mod models;
+mod child_job;
 mod remote_mcp;
 mod remote_oauth;
 mod node_rt;
@@ -75,6 +76,25 @@ fn init_logger(debug: bool) {
     log::set_max_level(LevelFilter::Info);
 }
 
+/// 退出前清理：停外部编程服务（含隧道）、断开全部 ACP 适配器（进程树终止）。
+/// Job Object 兜底保证任何退出路径（含强杀）最终不残留子进程；这里做的是
+/// 优雅路径——服务日志落"已停止"、pending 请求被正确拒绝、数据库正常关闭。
+fn graceful_exit(app: &tauri::AppHandle) {
+    if let Some(remote) = app.try_state::<crate::remote_mcp::RemoteManager>() {
+        remote.stop();
+    }
+    if let Some(mgr) = app.try_state::<std::sync::Arc<crate::manager::AgentManager>>() {
+        let conns = mgr.connection_ids();
+        for id in conns {
+            tauri::async_runtime::block_on(mgr.disconnect(&id));
+        }
+    }
+    // 最后显式终结子进程 Job（工作流 shell、隧道残留等；本机实测
+    // kill-on-close 标志读回不符，不依赖句柄关闭语义）
+    crate::child_job::terminate_all();
+    app.exit(0);
+}
+
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.show();
@@ -124,7 +144,7 @@ fn main() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => show_main_window(app),
-                    "quit" => app.exit(0),
+                    "quit" => graceful_exit(app),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
