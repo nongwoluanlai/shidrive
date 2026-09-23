@@ -8,6 +8,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   import ContextMenu from "./ContextMenu.svelte";
   import ChatTimeline from "./ChatTimeline.svelte";
   import type { AgentType, SessionReadyInfo } from "../types";
+import type { DisplayItem } from "../state.svelte";
 
   let input = $state("");
   let sending = $state(false);
@@ -20,61 +21,161 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   const ctx = $derived(currentContext());
   const key = $derived(chatKey(ctx?.id ?? null, app.agent));
   const items = $derived(app.chat[key] ?? []);
-  // 会话历史可能很长：默认只渲染最新 30 条，向上滚动或点按钮分批加载更早内容
+  // ============ 有界滑窗渲染：内存/卡顿与定位能力兼得 ============
+  // 设计：消息数据全量在内存（供搜索/时间轴索引），DOM 只渲染 [startIdx, endIdx)
+  // 窗口（最多 MAX_RENDER 条）。窗口外的消息用「高度缓存 + 估算」占位，保持滚动条
+  // 比例；所有定位（搜索跳转/时间轴/↑键）都通过 scrollToItem 原语：先把目标纳入
+  // 窗口，再精准滚动。DOM 有界 → 长会话不再卡顿；索引全量 → 定位不丢。
   const CHUNK = 30;
-  let visibleCount = $state(CHUNK);
-  const hiddenCount = $derived(Math.max(0, items.length - visibleCount));
-  const shownItems = $derived(hiddenCount > 0 ? items.slice(hiddenCount) : items);
+  const MAX_RENDER = 240;
+  let startIdx = $state(0);
+  let endIdx = $state(0);
+  const shownItems = $derived(items.slice(startIdx, endIdx));
+  const olderCount = $derived(startIdx);
+  const newerHidden = $derived(Math.max(0, items.length - endIdx));
+
+  // 高度缓存：渲染过的消息记实测高度，未渲染的按类型/长度估算
+  const hMap = new Map<string, number>();
+  let hVersion = $state(0);
+  function estHeight(it: DisplayItem): number {
+    const base = it.kind === "user" ? 84 : it.kind === "error" ? 76 : it.kind === "thought" ? 64 : it.kind === "tools" ? 96 : 72;
+    return Math.min(base + Math.ceil((it.text?.length ?? 0) / 900) * 80, 4000);
+  }
+  function hOf(it: DisplayItem): number {
+    void hVersion;
+    return hMap.get(it.id) ?? estHeight(it);
+  }
+  // 窗口外占位高度（保持滚动条长度与位置大致成比例）
+  const topPad = $derived(items.slice(0, startIdx).reduce((a, it) => a + hOf(it), 0));
+  const botPad = $derived(items.slice(endIdx).reduce((a, it) => a + hOf(it), 0));
+
+  // 记录当前已渲染消息的实测高度（滚动/开窗后惰性调用）
+  function measureRendered() {
+    if (!listEl) return;
+    const wrappers = listEl.querySelectorAll<HTMLDivElement>('.msgs-inner > div[id^="msg-"]');
+    let changed = false;
+    for (const el of wrappers) {
+      const id = el.id.slice(4);
+      const h = Math.round(el.getBoundingClientRect().height);
+      if (h > 0 && hMap.get(id) !== h) { hMap.set(id, h); changed = true; }
+    }
+    if (changed) hVersion++;
+  }
+
+  const idToIndex = $derived.by(() => {
+    const m = new Map<string, number>();
+    items.forEach((it, i) => m.set(it.id, i));
+    return m;
+  });
+
+  // 把 index 纳入渲染窗口（以目标为中心开窗，双端不超 MAX_RENDER）
+  function ensureRendered(index: number) {
+    const len = items.length;
+    if (index >= startIdx && index < endIdx) return;
+    let e = Math.min(len, index + Math.ceil(MAX_RENDER / 2));
+    let s = Math.max(0, e - MAX_RENDER);
+    if (index < s) s = Math.max(0, index - CHUNK);
+    e = Math.min(len, Math.max(e, s + 1));
+    if (e - s > MAX_RENDER) s = e - MAX_RENDER;
+    startIdx = Math.max(0, s);
+    endIdx = Math.max(startIdx + 1, e);
+  }
+
+  // ============ 统一定位原语：确保渲染 → 精准滚动 → 闪烁提示 ============
+  async function scrollToItem(id: string, align: "center" | "start" = "center") {
+    const idx = idToIndex.get(id);
+    if (idx === undefined || !listEl) return;
+    stickToBottom = false;
+    ensureRendered(idx);
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const el = document.getElementById("msg-" + id) as HTMLElement | null;
+    if (!el || !listEl) return;
+    lastProgScrollAt = performance.now();
+    const listRect = listEl.getBoundingClientRect();
+    const rel = el.getBoundingClientRect().top - listRect.top;
+    listEl.scrollTop = Math.max(0, listEl.scrollTop + rel - (align === "center" ? listEl.clientHeight / 2 - el.offsetHeight / 2 : 24));
+    el.classList.remove("flash");
+    void el.offsetWidth;
+    el.classList.add("flash");
+    // markdown/图片异步撑高后二次校准 + 补测高度
+    requestAnimationFrame(() => {
+      const el2 = document.getElementById("msg-" + id) as HTMLElement | null;
+      if (el2 && listEl) {
+        const r2 = listEl.getBoundingClientRect();
+        const rel2 = el2.getBoundingClientRect().top - r2.top;
+        listEl.scrollTop = Math.max(0, listEl.scrollTop + rel2 - (align === "center" ? listEl.clientHeight / 2 - el2.offsetHeight / 2 : 24));
+      }
+      measureRendered();
+    });
+  }
 
   const chatRev = () => app.chatRev[key] ?? 0;
 
-  // 切换会话/历史重载时恢复窗口大小
+  // 切换会话/历史重载时：窗口重置到最新一页
   $effect(() => {
     key;
     chatRev();
-    visibleCount = CHUNK;
+    endIdx = items.length;
+    startIdx = Math.max(0, endIdx - CHUNK);
   });
 
   function loadOlder() {
-    visibleCount += CHUNK;
+    startIdx = Math.max(0, startIdx - CHUNK);
+    if (endIdx - startIdx > MAX_RENDER) endIdx = startIdx + MAX_RENDER;
   }
 
-  // 上翻自动加载更早历史（距离顶部 60px 内触发），并保持视线不跳动
+  // 上翻自动扩窗（距离顶部 60px 内触发），锚定首条保持视线不跳动
   let loadingOlder = false;
   async function onListScrollTop() {
-    if (loadingOlder || hiddenCount === 0 || !listEl) return;
+    if (loadingOlder || startIdx === 0 || !listEl) return;
     if (listEl.scrollTop > 60) return;
     loadingOlder = true;
-    const first = document.querySelector('.msgs-inner > div');
+    const first = listEl.querySelector('.msgs-inner > div[id^="msg-"]') as HTMLElement | null;
     const anchorTop = first?.getBoundingClientRect().top ?? 0;
-    visibleCount += CHUNK;
+    startIdx = Math.max(0, startIdx - CHUNK);
+    if (endIdx - startIdx > MAX_RENDER) endIdx = startIdx + MAX_RENDER;
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     if (first) listEl.scrollTop += first.getBoundingClientRect().top - anchorTop;
+    measureRendered();
     loadingOlder = false;
   }
 
-  // 定位上一条发出的消息气泡（从当前可视位置向上找最近的用户气泡）
+  // 下探扩窗：跳转到中部历史后继续向下读，接近底部时把窗口滑向下
+  function extendBottomIfNeeded(distToBottom: number) {
+    if (newerHidden === 0 || distToBottom > 200 || !listEl) return;
+    const anchor = listEl.querySelector('.msgs-inner > div[id^="msg-"]:last-of-type') as HTMLElement | null;
+    const anchorBottom = anchor?.getBoundingClientRect().bottom ?? 0;
+    endIdx = Math.min(items.length, endIdx + CHUNK);
+    if (endIdx - startIdx > MAX_RENDER) startIdx = endIdx - MAX_RENDER;
+    requestAnimationFrame(() => {
+      const a2 = listEl?.querySelector('.msgs-inner > div[id^="msg-"]:last-of-type') as HTMLElement | null;
+      if (anchor && a2 && listEl) listEl.scrollTop += a2.getBoundingClientRect().bottom - anchorBottom;
+      measureRendered();
+    });
+  }
+
+  // 定位上一条发出的消息气泡：数据驱动（不再依赖已渲染 DOM，未加载的旧消息也能定位）
   function jumpToPrevUserMessage() {
-    if (!listEl) return;
-    const wrappers = Array.from(listEl.querySelectorAll('.msgs-inner > div[id^="msg-"]')) as HTMLElement[];
-    const marker = listEl.scrollTop + 80;
-    let target: HTMLElement | null = null;
-    for (let i = wrappers.length - 1; i >= 0; i--) {
-      const el = wrappers[i];
-      if (!el.querySelector('.bubble.user-bubble')) continue;
-      if (el.offsetTop < marker) { target = el; break; }
-    }
-    if (!target) {
-      for (const el of wrappers) {
-        if (el.querySelector('.bubble.user-bubble')) { target = el; break; }
+    if (!items.length || !listEl) return;
+    const listRect = listEl.getBoundingClientRect();
+    let cur = startIdx;
+    for (const el of Array.from(listEl.querySelectorAll('.msgs-inner > div[id^="msg-"]')) as HTMLElement[]) {
+      if (el.getBoundingClientRect().bottom > listRect.top + 80) {
+        cur = idToIndex.get(el.id.slice(4)) ?? startIdx;
+        break;
       }
     }
-    if (!target) { toast("info", t("没有更早的发出的消息")); return; }
-    stickToBottom = false;
-    target.scrollIntoView({ block: "center", behavior: "smooth" });
-    target.classList.remove("flash");
-    void target.offsetWidth;
-    target.classList.add("flash");
+    let target = -1;
+    for (let i = Math.min(cur, items.length - 1); i >= 0; i--) {
+      if (items[i].kind === "user") { target = i; break; }
+    }
+    if (target < 0) {
+      for (let i = items.length - 1; i >= 0; i--) {
+        if (items[i].kind === "user") { target = i; break; }
+      }
+    }
+    if (target < 0) { toast("info", t("没有更早的发出的消息")); return; }
+    void scrollToItem(items[target].id, "start");
   }
   const sessionId = $derived(app.bindingSession[key] ?? null);
   let bindingTitle = $state<string | null>(null);
@@ -147,6 +248,11 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     const n = items.length;
     const tailLen = items[n - 1]?.text.length ?? 0;
     const rev = app.chatRev[k] ?? 0;
+    // 流式追加：窗口尾随到最新（仅贴底时回收顶部，阅读中途不跳动）
+    if (n > endIdx) {
+      endIdx = n;
+      if (stickToBottom && endIdx - startIdx > MAX_RENDER) startIdx = endIdx - MAX_RENDER;
+    }
     if (k !== lastKeyScrolled) {
       lastKeyScrolled = k;
       lastRevSeen[k] = rev;
@@ -194,6 +300,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     const dist = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight;
     if (dist < 60) stickToBottom = true;
     if (listEl.scrollTop < 60) void onListScrollTop();
+    extendBottomIfNeeded(dist);
   }
 
   // 内容高度一变（历史重放渲染完成、流式追加、图片/字体加载）即贴底：
@@ -482,7 +589,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   // ---------- Ctrl+F 正文搜索 ----------
   let searchOpen = $state(false);
   let searchQuery = $state("");
-  let searchHits = $state<{ id: string; text: string }[]>([]);
+  let searchHits = $state<{ id: string; text: string; index: number }[]>([]);
   let searchIdx = $state(-1);
 
   function onPageKeydown(e: KeyboardEvent) {
@@ -511,8 +618,10 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       return;
     }
     searchHits = items
-      .filter((it) => (it.kind === "user" || it.kind === "assistant" || it.kind === "error") && it.text.toLowerCase().includes(q))
-      .map((it) => ({ id: it.id, text: it.text }));
+      .map((it, index) => ({ id: it.id, text: it.text, index, kind: it.kind }))
+      .filter((it) => it.kind === "user" || it.kind === "assistant" || it.kind === "error")
+      .filter((it) => it.text.toLowerCase().includes(q))
+      .map(({ id, text, index }) => ({ id, text, index }));
     searchIdx = searchHits.length ? searchIdx >= 0 && searchIdx < searchHits.length ? searchIdx : 0 : -1;
     jumpToHit();
   }
@@ -526,11 +635,8 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   function jumpToHit() {
     const hit = searchHits[searchIdx];
     if (!hit) return;
-    const el = document.getElementById("msg-" + hit.id);
-    el?.scrollIntoView({ block: "center", behavior: "smooth" });
-    el?.classList.remove("flash");
-    void el?.offsetWidth;
-    el?.classList.add("flash");
+    // 数据驱动：先把目标纳入渲染窗口（可在任意未加载的历史位置），再精准滚动
+    void scrollToItem(hit.id, "center");
   }
 
   function closeSearch() {
@@ -538,6 +644,29 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     searchQuery = "";
     searchHits = [];
     searchIdx = -1;
+  }
+
+  // ---------- 执行后动作（回合结束后触发；配置全局生效，存 localStorage） ----------
+  type AfterActionKind = "sound" | "shutdown" | "command";
+  let afterAction = $state<{ kind: AfterActionKind; cmd: string }>({ kind: "sound", cmd: "" });
+
+  $effect(() => {
+    // 挂载时读一次持久化配置（与 events.ts 的 loadAfterAction 同一存储）
+    try {
+      const raw = localStorage.getItem("shidrive.afterAction");
+      if (raw) {
+        const v = JSON.parse(raw);
+        if (v && (v.kind === "sound" || v.kind === "shutdown" || v.kind === "command")) {
+          afterAction = { kind: v.kind, cmd: typeof v.cmd === "string" ? v.cmd : "" };
+        }
+      }
+    } catch {}
+  });
+
+  function saveAfterAction() {
+    try { localStorage.setItem("shidrive.afterAction", JSON.stringify(afterAction)); } catch {}
+    if (afterAction.kind === "shutdown") toast("warn", t("回合结束后将安排关机（30 秒缓冲，cmd 执行 shutdown /a 可取消）"));
+    else if (afterAction.kind === "command" && !afterAction.cmd.trim()) toast("warn", t("请填写要执行的 cmd 命令"));
   }
 
   // ---------- 输入框右键粘贴 ----------
@@ -727,7 +856,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   </div>
 
   <div class="msgs-row">
-    <ChatTimeline {items} onJump={(id) => document.getElementById("msg-" + id)?.scrollIntoView({ behavior: "smooth", block: "start" })} />
+    <ChatTimeline {items} onJump={(id) => void scrollToItem(id, "start")} />
     <div class="msgs" bind:this={listEl} onscroll={onScroll}>
       <div class="msgs-inner" bind:this={msgsInnerEl}>
     {#if loadingHere && items.length === 0}
@@ -746,14 +875,23 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
           {/if}
         </div>
       {/if}
-      {#if hiddenCount > 0}
-        <button class="load-older" onclick={() => loadOlder()}>{t("加载更早的 {count} 条消息", { count: Math.min(CHUNK, hiddenCount) })}</button>
+      {#if topPad > 0}
+        <div class="win-pad" style="height:{topPad}px"></div>
+      {/if}
+      {#if olderCount > 0}
+        <button class="load-older" onclick={() => loadOlder()}>{t("加载更早的 {count} 条消息", { count: Math.min(CHUNK, olderCount) })}</button>
       {/if}
       {#each shownItems as item (item.id)}
         <div id={"msg-" + item.id}>
           <MessageItem {item} />
         </div>
       {/each}
+      {#if newerHidden > 0}
+        <button class="load-older" onclick={() => { endIdx = Math.min(items.length, endIdx + CHUNK); if (endIdx - startIdx > MAX_RENDER) startIdx = endIdx - MAX_RENDER; }}>{t("加载更新的 {count} 条消息", { count: Math.min(CHUNK, newerHidden) })}</button>
+      {/if}
+      {#if botPad > 0}
+        <div class="win-pad" style="height:{botPad}px"></div>
+      {/if}
       {#if loadingHere}
         <div class="syncing"><span class="chat-spinner sm"></span> {t("正在同步最新历史…")}</div>
       {/if}
@@ -788,9 +926,25 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     </div>
   {/if}
 
-  {#if cfgItems.length}
-      <div class="cfg-bar">
-        {#each cfgItems as c (c.id)}
+  <div class="cfg-bar">
+      <label class="cfg">
+        <span class="cfg-label" title={t("回合结束（完成/中断）后自动执行")}>⚙ {t("执行后动作")}</span>
+        <select class="cfg-select" value={afterAction.kind} onchange={(e) => { afterAction.kind = (e.target as HTMLSelectElement).value as AfterActionKind; saveAfterAction(); }}>
+          <option value="sound">{t("声音提示")}</option>
+          <option value="shutdown">{t("关机")}</option>
+          <option value="command">{t("执行命令")}</option>
+        </select>
+      </label>
+      {#if afterAction.kind === "command"}
+        <input
+          class="cfg-cmd"
+          placeholder={t("回合结束后执行的 cmd 命令，如 build.bat")}
+          bind:value={afterAction.cmd}
+          onchange={saveAfterAction}
+          onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); saveAfterAction(); } }}
+        />
+      {/if}
+      {#each cfgItems as c (c.id)}
           <label class="cfg">
             <span class="cfg-label">{c.label}</span>
             <select class="cfg-select" value={c.value} onchange={(e) => setCfg(c.id, (e.target as HTMLSelectElement).value)}>
@@ -801,7 +955,6 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
           </label>
         {/each}
       </div>
-    {/if}
     <div class="grow-handle" title={t("拖拽调整输入框高度")} onpointerdown={startResize}><span></span></div>
     <div class="input-row">
     <textarea
@@ -948,6 +1101,12 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       transform: rotate(360deg);
     }
   }
+  .win-pad { flex: none; }
+  /* 离屏消息跳过排版与绘制（contain-intrinsic-size 撑住滚动条），长会话不卡 */
+  .msgs-inner > div[id^="msg-"] {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 120px;
+  }
   .chat-search {
     display: flex;
     align-items: center;
@@ -975,6 +1134,18 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     100% {
       background: transparent;
     }
+  }
+  .cfg-cmd {
+    min-width: 220px;
+    max-width: 380px;
+    height: 26px;
+    border: 1px solid var(--border-soft);
+    border-radius: 6px;
+    background: var(--bg-panel);
+    color: var(--text);
+    padding: 0 8px;
+    font-family: var(--mono);
+    font-size: 0.82em;
   }
   .cfg-bar {
     display: flex;

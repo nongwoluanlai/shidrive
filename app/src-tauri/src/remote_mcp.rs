@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::db::Db;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RemoteGrant {
@@ -306,16 +306,66 @@ pub struct RemoteStatus {
     pub grants_active: i64,
     pub tunnel_running: bool,
     pub logs: Vec<String>,
+    /// 定时停止剩余秒数（-1 = 未启用）
+    pub timer_stop_in_secs: i64,
 }
 
 #[derive(Default)]
 pub struct RemoteManager {
     pub runtime: RwLock<Option<Arc<RemoteRuntime>>>,
+    /// 定时停止时间点（Some = 已启用）；到点由守卫线程核对后停止服务
+    pub timer_stop_at: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl RemoteManager {
     pub fn new() -> Self {
-        Self { runtime: RwLock::new(None) }
+        Self { runtime: RwLock::new(None), timer_stop_at: Arc::new(Mutex::new(None)) }
+    }
+
+    /// 启用/重置定时停止（hours<=0 取消）。守卫线程到点核对时间戳未被改动后才停止，
+    /// 手动停止/重新计时会使旧守卫失效（时间戳比对）。
+    pub fn arm_timer(app: &tauri::AppHandle, hours: f64) {
+        let m = app.state::<RemoteManager>();
+        if hours <= 0.0 {
+            *m.timer_stop_at.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            if let Some(rt) = m.runtime.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                Self::log_into(&rt.logs, "定时停止已取消".into());
+            }
+            return;
+        }
+        let hours = hours.clamp(0.05, 24.0 * 7.0);
+        let target = std::time::Instant::now() + std::time::Duration::from_secs((hours * 3600.0) as u64);
+        *m.timer_stop_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(target);
+        if let Some(rt) = m.runtime.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            Self::log_into(&rt.logs, format!("定时停止已启用：{hours} 小时后自动停止服务"));
+        }
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            let now = std::time::Instant::now();
+            if target > now {
+                std::thread::sleep(target - now);
+            }
+            let m = app2.state::<RemoteManager>();
+            let cur = *m.timer_stop_at.lock().unwrap_or_else(|p| p.into_inner());
+            if cur != Some(target) {
+                return; // 已被手动停止/重新计时接管
+            }
+            *m.timer_stop_at.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            if let Some(rt) = m.runtime.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                Self::log_into(&rt.logs, "定时停止触发：正在停止服务".into());
+            }
+            m.stop();
+            let _ = app2.emit("remote://timer-stop", serde_json::json!({ "hours": hours }));
+        });
+    }
+
+    /// 读取配置的定时小时数（remote.auto_stop_hours，缺省 6.0；0 = 禁用）
+    pub fn configured_hours(db: &Db) -> f64 {
+        db.get_setting("remote.auto_stop_hours")
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(6.0)
     }
 
     fn log_into(logs: &Arc<Mutex<VecDeque<String>>>, line: String) {
@@ -344,6 +394,12 @@ impl RemoteManager {
                 grants_active,
                 tunnel_running: rt.cloudflared_pid.lock().map(|c| c.is_some()).unwrap_or(false),
                 logs: rt.logs.lock().map(|l| l.iter().cloned().collect()).unwrap_or_default(),
+                timer_stop_in_secs: self
+                    .timer_stop_at
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .map(|t| t.saturating_duration_since(std::time::Instant::now()).as_secs() as i64)
+                    .unwrap_or(-1),
             },
             None => RemoteStatus {
                 running: false,
@@ -353,6 +409,7 @@ impl RemoteManager {
                 grants_active,
                 tunnel_running: false,
                 logs: Vec::new(),
+                timer_stop_in_secs: -1,
             },
         }
     }
@@ -366,6 +423,7 @@ impl RemoteManager {
         listen_host: &str,
         port: u16,
         quick_tunnel: bool,
+        oauth: Arc<crate::remote_oauth::OAuthState>,
     ) -> Result<(), String> {
         {
             let guard = self.runtime.read().unwrap_or_else(|p| p.into_inner());
@@ -405,6 +463,13 @@ impl RemoteManager {
                 _ => {}
             }
         }
+        // 定时停止：每次启动服务按配置重新计时（remote.auto_stop_hours，默认 6 小时，0 = 禁用）
+        let auto_hours = Self::configured_hours(&db);
+        if auto_hours > 0.0 {
+            Self::arm_timer(&app, auto_hours);
+        } else {
+            *self.timer_stop_at.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
 
         // accept 循环线程：stop_flag 置位后以自身连接唤醒并退出
         let accept_logs = logs.clone();
@@ -412,6 +477,7 @@ impl RemoteManager {
         let accept_app = app.clone();
         let accept_db = db.clone();
         let accept_stop = stop_flag.clone();
+        let accept_oauth = oauth.clone();
         let handle = std::thread::spawn(move || {
             listener.set_nonblocking(true).ok();
             loop {
@@ -432,10 +498,11 @@ impl RemoteManager {
                         let app = accept_app.clone();
                         let db = accept_db.clone();
                         let logs = accept_logs.clone();
+                        let oauth = accept_oauth.clone();
                         OPEN_CONNS.fetch_add(1, Ordering::SeqCst);
                         std::thread::spawn(move || {
                             let _dec = ConnDec;
-                            if let Err(e) = handle_remote_http(stream, logs, state, app, db) {
+                            if let Err(e) = handle_remote_http(stream, logs, state, app, db, oauth) {
                                 log::warn!("[remote-mcp] conn: {e}");
                             }
                         });
@@ -514,6 +581,7 @@ impl RemoteManager {
     }
 
     pub fn stop(&self) {
+        *self.timer_stop_at.lock().unwrap_or_else(|p| p.into_inner()) = None; // 定时随停止作废
         let rt = self.runtime.write().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(rt) = rt {
             rt.tunnel_generation.fetch_add(1, Ordering::SeqCst); // 旧读线程静默退出
@@ -834,6 +902,7 @@ fn handle_remote_http(
     state: Arc<crate::mcp::McpState>,
     app: tauri::AppHandle,
     db: Arc<Db>,
+    oauth: Arc<crate::remote_oauth::OAuthState>,
 ) -> Result<(), String> {
     use std::io::{Read as _, Write as _};
     let mut buf: Vec<u8> = Vec::new();
@@ -886,6 +955,28 @@ fn handle_remote_http(
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (target.clone(), String::new()),
     };
+
+    // OAuth 2.1 / 发现端点：公开访问（无需 Bearer），由 remote_oauth 全权处理
+    match crate::remote_oauth::try_handle_http(
+        &method,
+        &path,
+        &query,
+        &mut stream,
+        &mut buf,
+        header_end,
+        content_length,
+        &db,
+        &app,
+        oauth.as_ref(),
+    ) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => {
+            let msg = serde_json::to_string(&e).unwrap_or_else(|_| "\"oauth_error\"".into());
+            return write_http(&mut stream, 400, "application/json", &format!("{{\"error\":{msg}}}"));
+        }
+    }
+
     let mut token: Option<String> = None;
     for line in head.lines() {
         let lower = line.to_ascii_lowercase();
@@ -903,24 +994,52 @@ fn handle_remote_http(
         }
     }
     let Some(token) = token else {
+        let origin = crate::remote_oauth::origin_from_head(&head);
         return write_http_h(
             &mut stream,
             401,
             "application/json",
             "{\"error\":\"需要凭据：Authorization: Bearer <token> 或 ?passcode=<token>\"}",
-            "WWW-Authenticate: Bearer\r\n",
+            &format!("WWW-Authenticate: Bearer resource_metadata=\"{origin}/.well-known/oauth-protected-resource\"\r\n"),
         );
     };
-    let hash = sha256_hex(&token);
-    let grants = grants_list(&db).map_err(|e| e.to_string())?;
-    let Some(grant) = grants.iter().find(|g| ct_eq(&g.token_hash, &hash) && g.revoked_at.is_none()) else {
-        return write_http(&mut stream, 401, "application/json", "{\"error\":\"凭据无效或已撤销\"}");
+    let grant: RemoteGrant = if token.starts_with("sdo1_") {
+        // OAuth 2.1 访问令牌：查令牌表并映射到内部授权行（同一套越界/工具裁剪/执行门禁）
+        match crate::remote_oauth::resolve_access_token(&db, &token) {
+            Ok(Some(g)) => g,
+            Ok(None) => {
+                let origin = crate::remote_oauth::origin_from_head(&head);
+                let hdr = format!(
+                    "WWW-Authenticate: Bearer error=\"invalid_token\", resource_metadata=\"{origin}/.well-known/oauth-protected-resource\"\r\n"
+                );
+                return write_http_h(
+                    &mut stream,
+                    401,
+                    "application/json",
+                    "{\"error\":\"invalid_token：令牌无效或已过期（客户端应使用 refresh_token 刷新）\"}",
+                    &hdr,
+                );
+            }
+            Err(e) => {
+                let msg = serde_json::to_string(&e).unwrap_or_default();
+                return write_http(&mut stream, 500, "application/json", &format!("{{\"error\":{msg}}}"));
+            }
+        }
+    } else {
+        let hash = sha256_hex(&token);
+        let grants = grants_list(&db).map_err(|e| e.to_string())?;
+        match grants.iter().find(|g| ct_eq(&g.token_hash, &hash) && g.revoked_at.is_none()) {
+            Some(g) => {
+                grant_touch(&db, &g.id);
+                g.clone()
+            }
+            None => return write_http(&mut stream, 401, "application/json", "{\"error\":\"凭据无效或已撤销\"}"),
+        }
     };
     // 暂停开放：凭据本身有效但该授权已暂停，明确 403 提示去恢复
     if grant.paused_at.is_some() {
         return write_http(&mut stream, 403, "application/json", "{\"error\":\"此授权已暂停开放：请在使驾设置中「继续开放」（凭据将刷新）\"}");
     }
-    grant_touch(&db, &grant.id);
 
     // 鉴权通过后再读 body
     while buf.len() < header_end + content_length {
@@ -958,7 +1077,7 @@ fn handle_remote_http(
             "notifications/initialized" | "notifications/cancelled" => serde_json::Value::Null,
             "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
             "tools/list" => {
-                let tools = scoped_tools(grant);
+                let tools = scoped_tools(&grant);
                 serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools } })
             }
             "tools/call" => {
@@ -985,7 +1104,11 @@ fn handle_remote_http(
                         return write_http(&mut stream, 403, "application/json", "{\"error\":\"命令执行未授权\"}");
                     }
                 }
-                if name.starts_with("pc.fs.write") && !grant.fs_write {
+                const FS_WRITE_TOOLS: &[&str] = &[
+                    "pc.fs.write", "pc.fs.writeBatch", "pc.fs.mkdir",
+                    "pc.fs.move", "pc.fs.copy", "pc.fs.delete",
+                ];
+                if FS_WRITE_TOOLS.contains(&name.as_str()) && !grant.fs_write {
                     return write_http(&mut stream, 403, "application/json", "{\"error\":\"文件写入未授权（只读）\"}");
                 }
                 let result = if name.starts_with("context_") {
@@ -1031,21 +1154,40 @@ fn handle_remote_http(
 
 fn scoped_tools(grant: &RemoteGrant) -> serde_json::Value {
     let mut tools = vec![
-        serde_json::json!({ "name": "pc.fs.read", "description": "按行读取文本文件", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"}, "offset": {"type":"integer"}, "limit": {"type":"integer"} } } }),
-        serde_json::json!({ "name": "pc.fs.list", "description": "列出目录", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"} } } }),
-        serde_json::json!({ "name": "pc.fs.search", "description": "文本搜索", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"}, "query": {"type":"string"} } } }),
+        serde_json::json!({ "name": "pc.fs.read", "description": "按行读取文本文件（1 起始行号；自动处理 UTF-8/UTF-16 BOM）", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"}, "offset": {"type":"integer","description":"起始行，默认 1"}, "limit": {"type":"integer","description":"行数，默认 2000"} }, "required": ["path"] } }),
+        serde_json::json!({ "name": "pc.fs.list", "description": "列出目录（分页；含 size 与 mtime epoch 秒）", "inputSchema": { "type": "object", "properties": { "path": {"type":"string","description":"默认 ."}, "offset": {"type":"integer"}, "limit": {"type":"integer","description":"默认 200"} } } }),
+        serde_json::json!({ "name": "pc.fs.search", "description": "字面文本搜索。path 可为目录或单个文件；自动解码 UTF-8/UTF-16 BOM；跳过原因见返回的 skipped 数组", "inputSchema": { "type": "object", "properties": { "query": {"type":"string"}, "path": {"type":"string","description":"目录或文件，默认 ."}, "glob": {"type":"string","description":"文件名通配，默认 *"}, "ignore_case": {"type":"boolean","description":"默认 false"}, "max_results": {"type":"integer","description":"默认 100"} }, "required": ["query"] } }),
+        serde_json::json!({ "name": "pc.fs.exists", "description": "检查文件/目录是否存在（返回 exists/is_dir/size）", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"} }, "required": ["path"] } }),
     ];
     if grant.fs_write {
-        tools.push(serde_json::json!({ "name": "pc.fs.write", "description": "写入文本文件（原子替换）", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"}, "content": {"type":"string"} }, "required": ["path","content"] } }));
-        tools.push(serde_json::json!({ "name": "pc.fs.mkdir", "description": "创建目录", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"} } } }));
+        tools.push(serde_json::json!({ "name": "pc.fs.write", "description": "写入文件（原子替换）。encoding=text（默认）或 base64（PNG 等二进制资源直接解码写入）", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"}, "content": {"type":"string","description":"文本内容，或 encoding=base64 时的 base64 字符串"}, "encoding": {"type":"string","enum":["text","base64"],"description":"默认 text"} }, "required": ["path","content"] } }));
+        tools.push(serde_json::json!({ "name": "pc.fs.writeBatch", "description": "批量写入多个文件（单次最多 50），减少网络往返", "inputSchema": { "type": "object", "properties": { "items": {"type":"array","maxItems":50,"items":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"encoding":{"type":"string","enum":["text","base64"]}},"required":["path","content"]}} }, "required": ["items"] } }));
+        tools.push(serde_json::json!({ "name": "pc.fs.mkdir", "description": "递归创建目录", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"} }, "required": ["path"] } }));
+        tools.push(serde_json::json!({ "name": "pc.fs.move", "description": "移动/重命名（同盘符；dst 为已存在目录时移入其中）", "inputSchema": { "type": "object", "properties": { "src": {"type":"string"}, "dst": {"type":"string"} }, "required": ["src","dst"] } }));
+        tools.push(serde_json::json!({ "name": "pc.fs.copy", "description": "复制文件或目录（目录递归；符号链接跳过）", "inputSchema": { "type": "object", "properties": { "src": {"type":"string"}, "dst": {"type":"string"} }, "required": ["src","dst"] } }));
+        tools.push(serde_json::json!({ "name": "pc.fs.delete", "description": "删除文件或目录（目录必须 recursive=true；不可恢复，谨慎使用）", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"}, "recursive": {"type":"boolean","description":"目录递归删除，默认 false"} }, "required": ["path"] } }));
     }
     if grant.exec_allowed {
-        tools.push(serde_json::json!({ "name": "pc.process.exec", "description": "执行命令（需同时开启全局允许执行）", "inputSchema": { "type": "object", "properties": { "command": {"type":"string"}, "timeout": {"type":"integer"} }, "required": ["command"] } }));
+        tools.push(serde_json::json!({ "name": "pc.process.exec", "description": "执行命令（需同时开启全局允许执行）。多行脚本用 stdin 传给解释器（如 command=python + stdin=脚本），避免命令行转义", "inputSchema": { "type": "object", "properties": { "command": {"type":"string","description":"单行命令；解释器脚本内容请放 stdin"}, "stdin": {"type":"string","description":"可选：写入子进程标准输入的内容（多行脚本）"}, "workdir": {"type":"string","description":"工作目录，默认授权根目录；cwd 为其别名"}, "cwd": {"type":"string","description":"同 workdir"}, "timeout": {"type":"integer","description":"秒，默认 30"}, "max_output_chars": {"type":"integer","description":"默认 32000"} }, "required": ["command"] } }));
     }
     if grant.context_enabled {
-        for name in ["context_get", "context_get_version", "context_update", "context_history", "context_search"] {
-            tools.push(serde_json::json!({ "name": name, "description": "共享上下文工具（绑定授权上下文）" }));
-        }
+        // context_id 由服务端按授权绑定并强制覆盖，无需（也无法）由远端指定
+        tools.push(serde_json::json!({ "name": "context_get", "description": "读取共享上下文完整内容（概述/待办/进展/注意/约束 + 当前版本号 version）", "inputSchema": { "type": "object", "properties": {} } }));
+        tools.push(serde_json::json!({ "name": "context_get_version", "description": "轻量查询当前版本号与最近一次提交摘要", "inputSchema": { "type": "object", "properties": {} } }));
+        tools.push(serde_json::json!({ "name": "context_update", "description": "提交一轮共享上下文更新（git 式）。base_version 不匹配会被拒绝并提示重新读取合并", "inputSchema": { "type": "object", "properties": {
+            "base_version": {"type":"integer","description":"必填：你读取内容时的版本号"},
+            "summary": {"type":"string","description":"必填：本次提交摘要（做了哪些工作）"},
+            "files": {"type":"array","items":{"type":"string"},"description":"本次改动的核心文件路径"},
+            "updates": {"type":"object","description":"要替换的章节（只传改动过的）","properties":{
+                "overview": {"type":"string"},
+                "todos": {"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","enum":["open","done"]}},"required":["content"]}},
+                "progress": {"type":"array","items":{"type":"object","properties":{"content":{"type":"string"}},"required":["content"]}},
+                "notes": {"type":"array","items":{"type":"object","properties":{"content":{"type":"string"}},"required":["content"]}},
+                "constraints": {"type":"string"}
+            }}
+        }, "required": ["base_version","summary"] } }));
+        tools.push(serde_json::json!({ "name": "context_history", "description": "浏览提交历史（最新在前）", "inputSchema": { "type": "object", "properties": { "limit": {"type":"integer","description":"默认 20"} } } }));
+        tools.push(serde_json::json!({ "name": "context_search", "description": "按关键词搜索历史提交的摘要/涉及文件/内容", "inputSchema": { "type": "object", "properties": { "query": {"type":"string"}, "limit": {"type":"integer"} }, "required": ["query"] } }));
     }
     serde_json::Value::Array(tools)
 }
@@ -1095,12 +1237,12 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-fn write_http(stream: &mut std::net::TcpStream, status: u16, ctype: &str, body: &str) -> Result<(), String> {
+pub(crate) fn write_http(stream: &mut std::net::TcpStream, status: u16, ctype: &str, body: &str) -> Result<(), String> {
     write_http_h(stream, status, ctype, body, "")
 }
 
 /// extra_headers：附加响应头，每行自带 \r\n（可为空）。
-fn write_http_h(stream: &mut std::net::TcpStream, status: u16, ctype: &str, body: &str, extra_headers: &str) -> Result<(), String> {
+pub(crate) fn write_http_h(stream: &mut std::net::TcpStream, status: u16, ctype: &str, body: &str, extra_headers: &str) -> Result<(), String> {
     let mut head = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nAccess-Control-Allow-Origin: *\r\n",
         reason(status)

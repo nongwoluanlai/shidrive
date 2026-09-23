@@ -1,8 +1,39 @@
 // Wire backend events to global state. Called once from App.svelte on mount.
 import { listen } from "@tauri-apps/api/event";
 import { app, applySessionUpdate, toast, chatKey } from "./state.svelte";
-import type { AgentType, PermissionRequest, SessionReadyInfo } from "./types";
+import type { AgentType, ElicitationRequest, PermissionRequest, SessionReadyInfo } from "./types";
 import { api } from "./ipc";
+
+// ---------- 执行后动作（回合结束后触发；配置存 localStorage，聊天页配置栏可改） ----------
+export interface AfterActionCfg {
+  kind: "sound" | "shutdown" | "command";
+  cmd: string;
+}
+
+export function loadAfterAction(): AfterActionCfg {
+  try {
+    const raw = localStorage.getItem("shidrive.afterAction");
+    if (raw) {
+      const v = JSON.parse(raw) as AfterActionCfg;
+      if (v && (v.kind === "sound" || v.kind === "shutdown" || v.kind === "command")) {
+        return { kind: v.kind, cmd: typeof v.cmd === "string" ? v.cmd : "" };
+      }
+    }
+  } catch {}
+  return { kind: "sound", cmd: "" };
+}
+
+function fireAfterAction() {
+  const cfg = loadAfterAction();
+  if (cfg.kind === "sound") {
+    void api.systemAfterAction("sound", "").catch(() => {});
+  } else if (cfg.kind === "shutdown") {
+    void api.systemAfterAction("shutdown", "").catch(() => {});
+    import("./state.svelte").then(({ toast }) => toast("warn", "回合已结束：已安排 30 秒后关机（cmd 执行 shutdown /a 可取消）"));
+  } else if (cfg.kind === "command" && cfg.cmd.trim()) {
+    void api.systemAfterAction("command", cfg.cmd).catch(() => {});
+  }
+}
 
 export async function wireEvents() {
   await listen<{
@@ -30,6 +61,10 @@ export async function wireEvents() {
 
   await listen<PermissionRequest>("acp://permission", (e) => {
     app.permissions.push(e.payload);
+  });
+
+  await listen<ElicitationRequest>("acp://elicitation", (e) => {
+    app.elicitations.push(e.payload);
   });
 
   await listen<SessionReadyInfo>("acp://session-ready", (e) => {
@@ -66,6 +101,7 @@ export async function wireEvents() {
   await listen<{ contextId: string; agentType: string; status: string }>("acp://binding-status", (e) => {
     if (e.payload.status === "completed" || e.payload.status === "interrupted") {
       app.treeRev++;
+      fireAfterAction();
     }
   });
 

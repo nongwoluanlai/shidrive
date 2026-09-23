@@ -16,10 +16,14 @@ use crate::models::AgentLaunch;
 pub const EVT_UPDATE: &str = "acp://update";
 pub const EVT_STATUS: &str = "acp://status";
 pub const EVT_PERMISSION: &str = "acp://permission";
+/// ACP unstable elicitation：agent 请求用户输入（选项/自由文本），ACP 规范尚未转正，
+/// 适配器侧以 MCP elicitation 形状桥接（message + requestedSchema → {action, content}）
+pub const EVT_ELICIT: &str = "acp://elicitation";
 
 type PendingMap = Arc<Mutex<HashMap<Value, tokio::sync::oneshot::Sender<Result<Value, String>>>>>;
 /// permission_key ("{agent_type}:{rpc_id}") -> resolver delivering the chosen option id
 type PermissionMap = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Value>>>>;
+/// elicitation_key -> resolver delivering {action: accept|decline|cancel, content?}
 
 /// Match adapter and preflight environment, including PATH prefix semantics.
 pub(crate) fn apply_launch_env(cmd: &mut tokio::process::Command, env: &std::collections::BTreeMap<String, String>) {
@@ -66,6 +70,7 @@ pub struct AcpConnection {
     next_id: AtomicI64,
     pending: PendingMap,
     permissions: PermissionMap,
+    elicitations: PermissionMap,
     buffers: Arc<Mutex<HashMap<String, TurnBuffer>>>,
     /// sessions currently being loaded (replay updates are discarded)
     loading: Arc<Mutex<HashSet<String>>>,
@@ -145,6 +150,7 @@ impl AcpConnection {
             next_id: AtomicI64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permissions: Arc::new(Mutex::new(HashMap::new())),
+            elicitations: Arc::new(Mutex::new(HashMap::new())),
             buffers: Arc::new(Mutex::new(HashMap::new())),
             loading: Arc::new(Mutex::new(HashSet::new())),
             loaded: Arc::new(Mutex::new(HashSet::new())),
@@ -332,6 +338,35 @@ impl AcpConnection {
                     let outcome = rx.await.unwrap_or_else(|_| json!({ "outcome": "cancelled" }));
                     if conn.is_alive() {
                         conn.respond(id, Ok(json!({ "outcome": outcome })));
+                    }
+                });
+            }
+            // ACP unstable elicitation（含常见别名）：agent 向用户请求结构化输入。
+            // 与 request_permission 同构：事件到 UI，oneshot 等待用户作答；
+            // 应答整体为 { action: "accept"|"decline"|"cancel", content?: {...} }，原样回给适配器。
+            "elicitation/create" | "session/elicitation/create" | "elicitation/request" => {
+                let session_id = params.get("sessionId").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+                let key = format!("{}:{}:{id}", self.agent_type, uuid::Uuid::new_v4());
+                let (tx, rx) = tokio::sync::oneshot::channel::<Value>();
+                {
+                    let mut m = self.elicitations.lock().unwrap();
+                    if !self.is_alive() { return; }
+                    m.insert(key.clone(), tx);
+                }
+                let _ = self.app.emit(
+                    EVT_ELICIT,
+                    json!({
+                        "requestId": key,
+                        "agentType": self.agent_type,
+                        "sessionId": session_id,
+                        "params": params,
+                    }),
+                );
+                let conn = self.clone();
+                tokio::spawn(async move {
+                    let outcome = rx.await.unwrap_or_else(|_| json!({ "action": "cancel" }));
+                    if conn.is_alive() {
+                        conn.respond(id, Ok(outcome));
                     }
                 });
             }
@@ -683,6 +718,15 @@ impl AcpConnection {
                 .map_err(|_| "权限请求已失效".to_string())
         } else {
             Err("权限请求已失效".into())
+        }
+    }
+
+    /// Deliver the user's elicitation answer to the pending server request.
+    pub fn resolve_elicitation(&self, request_id: &str, response: Value) -> Result<(), String> {
+        if let Some(tx) = self.elicitations.lock().unwrap().remove(request_id) {
+            tx.send(response).map_err(|_| "输入请求已失效".to_string())
+        } else {
+            Err("输入请求已失效".into())
         }
     }
 

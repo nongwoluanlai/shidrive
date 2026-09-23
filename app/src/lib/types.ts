@@ -299,6 +299,13 @@ export interface PermissionRequest {
   };
 }
 
+export interface ElicitationRequest {
+  requestId: string;
+  agentType: AgentType;
+  sessionId: string;
+  params: Record<string, unknown>;
+}
+
 export interface SessionModes {
   currentModeId: string;
   availableModes: { id: string; name: string; description?: string }[];

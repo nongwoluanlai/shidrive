@@ -11,6 +11,7 @@ mod mcp;
 mod manager;
 mod models;
 mod remote_mcp;
+mod remote_oauth;
 mod node_rt;
 mod setup;
 mod skins;
@@ -159,6 +160,7 @@ fn main() {
             app.manage(agents);
             app.manage(engine);
             app.manage(crate::remote_mcp::RemoteManager::new());
+            app.manage(std::sync::Arc::new(crate::remote_oauth::OAuthState::new()));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -193,6 +195,7 @@ fn main() {
             commands::acp_set_mode,
             commands::acp_set_config_option,
             commands::acp_respond_permission,
+            commands::acp_respond_elicitation,
             commands::acp_sessions_list,
             commands::acp_session_bind,
             commands::bindings_all,
@@ -240,6 +243,11 @@ fn main() {
             commands::remote_grant_token,
             commands::remote_grant_pause,
             commands::remote_grant_resume,
+            commands::remote_timer_set,
+            commands::system_after_action,
+            commands::remote_oauth_decide,
+            commands::remote_oauth_tokens_list,
+            commands::remote_oauth_token_revoke,
             commands::remote_cloudflared_install,
             commands::remote_cloudflared_status,
             commands::remote_cloudflared_set_path,

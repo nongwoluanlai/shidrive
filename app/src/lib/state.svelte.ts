@@ -3,6 +3,7 @@ import type {
   AgentType,
   TranscriptRow,
   Context,
+  ElicitationRequest,
   PermissionRequest,
   Project,
   Prompt,
@@ -66,6 +67,8 @@ export const app = $state({
   historyBind: null as AgentType | null,
   toasts: [] as Toast[],
   permissions: [] as PermissionRequest[],
+  /** ACP elicitation：agent 请求用户输入（选项/自由文本） */
+  elicitations: [] as ElicitationRequest[],
   sessionInfo: {} as Record<string, SessionReadyInfo>,
   /** ctxId:agent -> bound session id (kept in sync by acp://session-ready) */
   bindingSession: {} as Record<string, string | null>,

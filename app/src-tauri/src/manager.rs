@@ -647,6 +647,16 @@ impl AgentManager {
         }
     }
 
+    pub async fn respond_elicitation(&self, request_id: &str, response: Value) -> Result<(), String> {
+        let agent_type = request_id.split(':').next().unwrap_or_default().to_string();
+        let conns = self.conns.read().await;
+        if let Some(conn) = conns.get(&agent_type) {
+            conn.resolve_elicitation(request_id, response)
+        } else {
+            Err("适配器未连接，无法应答输入请求".into())
+        }
+    }
+
     /// Capabilities payload for the UI after a resume. Load responses carry
     /// models/modes but we may skip the load when the session is already live —
     /// in that case reuse whatever the UI already has (frontend merges).

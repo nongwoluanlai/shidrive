@@ -15,6 +15,7 @@
     grants_active: number;
     tunnel_running: boolean;
     logs: string[];
+    timer_stop_in_secs: number;
   }
   interface RemoteGrant {
     id: string;
@@ -49,6 +50,17 @@
   let addFsWrite = $state(false);
   let addExec = $state(false);
   let logOpen = $state(false);
+  // 定时停止：小时数（配置）+ 本地每秒倒计时（3s 轮询之外保持显示活性）
+  let timerHours = $state(6);
+  let timerTick = $state(0);
+  // OAuth 2.1：待裁决的授权请求 + 已签发令牌
+  interface OAuthPending {
+    txnId: string; clientId: string; clientName: string; redirectUri: string; scopes: string[];
+    projectId: string; projectName: string; projectRoot: string; contexts: Context[]; contextId: string;
+    fsWrite: boolean; execAllowed: boolean;
+  }
+  let oauthPending = $state<OAuthPending[]>([]);
+  let oauthTokens = $state<any[]>([]);
   let cf = $state<{ installed: boolean; path: string; version: string } | null>(null);
   let cfBusy = $state(false);
 
@@ -57,11 +69,17 @@
 
   async function refresh() {
     status = await api.remoteMcpStatus().catch(() => null);
+    timerTick = 0;
     try {
       grants = (await api.remoteGrantsList()) as unknown as RemoteGrant[];
     } catch {
       grants = [];
     }
+    void refreshOauthTokens();
+  }
+
+  async function refreshOauthTokens() {
+    oauthTokens = ((await api.remoteOauthTokensList().catch(() => [])) as any[]) ?? [];
   }
 
   async function refreshCf() {
@@ -74,6 +92,14 @@
     void api.settingsGet("remote.exposure")
       .then((v) => { if (v === "custom" || v === "quick_tunnel") exposure = v; })
       .catch(() => {});
+    void api.settingsGet("remote.auto_stop_hours")
+      .then((v) => { const n = Number(v); if (Number.isFinite(n) && n > 0) timerHours = n; })
+      .catch(() => {});
+    const unTimer = listen("remote://timer-stop", () => {
+      toast("warn", t("定时停止已触发，外部编程服务已停止"));
+      void refresh();
+    });
+    const tId = setInterval(() => (timerTick += 1), 1000);
     void api.settingsGet("remote.exec_allowed")
       .then((v) => { globalExec = v === "1"; })
       .catch(() => {});
@@ -88,8 +114,80 @@
       if (d.publicUrl) { void refresh(); toast("ok", t("隧道地址已获取")); }
       else if (d.error) { toast("error", t("隧道地址获取失败，请查看运行日志")); void refresh(); }
     });
-    return () => { void un.then((f) => f()); };
+    const unOauth = listen("remote://oauth-consent", (e) => {
+      const d = (e.payload ?? {}) as any;
+      const scopes: string[] = Array.isArray(d.scopes) ? d.scopes : ["fs:read"];
+      const proj = projects[0];
+      const card: OAuthPending = {
+        txnId: d.txnId ?? "", clientId: d.clientId ?? "", clientName: d.clientName ?? "client",
+        redirectUri: d.redirectUri ?? "", scopes,
+        projectId: proj?.id ?? "", projectName: proj?.name ?? "", projectRoot: proj?.root_path ?? "",
+        contexts: [], contextId: "",
+        fsWrite: scopes.includes("fs:write"),
+        execAllowed: scopes.includes("exec"),
+      };
+      oauthPending = [...oauthPending, card];
+      if (proj) void onConsentProjectChange(card, proj.id);
+      toast("info", t("收到 OAuth 授权请求，请在本页处理"));
+    });
+    return () => {
+      void un.then((f) => f());
+      void unOauth.then((f) => f());
+      void unTimer.then((f) => f());
+      clearInterval(tId);
+    };
   });
+
+  // OAuth 授权卡片：切换项目 → 载入该项目上下文
+  async function onConsentProjectChange(card: OAuthPending, id: string) {
+    const proj = app.projects.find((x) => x.id === id);
+    card.projectId = id;
+    card.projectName = proj?.name ?? "";
+    card.projectRoot = proj?.root_path ?? "";
+    card.contexts = id ? await api.contextsList(id).catch(() => []) : [];
+    if (!card.contexts.some((c) => c.id === card.contextId)) card.contextId = "";
+  }
+
+  // OAuth 批准/拒绝：批准时按（可缩减的）scope 创建内部授权行并签发授权码
+  async function consentDecide(card: OAuthPending, approve: boolean) {
+    try {
+      const ctx = card.contexts.find((c) => c.id === card.contextId) ?? null;
+      await api.remoteOauthDecide({
+        txnId: card.txnId, approve,
+        projectId: card.projectId, projectName: card.projectName, projectRoot: card.projectRoot,
+        contextId: ctx?.id ?? null, contextName: ctx?.name ?? "",
+        fsWrite: card.fsWrite, execAllowed: card.execAllowed,
+      });
+      oauthPending = oauthPending.filter((x) => x.txnId !== card.txnId);
+      toast("ok", approve ? t("已批准并签发授权码，客户端页面将自动跳转") : t("已拒绝该授权请求"));
+      if (approve) void refreshOauthTokens();
+    } catch (err) {
+      toast("error", String(err));
+    }
+  }
+
+  async function oauthRevoke(id: string) {
+    try {
+      await api.remoteOauthTokenRevoke(id);
+      await refreshOauthTokens();
+      toast("ok", t("OAuth 令牌已吊销"));
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
+  function copyOauthMeta() {
+    const meta = {
+      resource: `${publicUrl}/mcp`,
+      authorization_servers: [publicUrl],
+      authorization_endpoint: `${publicUrl}/authorize`,
+      token_endpoint: `${publicUrl}/token`,
+      registration_endpoint: `${publicUrl}/register`,
+      scopes_supported: ["fs:read", "fs:write", "exec", "context"],
+      code_challenge_methods_supported: ["S256"],
+    };
+    void copyText(JSON.stringify(meta, null, 2), t("元数据 JSON 已复制"));
+  }
 
   // 切换接入方式：记住选择；服务运行中即时起/停隧道
   async function onExposureChange(v: "custom" | "quick_tunnel") {
@@ -198,6 +296,30 @@
     } finally {
       busy = false;
     }
+  }
+
+  // 定时停止：>0 设置并重新计时（持久化配置，下次启动沿用）；0 取消
+  async function applyTimer(hours: number) {
+    const h = Number(hours);
+    if (!Number.isFinite(h) || h < 0) {
+      toast("warn", t("请输入有效的小时数（0 为取消定时）"));
+      return;
+    }
+    try {
+      await api.remoteTimerSet(h);
+      await refresh();
+      toast("ok", hours > 0 ? t("定时停止已设置：{h} 小时后自动停止", { h: String(hours) }) : t("定时停止已取消"));
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
+  function fmtDur(totalSecs: number): string {
+    const secs = Math.max(0, totalSecs - Math.min(timerTick, totalSecs));
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const ss = secs % 60;
+    return `${h}:${String(m).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
   }
 
   async function stopService() {
@@ -361,6 +483,26 @@
     {/if}
   </div>
 
+  <div class="row timer-row">
+    <span class="lbl">⏱ {t("定时停止")}</span>
+    <input
+      class="timer-hours"
+      type="number"
+      min="0.1"
+      step="0.5"
+      bind:value={timerHours}
+      title={t("单位：小时；服务每次启动后按此时间自动停止")}
+    />
+    <span class="lbl">{t("小时")}</span>
+    <button class="btn sm" disabled={!status?.running} title={status?.running ? "" : t("服务未启动")} onclick={() => void applyTimer(Number(timerHours))}>{t("设置并重新计时")}</button>
+    <button class="btn ghost sm" disabled={(status?.timer_stop_in_secs ?? -1) < 0} onclick={() => void applyTimer(0)}>{t("取消定时")}</button>
+    {#if (status?.timer_stop_in_secs ?? -1) >= 0}
+      <span class="mono timer-left" title={t("距离自动停止的剩余时间")}>{t("剩余 {t}", { t: fmtDur(status!.timer_stop_in_secs) })}</span>
+    {:else}
+      <span class="dim">{t("未启用（服务启动时默认按上方小时数自动计时）")}</span>
+    {/if}
+  </div>
+
   {#if lastToken}
     <div class="token-banner">
       <span class="warn-txt">⚠ {t("新授权 Token（仅此一次显示，请立即复制）")}：</span>
@@ -428,6 +570,89 @@
       />
       <span class="pend">{t("自定义穿透 / 反向代理时按需指定；修改后重启服务生效")}</span>
     </div>
+  </div>
+
+  <div class="sec">
+    <h3>{t("OAuth 授权（MCP 标准握手）")}</h3>
+    {#if publicUrl}
+      <div class="row"><span class="lbl oauth-lbl">{t("受保护资源元数据")}</span><code class="grow oauth-url">{publicUrl}/.well-known/oauth-protected-resource</code><button class="btn sm" onclick={() => void copyText(`${publicUrl}/.well-known/oauth-protected-resource`, t("已复制"))}>{t("复制")}</button></div>
+      <div class="row"><span class="lbl oauth-lbl">{t("客户端注册端点")}</span><code class="grow oauth-url">{publicUrl}/register</code><button class="btn sm" onclick={() => void copyText(`${publicUrl}/register`, t("已复制"))}>{t("复制")}</button></div>
+      <div class="row"><span class="lbl oauth-lbl">{t("授权端点")}</span><code class="grow oauth-url">{publicUrl}/authorize</code><button class="btn sm" onclick={() => void copyText(`${publicUrl}/authorize`, t("已复制"))}>{t("复制")}</button></div>
+      <div class="row"><span class="lbl oauth-lbl">{t("令牌端点")}</span><code class="grow oauth-url">{publicUrl}/token</code><button class="btn sm" onclick={() => void copyText(`${publicUrl}/token`, t("已复制"))}>{t("复制")}</button></div>
+      <div class="row">
+        <button class="btn sm" onclick={copyOauthMeta}>{t("复制元数据 JSON")}</button>
+        <span class="note grow">{t("Claude / ChatGPT 等 MCP 客户端收到 401 后会自动发现以上端点，一般无需手动填写；链接供需要手动配置的客户端使用。")}</span>
+      </div>
+    {:else}
+      <p class="note">{t("服务启动后，这里会基于当前接入地址生成可复制的 OAuth 端点链接。")}</p>
+    {/if}
+
+    {#each oauthPending as card (card.txnId)}
+      <div class="consent-card">
+        <div><b>{card.clientName}</b> <span class="dim mono">{card.clientId}</span></div>
+        <div class="dim mono">{t("回调地址")}：{card.redirectUri}</div>
+        <div class="dim">{t("请求权限")}：{card.scopes.join(" / ")}</div>
+        <div class="row">
+          <label class="lbl">{t("授权项目")}</label>
+          <select value={card.projectId} onchange={(e) => void onConsentProjectChange(card, e.currentTarget.value)}>
+            {#each projects as pj (pj.id)}
+              <option value={pj.id}>{pj.name} · {pj.root_path}</option>
+            {/each}
+          </select>
+          <label class="lbl">{t("共享上下文")}</label>
+          <select value={card.contextId} onchange={(e) => (card.contextId = e.currentTarget.value)}>
+            <option value="">{t("（不开放）")}</option>
+            {#each card.contexts as c (c.id)}
+              <option value={c.id}>{c.name}</option>
+            {/each}
+          </select>
+        </div>
+        <div class="row">
+          {#if card.scopes.includes("fs:write")}
+            <label class="check"><input type="checkbox" bind:checked={card.fsWrite} /> {t("文件读写")}</label>
+          {/if}
+          {#if card.scopes.includes("exec")}
+            <label class="check"><input type="checkbox" bind:checked={card.execAllowed} /> {t("允许命令执行")}</label>
+          {/if}
+          <span class="grow"></span>
+          <button class="btn sm primary" onclick={() => void consentDecide(card, true)}>{t("批准")}</button>
+          <button class="btn sm" onclick={() => void consentDecide(card, false)}>{t("拒绝")}</button>
+        </div>
+      </div>
+    {/each}
+
+    {#if oauthTokens.length}
+      <div class="tbl-wrap">
+        <table class="tbl">
+          <thead>
+            <tr><th>{t("客户端")}</th><th>{t("权限")}</th><th>{t("授权项目")}</th><th>{t("有效期")}</th><th>{t("最近使用")}</th><th>{t("操作")}</th></tr>
+          </thead>
+          <tbody>
+            {#each oauthTokens as tk (tk.id)}
+              <tr class:revoked={!!tk.revoked_at}>
+                <td><span class="mono">{tk.client_id}</span></td>
+                <td><span class="mono">{tk.scopes}</span></td>
+                <td>{tk.grant_name}</td>
+                <td>
+                  {#if tk.revoked_at}
+                    {t("已吊销")}
+                  {:else}
+                    {t("访问")} {tk.expires_in_secs > 0 ? `${Math.floor(tk.expires_in_secs / 60)}${t("分钟")}` : t("已过期")}
+                    · {t("刷新")} {Math.max(0, Math.floor(tk.refresh_expires_in_secs / 86400))}{t("天")}
+                  {/if}
+                </td>
+                <td>{tk.last_used_at ?? "—"}</td>
+                <td class="op">
+                  {#if !tk.revoked_at}
+                    <button class="btn ghost sm" onclick={() => void oauthRevoke(tk.id)}>{t("吊销")}</button>
+                  {/if}
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
   </div>
 
   <div class="sec">
@@ -548,6 +773,9 @@
   .badge { font-size: .82em; padding: 1px 8px; border-radius: 10px; }
   .badge.ok { background: rgba(52, 199, 123, .15); color: #2c9c63; }
   .badge.warn { background: rgba(240, 170, 40, .15); color: #b57e17; }
+  .timer-row { margin-top: -4px; }
+  .timer-hours { width: 5.5em; }
+  .timer-left { color: #2c9c63; font-variant-numeric: tabular-nums; }
   .token-banner {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
     border: 1px solid rgba(240, 170, 40, .4); background: rgba(240, 170, 40, .08);
@@ -555,4 +783,10 @@
   }
   .token-banner code { user-select: text; word-break: break-all; }
   .warn-txt { color: #b57e17; font-weight: 600; }
+  .oauth-lbl { min-width: 9em; }
+  .oauth-url { word-break: break-all; }
+  .consent-card {
+    border: 1px solid rgba(240, 170, 40, .4); background: rgba(240, 170, 40, .06);
+    border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 6px; margin-top: 8px; font-size: .9em;
+  }
 </style>

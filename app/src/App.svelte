@@ -16,6 +16,7 @@
   import SettingsModal from "./lib/components/SettingsModal.svelte";
   import Toasts from "./lib/components/Toasts.svelte";
   import PermissionDialog from "./lib/components/PermissionDialog.svelte";
+  import ElicitationDialog from "./lib/components/ElicitationDialog.svelte";
   import SessionManagerModal from "./lib/components/SessionManagerModal.svelte";
   import TasksPanel from "./lib/components/TasksPanel.svelte";
   import PromptsPanel from "./lib/components/PromptsPanel.svelte";
@@ -206,6 +207,7 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
 <PromptsPanel />
 <HistoryBindModal />
 <PermissionDialog />
+<ElicitationDialog />
 <Toasts />
 <DialogHost />
 <!-- 皮肤人物：顶层悬浮于左下角，不占布局、不挡操作 -->

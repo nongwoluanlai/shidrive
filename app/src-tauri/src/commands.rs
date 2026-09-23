@@ -185,6 +185,16 @@ pub async fn acp_respond_permission(agents: AgentsState<'_>, request_id: String,
     agents.respond_permission(&request_id, option_id).await
 }
 
+/// 用户对 elicitation/create 的应答：{ action: accept|decline|cancel, content?: {...} }
+#[tauri::command]
+pub async fn acp_respond_elicitation(
+    agents: AgentsState<'_>,
+    request_id: String,
+    response: serde_json::Value,
+) -> Result<(), String> {
+    agents.respond_elicitation(&request_id, response).await
+}
+
 /// Historical sessions known to the adapter (for the 绑定历史会话 dialog).
 #[tauri::command]
 pub async fn acp_sessions_list(agents: AgentsState<'_>, agent_type: String) -> Result<Vec<SessionInfo>, String> {
@@ -509,6 +519,7 @@ pub async fn remote_mcp_start(
     remote: RemoteState<'_>,
     db: DbState<'_>,
     engine: EngineState<'_>,
+    oauth: tauri::State<'_, std::sync::Arc<crate::remote_oauth::OAuthState>>,
     opts: Option<RemoteStartOpts>,
 ) -> Result<(), String> {
     let o = opts.unwrap_or(RemoteStartOpts {
@@ -517,7 +528,15 @@ pub async fn remote_mcp_start(
         quick_tunnel: false,
     });
     let port = u16::try_from(o.port.clamp(1, 65535)).map_err(|_| "端口超出范围")?;
-    remote.start(app, db.inner().clone(), engine.inner().clone(), &o.listen_host, port, o.quick_tunnel)
+    remote.start(
+        app,
+        db.inner().clone(),
+        engine.inner().clone(),
+        &o.listen_host,
+        port,
+        o.quick_tunnel,
+        oauth.inner().clone(),
+    )
 }
 
 /// 运行中单独启动 Quick Tunnel（切换接入方式为 Cloudflare 时调用；幂等）。
@@ -622,6 +641,124 @@ pub async fn remote_grant_pause(db: DbState<'_>, id: String) -> Result<(), Strin
 #[tauri::command]
 pub async fn remote_grant_resume(db: DbState<'_>, id: String) -> Result<(), String> {
     crate::remote_mcp::grant_resume(db.inner(), &id)
+}
+
+/// OAuth 授权请求的桌面端裁决：批准（按 scope 创建内部授权行并签发授权码）/ 拒绝。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn remote_oauth_decide(
+    db: DbState<'_>,
+    oauth: tauri::State<'_, std::sync::Arc<crate::remote_oauth::OAuthState>>,
+    txn_id: String,
+    approve: bool,
+    project_id: Option<String>,
+    project_name: Option<String>,
+    project_root: Option<String>,
+    context_id: Option<String>,
+    context_name: Option<String>,
+    fs_write: bool,
+    exec_allowed: bool,
+) -> Result<(), String> {
+    crate::remote_oauth::oauth_decide(
+        db.inner(),
+        oauth.inner(),
+        &txn_id,
+        approve,
+        project_id,
+        project_name,
+        project_root,
+        context_id,
+        context_name,
+        fs_write,
+        exec_allowed,
+    )
+}
+
+/// 已签发的 OAuth 令牌列表（设置页展示与吊销）。
+#[tauri::command]
+pub async fn remote_oauth_tokens_list(db: DbState<'_>) -> Result<serde_json::Value, String> {
+    let rows = crate::remote_oauth::tokens_list(db.inner())?;
+    serde_json::to_value(rows).map_err(|e| e.to_string())
+}
+
+/// 吊销 OAuth 令牌（客户端的 access/refresh 立即失效）。
+#[tauri::command]
+pub async fn remote_oauth_token_revoke(db: DbState<'_>, id: String) -> Result<(), String> {
+    crate::remote_oauth::token_revoke(db.inner(), &id)
+}
+
+/// 设置外部编程服务的定时停止（hours<=0 取消；同时持久化配置，下次启动沿用）。
+#[tauri::command]
+pub async fn remote_timer_set(app: tauri::AppHandle, db: DbState<'_>, hours: f64) -> Result<(), String> {
+    if !hours.is_finite() {
+        return Err("小时数无效".into());
+    }
+    if hours <= 0.0 {
+        db.set_setting("remote.auto_stop_hours", "0")?;
+        crate::remote_mcp::RemoteManager::arm_timer(&app, 0.0);
+        return Ok(());
+    }
+    let h = hours.clamp(0.05, 24.0 * 7.0);
+    db.set_setting("remote.auto_stop_hours", &format!("{h}"))?;
+    crate::remote_mcp::RemoteManager::arm_timer(&app, h);
+    Ok(())
+}
+
+/// 回合结束后的执行后动作：sound（系统提示音）/ shutdown（30 秒缓冲，shutdown /a 可取消）/ command。
+#[tauri::command]
+pub async fn system_after_action(kind: String, command: String) -> Result<(), String> {
+    match kind.as_str() {
+        "sound" => {
+            #[cfg(windows)]
+            {
+                let mut c = std::process::Command::new("powershell");
+                c.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", "[console]::beep(880,180); [console]::beep(1175,240)"]);
+                crate::setup::hide_console(&mut c);
+                c.spawn().map_err(|e| format!("提示音播放失败: {e}"))?;
+            }
+            Ok(())
+        }
+        "shutdown" => {
+            #[cfg(windows)]
+            {
+                let mut c = std::process::Command::new("shutdown");
+                c.args(["/s", "/t", "30"]);
+                crate::setup::hide_console(&mut c);
+                c.spawn().map_err(|e| format!("关机计划失败: {e}"))?;
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = std::process::Command::new("shutdown").arg("-h").spawn();
+            }
+            Ok(())
+        }
+        "command" => {
+            let cmd = command.trim().to_string();
+            if cmd.is_empty() {
+                return Err("命令为空".into());
+            }
+            tauri::async_runtime::spawn_blocking(move || {
+                let mut c = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    c.raw_arg("/C").raw_arg(&cmd);
+                    c.creation_flags(0x0800_0000);
+                }
+                #[cfg(not(windows))]
+                {
+                    c.arg("-c").arg(&cmd);
+                }
+                c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                crate::setup::hide_console(&mut c);
+                c.spawn().map_err(|e| format!("命令启动失败: {e}"))?;
+                Ok::<(), String>(())
+            })
+            .await
+            .map_err(|e| format!("任务失败: {e}"))?
+        }
+        _ => Err(format!("未知动作 {kind}")),
+    }
 }
 
 /// 检测 cloudflared 环境：解析路径 + 读取版本（供设置页展示）。

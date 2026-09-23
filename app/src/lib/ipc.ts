@@ -64,6 +64,8 @@ export const api = {
     invoke<void>("acp_set_mode", { contextId: context_id, agentType: agent_type, modeId: mode_id }),
   acpSetConfigOption: (context_id: string, agent_type: string, option_id: string, value: unknown) =>
     invoke<void>("acp_set_config_option", { contextId: context_id, agentType: agent_type, optionId: option_id, value }),
+  acpRespondElicitation: (request_id: string, response: unknown) =>
+    invoke<void>("acp_respond_elicitation", { requestId: request_id, response }),
   acpRespondPermission: (request_id: string, option_id: string) =>
     invoke<void>("acp_respond_permission", { requestId: request_id, optionId: option_id }),
   acpSessionsList: (agent_type: string) => invoke<SessionInfo[]>("acp_sessions_list", { agentType: agent_type }),
@@ -143,10 +145,18 @@ export const api = {
   remoteGrantToken: (id: string) => invoke<{ token: string }>("remote_grant_token", { id }),
   remoteGrantPause: (id: string) => invoke<void>("remote_grant_pause", { id }),
   remoteGrantResume: (id: string) => invoke<void>("remote_grant_resume", { id }),
+  remoteOauthDecide: (args: {
+    txnId: string; approve: boolean; projectId: string; projectName: string; projectRoot: string;
+    contextId: string | null; contextName: string; fsWrite: boolean; execAllowed: boolean;
+  }) => invoke<void>("remote_oauth_decide", args),
+  remoteOauthTokensList: () => invoke<any[]>("remote_oauth_tokens_list"),
+  remoteOauthTokenRevoke: (id: string) => invoke<void>("remote_oauth_token_revoke", { id }),
   remoteCloudflaredInstall: () => invoke<string>("remote_cloudflared_install"),
   remoteCloudflaredStatus: () => invoke<{ installed: boolean; path: string; version: string }>("remote_cloudflared_status"),
   remoteCloudflaredSetPath: (path: string) => invoke<void>("remote_cloudflared_set_path", { path }),
   remoteTunnelStart: () => invoke<void>("remote_tunnel_start"),
+  remoteTimerSet: (hours: number) => invoke<void>("remote_timer_set", { hours }),
+  systemAfterAction: (kind: string, command: string) => invoke<void>("system_after_action", { kind, command }),
   remoteTunnelStop: () => invoke<void>("remote_tunnel_stop"),
   dataExport: () => invoke<string>("data_export"),
   dataImport: (path: string) => invoke<string>("data_import", { path }),

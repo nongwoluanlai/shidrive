@@ -345,7 +345,13 @@ fn handle_mcp(msg: Value, cfg: &Cfg) -> Value {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             match call_tool(cfg, &name, &args) {
-                Ok(text) => json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":text}],"isError":false}}),
+                Ok(v) => {
+                    // call_tool 返回结构化 JSON，这里做唯一一次序列化。
+                    // FIX：此前 json_bytes 先转成字符串、外层再转义一次，
+                    // 客户端看到的是 JSON-in-JSON 多层转义。
+                    let text = serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string());
+                    json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":text}],"isError":false}})
+                }
                 Err(e) => json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":e}],"isError":true}}),
             }
         }
@@ -356,29 +362,51 @@ fn handle_mcp(msg: Value, cfg: &Cfg) -> Value {
 fn tool_definitions(cfg: &Cfg) -> Value {
     let root_desc = cfg.root.to_string_lossy();
     json!([
-        { "name": "pc.fs.read", "description": "按行读取文本文件（1 起始行号）",
+        { "name": "pc.fs.read", "description": format!("按行读取文本文件（1 起始行号）。root：{root_desc}。自动处理 UTF-8/UTF-16 BOM"),
           "inputSchema": { "type":"object","required":["path"],"properties":{
             "path": {"type":"string","description":"相对 root 或绝对路径"},
             "offset": {"type":"integer","description":"起始行（默认 1）"},
             "limit": {"type":"integer","description":"行数（默认 2000）"} } } },
-        { "name": "pc.fs.write", "description": "写入文本文件（原子替换）",
+        { "name": "pc.fs.write", "description": "写入文件（原子替换）。encoding=text（默认，UTF-8 文本）或 base64（二进制资源如 PNG 直接解码写入）",
           "inputSchema": { "type":"object","required":["path","content"],"properties":{
-            "path": {"type":"string"}, "content": {"type":"string"} } } },
-        { "name": "pc.fs.list", "description": "列出目录（分页）",
+            "path": {"type":"string"},
+            "content": {"type":"string","description":"文本内容，或 encoding=base64 时的 base64 字符串"},
+            "encoding": {"type":"string","enum":["text","base64"],"description":"默认 text"} } } },
+        { "name": "pc.fs.writeBatch", "description": "批量写入多个文件（单次最多 50），减少往返",
+          "inputSchema": { "type":"object","required":["items"],"properties":{
+            "items": {"type":"array","maxItems":50,"items":{"type":"object","properties":{
+                "path":{"type":"string"},"content":{"type":"string"},"encoding":{"type":"string","enum":["text","base64"]} },
+                "required":["path","content"]} } } } },
+        { "name": "pc.fs.list", "description": "列出目录（分页，含 size 与 mtime epoch 秒）",
           "inputSchema": { "type":"object","properties":{
             "path": {"type":"string","description":"默认 ."}, "offset": {"type":"integer"}, "limit": {"type":"integer","description":"默认 200"} } } },
         { "name": "pc.fs.mkdir", "description": "递归创建目录",
           "inputSchema": { "type":"object","required":["path"],"properties":{ "path": {"type":"string"} } } },
-        { "name": "pc.fs.search", "description": "字面文本搜索（跳过 node_modules/.git/target/dist 等）",
+        { "name": "pc.fs.search", "description": "字面文本搜索（跳过 node_modules/.git/target/dist 等）。path 可为目录或单个文件；自动解码 UTF-8/UTF-16 BOM；跳过原因见返回的 skipped 数组",
           "inputSchema": { "type":"object","required":["query"],"properties":{
-            "query": {"type":"string"}, "path": {"type":"string","description":"默认 ."}, "glob": {"type":"string","description":"默认 *"},
+            "query": {"type":"string"}, "path": {"type":"string","description":"目录或文件，默认 ."}, "glob": {"type":"string","description":"文件名通配，默认 *"},
+            "ignore_case": {"type":"boolean","description":"默认 false"},
             "max_results": {"type":"integer","description":"默认 100"} } } },
-        { "name": "pc.process.exec", "description": "执行命令（cmd /C），捕获输出；超时终止进程树",
+        { "name": "pc.fs.exists", "description": "检查文件/目录是否存在（返回 exists/is_dir/size）",
+          "inputSchema": { "type":"object","required":["path"],"properties":{ "path": {"type":"string"} } } },
+        { "name": "pc.fs.move", "description": "移动/重命名（同盘符；dst 为已存在目录时移入其中）",
+          "inputSchema": { "type":"object","required":["src","dst"],"properties":{
+            "src": {"type":"string"}, "dst": {"type":"string"} } } },
+        { "name": "pc.fs.copy", "description": "复制文件或目录（目录递归；符号链接跳过）",
+          "inputSchema": { "type":"object","required":["src","dst"],"properties":{
+            "src": {"type":"string"}, "dst": {"type":"string"} } } },
+        { "name": "pc.fs.delete", "description": "删除文件或目录（目录必须 recursive=true；不可恢复，谨慎使用）",
+          "inputSchema": { "type":"object","required":["path"],"properties":{
+            "path": {"type":"string"}, "recursive": {"type":"boolean","description":"目录递归删除，默认 false"} } } },
+        { "name": "pc.process.exec", "description": "执行命令（Windows cmd /C），捕获输出；超时终止进程树。多行脚本用 stdin 传给解释器（如 command=python + stdin=脚本），避免命令行转义",
           "inputSchema": { "type":"object","required":["command"],"properties":{
-            "command": {"type":"string"}, "workdir": {"type":"string","description":"默认 root"},
-            "timeout": {"type":"integer","description":"秒，默认 30"}, "max_output_chars": {"type":"integer","description":"默认 32000"} } } },
+            "command": {"type":"string","description":"单行命令；解释器脚本内容请放 stdin"},
+            "stdin": {"type":"string","description":"可选：写入子进程标准输入的内容（多行脚本）"},
+            "workdir": {"type":"string","description":"工作目录，默认 root；cwd 为其别名"},
+            "cwd": {"type":"string","description":"同 workdir"},
+            "timeout": {"type":"integer","description":"秒，默认 30"},
+            "max_output_chars": {"type":"integer","description":"默认 32000"} } } },
     ])
-    // root 提示放进每个工具不合适；在 read 的 description 已带，这里统一补充：
 }
 
 // ---------- helpers ----------
@@ -408,17 +436,55 @@ fn safe_path(cfg: &Cfg, raw: &str) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
-/// 原子写入：同目录临时文件 + flush + rename；失败清理临时文件。
-fn atomic_write(full: &Path, content: &str) -> Result<usize, String> {
+/// 原子写入（字节版）：同目录临时文件 + flush + rename；失败清理临时文件。
+fn atomic_write_bytes(full: &Path, bytes: &[u8]) -> Result<usize, String> {
     use std::io::Write;
     let tmp = full.with_extension("tmp-shidrive");
     {
         let mut f = std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {e}"))?;
-        f.write_all(content.as_bytes()).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("写入失败: {e}") })?;
+        f.write_all(bytes).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("写入失败: {e}") })?;
         f.flush().map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("flush 失败: {e}") })?;
     }
     std::fs::rename(&tmp, full).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("替换失败: {e}") })?;
-    Ok(content.len())
+    Ok(bytes.len())
+}
+
+fn b64_val(c: u8) -> Option<u32> {
+    match c {
+        b'A'..=b'Z' => Some((c - b'A') as u32),
+        b'a'..=b'z' => Some((c - b'a') as u32 + 26),
+        b'0'..=b'9' => Some((c - b'0') as u32 + 52),
+        b'+' | b'-' => Some(62),
+        b'/' | b'_' => Some(63),
+        _ => None,
+    }
+}
+
+/// 标准字母表 base64 解码（容忍空白与 URL-safe 变体，校验填充）。
+/// 不引入外部依赖，供 pc.fs.write/pc.fs.writeBatch 的 encoding=base64 使用。
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let cleaned: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let end = cleaned.iter().rposition(|&b| b != b'=').map(|i| i + 1).unwrap_or(0);
+    let body = &cleaned[..end];
+    if cleaned.len() - end > 2 {
+        return Err("base64 无效：填充符过多".into());
+    }
+    let mut out = Vec::with_capacity(body.len() * 3 / 4 + 3);
+    let mut acc: u32 = 0;
+    let mut nbits: u32 = 0;
+    for &c in body {
+        let v = b64_val(c).ok_or_else(|| format!("base64 含非法字符: {}", c as char))?;
+        acc = (acc << 6) | v;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push(((acc >> nbits) & 0xFF) as u8);
+        }
+    }
+    if nbits >= 6 {
+        return Err("base64 长度无效".into());
+    }
+    Ok(out)
 }
 
 pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
@@ -432,16 +498,16 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             if data.len() > 4 * 1024 * 1024 {
                 return Err("文件超过 4MiB 读取上限。".into());
             }
-            let text = String::from_utf8_lossy(&data);
+            let text = decode_text(&data);
             let lines: Vec<&str> = text.split_inclusive('\n').collect();
             let start = (offset - 1).min(lines.len());
             let end = (start + limit).min(lines.len());
-            Ok(json_bytes(&json!({
+            Ok(json!({
                 "path": full.to_string_lossy(),
                 "total_lines": lines.len(),
                 "offset": offset,
                 "content": lines[start..end].concat(),
-            })))
+            }))
         }
         "pc.fs.write" => {
             let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
@@ -450,15 +516,22 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             let Some(content) = args.get("content").and_then(|v| v.as_str()) else {
                 return Err("缺少必填参数 content（如需清空文件请传空字符串）".into());
             };
+            let encoding = args.get("encoding").and_then(|v| v.as_str()).unwrap_or("text");
             let full = safe_path_parent(cfg, path)?;
-            let bytes = atomic_write(&full, content)?;
-            Ok(json_bytes(&json!({ "written": true, "path": full.to_string_lossy(), "bytes": bytes })))
+            let bytes: Vec<u8> = match encoding {
+                "text" | "" => content.as_bytes().to_vec(),
+                // FIX：二进制资源（PNG/图标等）直接 base64 解码写入，不再绕道 python 脚本
+                "base64" => base64_decode(content)?,
+                other => return Err(format!("不支持的 encoding: {other}（可选 text / base64）")),
+            };
+            let n = atomic_write_bytes(&full, &bytes)?;
+            Ok(json!({ "written": true, "path": full.to_string_lossy(), "bytes": n }))
         }
         "pc.fs.mkdir" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
             let full = safe_path_parent(cfg, path)?;
             std::fs::create_dir_all(&full).map_err(|e| format!("创建失败: {e}"))?;
-            Ok(json_bytes(&json!({ "created": true, "path": full.to_string_lossy() })))
+            Ok(json!({ "created": true, "path": full.to_string_lossy() }))
         }
         "pc.fs.list" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
@@ -468,10 +541,15 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             let mut entries: Vec<Value> = Vec::new();
             for e in std::fs::read_dir(&full).map_err(|err| format!("读取目录失败: {err}"))? {
                 let e = e.map_err(|err| err.to_string())?;
+                let meta = e.metadata();
+                let mtime = meta.as_ref().ok().and_then(|m| m.modified().ok()).and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
+                });
                 entries.push(json!({
                     "name": e.file_name().to_string_lossy(),
-                    "is_dir": e.file_type().map(|t| t.is_dir()).unwrap_or(false),
-                    "size": e.metadata().map(|m| if m.is_file() { m.len() } else { 0 }).unwrap_or(0),
+                    "is_dir": meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
+                    "size": meta.as_ref().map(|m| if m.is_file() { m.len() } else { 0 }).unwrap_or(0),
+                    "mtime": mtime,
                 }));
             }
             entries.sort_by(|a, b| {
@@ -481,7 +559,7 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             });
             let total = entries.len();
             let slice: Vec<Value> = entries.into_iter().skip(offset).take(limit).collect();
-            Ok(json_bytes(&json!({ "path": full.to_string_lossy(), "total": total, "entries": slice })))
+            Ok(json!({ "path": full.to_string_lossy(), "total": total, "entries": slice }))
         }
         "pc.fs.search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or_default();
@@ -491,11 +569,125 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             let glob = args.get("glob").and_then(|v| v.as_str()).unwrap_or("*");
             let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+            let ignore_case = args.get("ignore_case").and_then(|v| v.as_bool()).unwrap_or(false);
             let full = safe_path(cfg, path)?;
             let mut matches: Vec<Value> = Vec::new();
+            let mut skipped: Vec<Value> = Vec::new();
             let mut visited = 0usize;
-            search_walk(&full, query, glob, max_results, &mut matches, &mut visited, 0);
-            Ok(json_bytes(&json!({ "query": query, "matches": matches, "scanned_files": visited })))
+            if full.is_file() {
+                // FIX：path 允许直接指向单个文件（此前 read_dir 失败静默返回，
+                // scanned_files 恒为 0，调用方完全不知道原因）
+                scan_one_file(&full, query, ignore_case, max_results, &mut matches, &mut skipped, &mut visited);
+            } else {
+                search_walk(&full, query, glob, ignore_case, max_results, &mut matches, &mut skipped, &mut visited, 0);
+            }
+            Ok(json!({ "query": query, "matches": matches, "scanned_files": visited, "skipped": skipped }))
+        }
+        "pc.fs.exists" => {
+            let raw = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            // 存在性检查允许目标不存在：校验父目录在 root 内，再看目标本身（防探测 root 外路径）
+            let p = Path::new(raw);
+            let joined = if p.is_absolute() { p.to_path_buf() } else { cfg.root.join(p) };
+            if joined.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                return Err("路径包含 ..，已拒绝。".into());
+            }
+            match std::fs::symlink_metadata(&joined) {
+                Ok(m) => Ok(json!({
+                    "exists": true,
+                    "is_dir": m.is_dir(),
+                    "is_symlink": m.file_type().is_symlink(),
+                    "size": if m.is_file() { m.len() } else { 0 },
+                })),
+                Err(_) => {
+                    let parent = joined.parent().unwrap_or(&cfg.root).to_path_buf();
+                    let canon = std::fs::canonicalize(&parent)
+                        .map_err(|e| format!("父目录不存在（{}）：{e}", parent.display()))?;
+                    if !within_root(&canon, &cfg.root) {
+                        return Err(format!("路径越界：{} 不在根目录 {} 之内。", joined.display(), cfg.root.display()));
+                    }
+                    Ok(json!({ "exists": false }))
+                }
+            }
+        }
+        "pc.fs.move" | "pc.fs.copy" => {
+            let Some(src) = args.get("src").and_then(|v| v.as_str()) else {
+                return Err("缺少必填参数 src".into());
+            };
+            let Some(dst) = args.get("dst").and_then(|v| v.as_str()) else {
+                return Err("缺少必填参数 dst".into());
+            };
+            let from = safe_path(cfg, src)?;
+            let root_canon = std::fs::canonicalize(&cfg.root).unwrap_or_else(|_| cfg.root.clone());
+            if norm_prefix(&from) == norm_prefix(&root_canon) {
+                return Err("拒绝操作根目录本身。".into());
+            }
+            let to = safe_path_parent(cfg, dst)?;
+            // dst 为已存在目录时移入该目录（保留原文件名）
+            let target = if to.is_dir() {
+                to.join(from.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default())
+            } else {
+                to
+            };
+            if name == "pc.fs.move" {
+                std::fs::rename(&from, &target).map_err(|e| format!("移动失败（跨盘符或目标占用时会失败，可改用 copy+delete）: {e}"))?;
+                Ok(json!({ "moved": true, "src": from.to_string_lossy(), "dst": target.to_string_lossy() }))
+            } else {
+                let n = copy_path_recursive(&from, &target, 0)?;
+                Ok(json!({ "copied": true, "src": from.to_string_lossy(), "dst": target.to_string_lossy(), "bytes": n }))
+            }
+        }
+        "pc.fs.delete" => {
+            let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
+                return Err("缺少必填参数 path".into());
+            };
+            let full = safe_path(cfg, path)?;
+            let root_canon = std::fs::canonicalize(&cfg.root).unwrap_or_else(|_| cfg.root.clone());
+            if norm_prefix(&full) == norm_prefix(&root_canon) {
+                return Err("拒绝删除根目录本身。".into());
+            }
+            let m = std::fs::symlink_metadata(&full).map_err(|e| format!("读取失败: {e}"))?;
+            if m.is_dir() {
+                let recursive = args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !recursive {
+                    return Err("目标是目录：需传 recursive=true 才会递归删除（删除不可恢复，请谨慎）。".into());
+                }
+                std::fs::remove_dir_all(&full).map_err(|e| format!("删除目录失败: {e}"))?;
+            } else {
+                std::fs::remove_file(&full).map_err(|e| format!("删除文件失败: {e}"))?;
+            }
+            Ok(json!({ "deleted": true, "path": full.to_string_lossy() }))
+        }
+        "pc.fs.writeBatch" => {
+            let Some(items) = args.get("items").and_then(|v| v.as_array()) else {
+                return Err("缺少必填参数 items（数组，每项 {path, content, encoding?}，单次最多 50）".into());
+            };
+            if items.len() > 50 {
+                return Err("单次最多 50 个文件。".into());
+            }
+            let mut results: Vec<Value> = Vec::new();
+            let mut ok_count = 0usize;
+            for (i, item) in items.iter().enumerate() {
+                let mut r = (|| -> Result<Value, String> {
+                    let path = item.get("path").and_then(|v| v.as_str()).ok_or("缺少 path")?;
+                    let content = item.get("content").and_then(|v| v.as_str()).ok_or("缺少 content")?;
+                    let encoding = item.get("encoding").and_then(|v| v.as_str()).unwrap_or("text");
+                    let full = safe_path_parent(cfg, path)?;
+                    let bytes: Vec<u8> = match encoding {
+                        "text" | "" => content.as_bytes().to_vec(),
+                        "base64" => base64_decode(content)?,
+                        o => return Err(format!("不支持的 encoding: {o}")),
+                    };
+                    let n = atomic_write_bytes(&full, &bytes)?;
+                    Ok(json!({ "written": true, "path": full.to_string_lossy(), "bytes": n }))
+                })()
+                .unwrap_or_else(|e| json!({ "written": false, "error": e }));
+                if r.get("written").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    ok_count += 1;
+                }
+                r["index"] = json!(i);
+                results.push(r);
+            }
+            Ok(json!({ "total": items.len(), "written": ok_count, "results": results }))
         }
         "pc.process.exec" => {
             if !cfg.exec_enabled {
@@ -505,13 +697,19 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             if command.trim().is_empty() {
                 return Err("缺少参数 command。".into());
             }
-            let workdir = args.get("workdir").and_then(|v| v.as_str()).unwrap_or_default();
+            // FIX：cwd 为 workdir 的别名；多行脚本经 stdin 传入，绕开命令行三层转义
+            let workdir = args
+                .get("workdir")
+                .and_then(|v| v.as_str())
+                .or_else(|| args.get("cwd").and_then(|v| v.as_str()))
+                .unwrap_or_default();
+            let stdin_data = args.get("stdin").and_then(|v| v.as_str()).map(|s| s.to_string());
             let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
             let max_chars = args.get("max_output_chars").and_then(|v| v.as_u64()).unwrap_or(32000) as usize;
             let dir = if workdir.is_empty() { cfg.root.clone() } else { safe_path(cfg, workdir)? };
-            run_exec(command, &dir, timeout, max_chars)
+            run_exec(command, &dir, timeout, max_chars, stdin_data.as_deref())
         }
-        other => Err(format!("未知工具 {other}。可用：pc.fs.read、pc.fs.write、pc.fs.list、pc.fs.mkdir、pc.fs.search、pc.process.exec。")),
+        other => Err(format!("未知工具 {other}。可用：pc.fs.read、pc.fs.write、pc.fs.list、pc.fs.mkdir、pc.fs.search、pc.fs.exists、pc.fs.move、pc.fs.copy、pc.fs.delete、pc.fs.writeBatch、pc.process.exec。")),
     }
 }
 
@@ -558,13 +756,127 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     name == pattern
 }
 
-fn search_walk(dir: &Path, query: &str, glob: &str, max_results: usize, out: &mut Vec<Value>, visited: &mut usize, depth: usize) {
+/// 搜索跳过记录（上限 20 条）：让调用方知道为什么没扫到
+fn push_skip(skipped: &mut Vec<Value>, path: &Path, reason: &str) {
+    if skipped.len() < 20 {
+        skipped.push(json!({ "path": path.to_string_lossy(), "reason": reason }));
+    }
+}
+
+/// UTF-16LE/BE 字节流解码（Windows 编辑器保存的带 BOM 文本文件常见）
+fn utf16_to_string(data: &[u8], little: bool) -> String {
+    let units: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|c| if little { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) })
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// 文本解码：识别并剥离 UTF-8 BOM / UTF-16 LE/BE BOM；无 BOM 按 UTF-8 lossy。
+fn decode_text(data: &[u8]) -> String {
+    if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        String::from_utf8_lossy(&data[3..]).into_owned()
+    } else if data.starts_with(&[0xFF, 0xFE]) {
+        utf16_to_string(&data[2..], true)
+    } else if data.starts_with(&[0xFE, 0xFF]) {
+        utf16_to_string(&data[2..], false)
+    } else {
+        String::from_utf8_lossy(data).into_owned()
+    }
+}
+
+/// 递归复制 src → dst：文件直接复制；目录递归；符号链接跳过（防逃出授权根）。
+/// 返回复制的总字节数。
+fn copy_path_recursive(src: &Path, dst: &Path, depth: usize) -> Result<u64, String> {
+    if depth > 24 {
+        return Err("目录层级过深（>24），可能存在循环链接".into());
+    }
+    let meta = std::fs::symlink_metadata(src).map_err(|e| format!("读取源失败: {e}"))?;
+    if meta.file_type().is_symlink() {
+        return Ok(0); // 符号链接不跟随，跳过
+    }
+    if meta.is_dir() {
+        std::fs::create_dir_all(dst).map_err(|e| format!("创建目录失败: {e}"))?;
+        let mut total = 0u64;
+        for entry in std::fs::read_dir(src).map_err(|e| format!("读取目录失败: {e}"))? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            total += copy_path_recursive(&entry.path(), &dst.join(entry.file_name()), depth + 1)?;
+        }
+        Ok(total)
+    } else {
+        std::fs::copy(src, dst).map(|n| n).map_err(|e| format!("复制文件失败: {e}"))
+    }
+}
+
+/// 扫描单个文件并按行匹配（跳过时原因写入 skipped）。
+/// FIX：BOM/UTF-16 正确解码；二进制判定改为「无 BOM 且前 64KB 含 NUL」——
+/// 此前整文件任一 NUL 即跳过，UTF-16 编码文件（Windows 编辑器常见）永远搜不到。
+fn scan_one_file(
+    path: &Path,
+    query: &str,
+    ignore_case: bool,
+    max_results: usize,
+    out: &mut Vec<Value>,
+    skipped: &mut Vec<Value>,
+    visited: &mut usize,
+) {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            push_skip(skipped, path, &format!("read_error: {e}"));
+            return;
+        }
+    };
+    let head = &data[..data.len().min(64 * 1024)];
+    let has_bom = data.starts_with(&[0xEF, 0xBB, 0xBF])
+        || data.starts_with(&[0xFF, 0xFE])
+        || data.starts_with(&[0xFE, 0xFF]);
+    if !has_bom && head.contains(&0) {
+        push_skip(skipped, path, "binary_or_utf16_without_bom");
+        return;
+    }
+    let text = decode_text(&data);
+    *visited += 1;
+    let needle = if ignore_case { query.to_lowercase() } else { String::new() };
+    for (i, line) in text.lines().enumerate() {
+        let hit = if ignore_case {
+            line.to_lowercase().contains(&needle)
+        } else {
+            line.contains(query)
+        };
+        if hit {
+            out.push(json!({
+                "path": path.to_string_lossy(),
+                "line": i + 1,
+                "text": line.trim().chars().take(240).collect::<String>(),
+            }));
+            if out.len() >= max_results {
+                return;
+            }
+        }
+    }
+}
+
+fn search_walk(
+    dir: &Path,
+    query: &str,
+    glob: &str,
+    ignore_case: bool,
+    max_results: usize,
+    out: &mut Vec<Value>,
+    skipped: &mut Vec<Value>,
+    visited: &mut usize,
+    depth: usize,
+) {
     if out.len() >= max_results || depth > 12 {
         return;
     }
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(e) => {
+            push_skip(skipped, dir, &format!("read_dir_error: {e}"));
+            return;
+        }
     };
     for e in rd.flatten() {
         if out.len() >= max_results {
@@ -574,7 +886,7 @@ fn search_walk(dir: &Path, query: &str, glob: &str, max_results: usize, out: &mu
         let path = e.path();
         if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             if !skip_dir(&name) {
-                search_walk(&path, query, glob, max_results, out, visited, depth + 1);
+                search_walk(&path, query, glob, ignore_case, max_results, out, skipped, visited, depth + 1);
             }
         } else {
             if !glob_match(glob, &name) {
@@ -585,45 +897,50 @@ fn search_walk(dir: &Path, query: &str, glob: &str, max_results: usize, out: &mu
                 Err(_) => continue,
             };
             if meta.len() > 4 * 1024 * 1024 {
+                push_skip(skipped, &path, "too_large(>4MiB)");
                 continue;
             }
-            *visited += 1;
-            let data = match std::fs::read(&path) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            if data.contains(&0) {
-                continue;
-            }
-            let text = String::from_utf8_lossy(&data);
-            for (i, line) in text.lines().enumerate() {
-                if line.contains(query) {
-                    out.push(json!({
-                        "path": path.to_string_lossy(),
-                        "line": i + 1,
-                        "text": line.trim().chars().take(240).collect::<String>(),
-                    }));
-                    if out.len() >= max_results {
-                        return;
-                    }
-                }
-            }
+            scan_one_file(&path, query, ignore_case, max_results, out, skipped, visited);
         }
     }
 }
 
-fn run_exec(command: &str, dir: &Path, timeout: u64, max_chars: usize) -> Result<Value, String> {
+fn run_exec(command: &str, dir: &Path, timeout: u64, max_chars: usize, stdin_data: Option<&str>) -> Result<Value, String> {
     use std::process::{Command, Stdio};
-    let mut cmd = Command::new("cmd");
-    cmd.args(["/C", command]).current_dir(dir);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    let mut cmd = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+    cmd.current_dir(dir);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if stdin_data.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        // FIX：raw_arg 原样拼接命令行。此前 std 的 arg() 按 MSVC 规则改写引号，
+        // 而 cmd.exe 不遵循该规则，中文/嵌套引号/特殊字符经多层转义后几乎必坏。
+        cmd.raw_arg("/C").raw_arg(command);
         cmd.creation_flags(0x0800_0000);
+    }
+    #[cfg(not(windows))]
+    {
+        cmd.arg("-c").arg(command);
     }
     let mut child = cmd.spawn().map_err(|e| format!("启动失败: {e}"))?;
     let pid = child.id();
+    // FIX：stdin 参数——多行脚本从标准输入喂给解释器（python/node 等），
+    // 彻底绕开 JSON→cmd→解释器 的命令行转义地狱。独立线程写入后随手柄关闭，
+    // 子进程不读也不会阻塞主管线。
+    if let Some(data) = stdin_data {
+        if let Some(mut sin) = child.stdin.take() {
+            let owned = data.as_bytes().to_vec();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = sin.write_all(&owned);
+            });
+        }
+    }
     let out = child.stdout.take();
     let err = child.stderr.take();
     // FIX-06：限额流式缓冲——超限后继续排空管道（不阻塞子进程），仅保留尾部 keep 字节
@@ -683,7 +1000,7 @@ fn run_exec(command: &str, dir: &Path, timeout: u64, max_chars: usize) -> Result
         }
     };
     match status {
-        Some(st) => Ok(json_bytes(&json!({
+        Some(st) => Ok(json!({
             "exit_code": st.code().unwrap_or(-1),
             "stdout": cut(&stdout_txt),
             "stderr": cut(&stderr_txt),
@@ -692,7 +1009,7 @@ fn run_exec(command: &str, dir: &Path, timeout: u64, max_chars: usize) -> Result
             "stderr_dropped_bytes": stderr_dropped,
             "stdout_truncated_note": trunc_note(stdout_dropped),
             "stderr_truncated_note": trunc_note(stderr_dropped),
-        }))),
+        })),
         None => {
             Err(format!("命令超时（{timeout}s），已终止进程树。已捕获输出：\n{}", cut(&stdout_txt)))
         }
@@ -715,6 +1032,3 @@ fn wait_with_timeout(child: &mut std::process::Child, timeout: u64) -> Option<st
     }
 }
 
-fn json_bytes(v: &Value) -> Value {
-    Value::String(serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
-}
