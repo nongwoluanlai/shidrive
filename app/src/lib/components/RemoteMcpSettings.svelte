@@ -28,6 +28,7 @@
     exec_allowed: boolean;
     created_at: string;
     revoked_at: string | null;
+    paused_at: string | null;
   }
 
   let status = $state<RemoteStatus | null>(null);
@@ -36,6 +37,11 @@
   let exposure = $state<"custom" | "quick_tunnel">("quick_tunnel");
   let customUrl = $state("");
   let lastToken = $state("");
+  // 服务监听端口（自定义穿透/反代需要指定端口）；持久化，默认 51688
+  let port = $state(51688);
+  // 全局「允许执行命令」开关（remote.exec_allowed）：此前误绑到添加表单的 addExec，
+  // 且从不写库，导致后端要求的「全局 AND 授权行」永远无法同时为真
+  let globalExec = $state(false);
   let adding = $state(false);
   let addProjectId = $state("");
   let addContextId = $state("");
@@ -67,6 +73,15 @@
     void refreshCf();
     void api.settingsGet("remote.exposure")
       .then((v) => { if (v === "custom" || v === "quick_tunnel") exposure = v; })
+      .catch(() => {});
+    void api.settingsGet("remote.exec_allowed")
+      .then((v) => { globalExec = v === "1"; })
+      .catch(() => {});
+    void api.settingsGet("remote.custom_url")
+      .then((v) => { if (typeof v === "string" && v) customUrl = v; })
+      .catch(() => {});
+    void api.settingsGet("remote.port")
+      .then((v) => { const n = Number(v); if (Number.isInteger(n) && n >= 1 && n <= 65535) port = n; })
       .catch(() => {});
     const un = listen("remote://tunnel", (e) => {
       const d = (e.payload ?? {}) as { publicUrl?: string; error?: string };
@@ -100,6 +115,41 @@
   $effect(() => {
     if (exposure === "quick_tunnel") void refreshCf();
   });
+
+  // 全局「允许执行命令」开关：持久化到设置（最终权限 = 全局 AND 授权行）
+  async function setGlobalExec(v: boolean) {
+    const prev = globalExec;
+    globalExec = v;
+    try {
+      await api.settingsSet("remote.exec_allowed", v ? "1" : "0");
+      toast("ok", t("全局执行开关已保存"));
+    } catch (e) {
+      globalExec = prev;
+      toast("error", String(e));
+    }
+  }
+
+  // 自定义地址持久化：重启后无需重输
+  function persistCustomUrl() {
+    const v = customUrl.trim().replace(/\/+$/, "");
+    customUrl = v;
+    void api.settingsSet("remote.custom_url", v).catch(() => {});
+  }
+
+  // 接入地址不可用时的区分提示：服务未启动 vs 地址还没拿到
+  function unavailableReason(): string {
+    if (!status?.running) return t("服务未启动，暂无接入地址");
+    return t("接入地址尚未就绪（隧道获取中或未配置），请稍后再试");
+  }
+
+  async function copyText(text: string, okMsg: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast("ok", okMsg);
+    } catch {
+      toast("error", t("复制失败"));
+    }
+  }
 
   async function installCloudflared() {
     cfBusy = true;
@@ -140,7 +190,7 @@
     }
     busy = true;
     try {
-      await api.remoteMcpStart({ listenHost: "0.0.0.0", port: 51688, quickTunnel: exposure === "quick_tunnel" });
+      await api.remoteMcpStart({ listenHost: "0.0.0.0", port, quickTunnel: exposure === "quick_tunnel" });
       await refresh();
       toast("ok", t("外部编程 MCP 服务已启动"));
     } catch (e) {
@@ -165,7 +215,7 @@
 
   async function copyAddress() {
     const url = publicUrl ? `${publicUrl}/mcp` : "";
-    if (!url) { toast("warn", t("服务未启动，暂无接入地址")); return; }
+    if (!url) { toast("warn", unavailableReason()); return; }
     try { await navigator.clipboard.writeText(url); toast("ok", t("接入地址已复制")); } catch { toast("error", t("复制失败")); }
   }
 
@@ -216,11 +266,23 @@
     }
   }
 
-  async function revokeGrant(id: string) {
+  // 暂停开放：暂停期间外部连接一律 403（可逆）
+  async function pauseGrant(id: string) {
     try {
-      await api.remoteGrantRevoke(id);
+      await api.remoteGrantPause(id);
       await refresh();
-      toast("ok", t("授权已撤销"));
+      toast("ok", t("已暂停开放，外部连接将被拒绝"));
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
+  // 继续开放：清除暂停标记并刷新凭据 → 提示重新复制提示词
+  async function resumeGrant(id: string) {
+    try {
+      await api.remoteGrantResume(id);
+      await refresh();
+      toast("ok", t("已继续开放，凭据已刷新，请重新复制提示词"));
     } catch (e) {
       toast("error", String(e));
     }
@@ -236,11 +298,22 @@
     }
   }
 
-  function copyPrompt(g: RemoteGrant) {
+  // 复制接入提示词：取当前有效凭据（不轮换）。凭据刷新时机：
+  // 服务启动（全部授权）/「暂停开放→继续开放」切换（单个授权），见暂停/继续按钮。
+  async function copyPrompt(g: RemoteGrant) {
     const base = publicUrl ? `${publicUrl}/mcp` : "";
-    if (!base) { toast("warn", t("服务未启动，暂无接入地址")); return; }
+    if (!base) { toast("warn", unavailableReason()); return; }
+    let token = "";
+    try {
+      const res = await api.remoteGrantToken(g.id);
+      token = (res as { token?: string }).token ?? "";
+    } catch (e) {
+      toast("error", String(e));
+      return;
+    }
+    if (!token) { toast("error", t("凭据生成失败，请重试")); return; }
     const lines = [
-      `接入地址：${base}?passcode=${g.id}`,
+      `MCP Server URL：${base}?passcode=${token}`,
       "",
       t("这是 ShiDrive Coding MCP，你可以借助它完成已授权项目的远端开发任务。"),
       `${t("项目")}: ${g.project_name}`,
@@ -248,9 +321,14 @@
       `${t("文件权限")}: ${g.fs_write ? t("读写") : t("只读")}`,
       `${t("命令执行")}: ${g.exec_allowed ? t("允许") : t("禁用")}`,
       "",
+      t("认证凭据（服务重启或「继续开放」时自动刷新，届时请重新复制提示词）："),
+      token,
+      t("请求认证二选一：Authorization: Bearer <token> 请求头，或 URL 追加 ?passcode=<token>。"),
+      "",
       t("请先完成 MCP 初始化并读取工具列表，再在授权范围内开展工作。"),
       t("执行删除、覆盖、发布等高风险操作前，请先征得我的确认。"),
       t("本链接包含临时访问凭据，请勿写入项目文件、提交记录或日志。"),
+      t("注意：服务或隧道重启后接入地址会变化，届时请向我索取新地址。"),
     ];
     if (g.context_enabled && g.context_name) {
       lines.push("", t("此接入已开放共享上下文，绑定上下文：{name}", { name: g.context_name }));
@@ -283,6 +361,15 @@
     {/if}
   </div>
 
+  {#if lastToken}
+    <div class="token-banner">
+      <span class="warn-txt">⚠ {t("新授权 Token（仅此一次显示，请立即复制）")}：</span>
+      <code>{lastToken}</code>
+      <button class="btn sm" onclick={() => void copyText(lastToken, t("Token 已复制"))}>{t("复制")}</button>
+      <button class="btn ghost sm" onclick={() => (lastToken = "")}>{t("关闭")}</button>
+    </div>
+  {/if}
+
   <div class="sec">
     <h3>{t("接入方式")}</h3>
     <div class="row">
@@ -291,11 +378,11 @@
     </div>
     {#if exposure === "custom"}
       <div class="row">
-        <input class="grow" placeholder={t("https://your-domain.com（已有 frp / 反向代理）")} bind:value={customUrl} />
+        <input class="grow" placeholder={t("https://your-domain.com（已有 frp / 反向代理）")} bind:value={customUrl} onchange={persistCustomUrl} />
         <button class="btn sm" onclick={copyAddress} disabled={!publicUrl}>{t("复制接入地址")}</button>
       </div>
     {:else}
-      <p class="note">{t("Quick Tunnel 为临时开发入口：无 SLA、不支持 SSE、有 200 在途请求上限；地址随重启变化。")}</p>
+      <p class="note">{t("Cloudflare Tunnel 为免费临时地址，重启服务后刷新，重新复制提示词可获取最新的信息。如果cloudflare安装速度慢，可以试着在环境与路径栏目下配置HTTP代理进行加速")}</p>
       <div class="row cf-row">
         <span class="lbl">{t("cloudflared")}：</span>
         {#if cf?.installed}
@@ -319,11 +406,33 @@
       {/if}
       <button class="btn ghost sm" onclick={copyAddress} disabled={!publicUrl}>{t("复制")}</button>
     </div>
+    <div class="row">
+      <label class="lbl">{t("服务端口")}</label>
+      <input
+        class="port-input"
+        type="number"
+        min="1"
+        max="65535"
+        value={port}
+        onchange={(e) => {
+          const n = Number((e.currentTarget as HTMLInputElement).value);
+          if (Number.isInteger(n) && n >= 1 && n <= 65535) {
+            port = n;
+            void api.settingsSet("remote.port", String(n)).catch(() => {});
+            toast("info", t("端口已保存，重启服务后生效"));
+          } else {
+            toast("warn", t("端口需为 1-65535 的整数"));
+            (e.currentTarget as HTMLInputElement).value = String(port);
+          }
+        }}
+      />
+      <span class="pend">{t("自定义穿透 / 反向代理时按需指定；修改后重启服务生效")}</span>
+    </div>
   </div>
 
   <div class="sec">
     <h3>{t("全局选项")}</h3>
-    <label class="check"><input type="checkbox" bind:checked={addExec} /> {t("允许执行命令（默认关闭；最终权限 = 全局 AND 授权行）")}</label>
+    <label class="check"><input type="checkbox" checked={globalExec} onchange={(e) => void setGlobalExec(e.currentTarget.checked)} /> {t("允许执行命令（默认关闭；最终权限 = 全局 AND 授权行）")}</label>
     <p class="note">{t("目录限制不等于命令沙箱：开启命令执行后，程序以当前系统用户权限运行。")}</p>
   </div>
 
@@ -370,17 +479,19 @@
         </thead>
         <tbody>
           {#each grants as g (g.id)}
-            <tr class:revoked={!!g.revoked_at}>
+            <tr class:revoked={!!g.revoked_at} class:paused={!!g.paused_at && !g.revoked_at}>
               <td>{g.project_name}<br /><span class="dim mono">{g.project_root}</span></td>
               <td>{g.context_enabled ? (g.context_name || t("已开放")) : t("未开放")}</td>
               <td>
                 {[g.fs_write ? t("读写") : t("只读"), g.exec_allowed ? t("可执行") : null].filter(Boolean).join(" · ") || "—"}
               </td>
-              <td>{g.revoked_at ? t("已撤销") : t("有效")}</td>
+              <td>{g.revoked_at ? t("已撤销") : g.paused_at ? t("已暂停") : t("有效")}</td>
               <td class="op">
-                {#if !g.revoked_at}
-                  <button class="btn ghost sm" onclick={() => copyPrompt(g)}>{t("复制提示词")}</button>
-                  <button class="btn ghost sm" onclick={() => revokeGrant(g.id)}>{t("撤销")}</button>
+                {#if !g.revoked_at && !g.paused_at}
+                  <button class="btn ghost sm" title={t("复制当前有效凭据的接入提示词")} onclick={() => void copyPrompt(g)}>{t("复制提示词")}</button>
+                  <button class="btn ghost sm" title={t("暂停后外部连接将被拒绝，继续开放时自动刷新凭据")} onclick={() => void pauseGrant(g.id)}>{t("暂停开放")}</button>
+                {:else if g.paused_at}
+                  <button class="btn ghost sm" title={t("继续开放并刷新凭据，旧凭据失效")} onclick={() => void resumeGrant(g.id)}>{t("继续开放")}</button>
                 {/if}
                 <button class="btn ghost sm" onclick={() => deleteGrant(g.id)}>{t("删除")}</button>
               </td>
@@ -425,14 +536,23 @@
   .tbl th, .tbl td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
   .tbl thead th { color: var(--text-dim); white-space: nowrap; position: sticky; top: 0; background: var(--bg-panel); }
   .tbl tr.revoked td { opacity: .5; }
+  .tbl tr.paused td { opacity: .65; }
   .dim { color: var(--text-faint); }
   .mono { font-family: var(--mono); font-size: .92em; }
   .op { white-space: nowrap; }
   .none { color: var(--text-faint); text-align: center; padding: 14px; }
   .logs { max-height: 220px; overflow: auto; background: var(--code-bg); border-radius: 6px; padding: 8px; font-family: var(--mono); font-size: .8em; user-select: text; }
   .cf-row { align-items: baseline; }
+  .port-input { width: 90px; padding: 4px 8px; font-size: .86em; }
   .cf-path { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .82em; }
   .badge { font-size: .82em; padding: 1px 8px; border-radius: 10px; }
   .badge.ok { background: rgba(52, 199, 123, .15); color: #2c9c63; }
   .badge.warn { background: rgba(240, 170, 40, .15); color: #b57e17; }
+  .token-banner {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    border: 1px solid rgba(240, 170, 40, .4); background: rgba(240, 170, 40, .08);
+    border-radius: 8px; padding: 8px 10px; font-size: .88em;
+  }
+  .token-banner code { user-select: text; word-break: break-all; }
+  .warn-txt { color: #b57e17; font-weight: 600; }
 </style>

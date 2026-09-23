@@ -29,9 +29,15 @@ pub struct RemoteGrant {
     pub created_at: String,
     pub revoked_at: Option<String>,
     pub last_used_at: Option<String>,
+    /// 暂停开放时间（Some = 已暂停）：暂停期间连接一律 403
+    pub paused_at: Option<String>,
     /// 仅内部使用（sha256）；不序列化到前端
     #[serde(skip_serializing)]
     pub token_hash: String,
+    /// 仅内部使用（当前有效凭据明文缓存，供「复制提示词」取用；不序列化到前端）。
+    /// 轮换时机：服务启动（全部有效授权）/ 暂停→继续开放（单个授权）。备份不导出此表。
+    #[serde(skip_serializing)]
+    pub token_plain: String,
 }
 
 pub struct RemoteGrantInput {
@@ -64,7 +70,7 @@ pub fn new_grant_token() -> String {
 // ---------------- DB-backed grant store ----------------
 
 const GRANT_COLS: &str =
-    "id,project_id,project_name,project_root,context_id,context_name,context_enabled,fs_write,exec_allowed,created_at,revoked_at,last_used_at,token_hash";
+    "id,project_id,project_name,project_root,context_id,context_name,context_enabled,fs_write,exec_allowed,created_at,revoked_at,last_used_at,token_hash,token_plain,paused_at";
 
 fn row_to_grant(r: &rusqlite::Row) -> rusqlite::Result<RemoteGrant> {
     Ok(RemoteGrant {
@@ -81,6 +87,8 @@ fn row_to_grant(r: &rusqlite::Row) -> rusqlite::Result<RemoteGrant> {
         revoked_at: r.get(10)?,
         last_used_at: r.get(11)?,
         token_hash: r.get(12)?,
+        token_plain: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+        paused_at: r.get(14)?,
     })
 }
 
@@ -104,9 +112,13 @@ pub fn grant_create(db: &Arc<Db>, input: &RemoteGrantInput) -> Result<(RemoteGra
     let token = new_grant_token();
     let hash = sha256_hex(&token);
     let ts = now();
+    // 归一化：勾了共享上下文但未绑定具体上下文时视为未开放，
+    // 否则 context_* 调用不会强制覆盖 context_id，远端可传任意 context_id 跨上下文读写
+    let context_enabled = input.context_enabled
+        && input.context_id.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
     db.with(|c| {
         c.execute(
-            &format!("INSERT INTO remote_grants ({GRANT_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"),
+            &format!("INSERT INTO remote_grants ({GRANT_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)"),
             rusqlite::params![
                 id,
                 input.project_id,
@@ -114,13 +126,15 @@ pub fn grant_create(db: &Arc<Db>, input: &RemoteGrantInput) -> Result<(RemoteGra
                 input.project_root,
                 input.context_id,
                 input.context_name,
-                input.context_enabled as i64,
+                context_enabled as i64,
                 input.fs_write as i64,
                 input.exec_allowed as i64,
                 ts,
                 Option::<String>::None,
                 Option::<String>::None,
                 hash,
+                token.clone(),
+                Option::<String>::None,
             ],
         )?;
         Ok(())
@@ -132,13 +146,15 @@ pub fn grant_create(db: &Arc<Db>, input: &RemoteGrantInput) -> Result<(RemoteGra
         project_root: input.project_root.clone(),
         context_id: input.context_id.clone(),
         context_name: input.context_name.clone(),
-        context_enabled: input.context_enabled,
+        context_enabled,
         fs_write: input.fs_write,
         exec_allowed: input.exec_allowed,
         created_at: ts,
         revoked_at: None,
         last_used_at: None,
+        paused_at: None,
         token_hash: hash.clone(),
+        token_plain: String::new(),
     };
     Ok((grant, token))
 }
@@ -158,6 +174,83 @@ pub fn grant_delete(db: &Arc<Db>, id: &str) -> Result<(), String> {
         c.execute("DELETE FROM remote_grants WHERE id=?1", rusqlite::params![id])?;
         Ok(())
     })
+}
+
+/// 重新签发凭据：生成新 token、替换 token_hash 与明文缓存（旧凭据立即失效）。
+/// 轮换时机由调用方控制：服务启动（全部有效授权）/ 暂停→继续开放（单个授权）。
+/// 明文只进本地库 token_plain 列（不序列化到前端列表、不进备份），供「复制提示词」取用。
+pub fn grant_rotate_token(db: &Arc<Db>, id: &str) -> Result<String, String> {
+    let token = new_grant_token();
+    let hash = sha256_hex(&token);
+    let updated = db.with(|c| {
+        let n = c.execute(
+            "UPDATE remote_grants SET token_hash=?2, token_plain=?3 WHERE id=?1 AND revoked_at IS NULL",
+            rusqlite::params![id, hash, token],
+        )?;
+        Ok(n)
+    })?;
+    if updated == 0 {
+        return Err("授权不存在或已撤销，无法重新生成凭据".into());
+    }
+    Ok(token)
+}
+
+/// 服务启动时调用：为所有有效（未撤销、未暂停）授权轮换凭据。
+/// 语义：接入地址随服务重启变化，凭据同步刷新，旧提示词整体失效，重新复制即可。
+pub fn rotate_all_active(db: &Arc<Db>) -> Result<usize, String> {
+    let grants = grants_list(db)?;
+    let mut n = 0usize;
+    for g in &grants {
+        if g.revoked_at.is_none() && g.paused_at.is_none() {
+            grant_rotate_token(db, &g.id)?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// 取当前有效凭据明文（供「复制提示词」，不做轮换）。
+/// 旧版本创建的授权没有明文缓存（token_plain 为空），此处补签一次并落库。
+pub fn grant_token_get(db: &Arc<Db>, id: &str) -> Result<String, String> {
+    let grants = grants_list(db)?;
+    let Some(g) = grants.iter().find(|g| g.id == id && g.revoked_at.is_none()) else {
+        return Err("授权不存在或已撤销".into());
+    };
+    if !g.token_plain.is_empty() {
+        return Ok(g.token_plain.clone());
+    }
+    grant_rotate_token(db, id)
+}
+
+/// 暂停开放：暂停期间该授权的连接一律 403（可逆，撤销才是终态）。
+pub fn grant_pause(db: &Arc<Db>, id: &str) -> Result<(), String> {
+    let updated = db.with(|c| {
+        let n = c.execute(
+            "UPDATE remote_grants SET paused_at=?2 WHERE id=?1 AND revoked_at IS NULL AND paused_at IS NULL",
+            rusqlite::params![id, now()],
+        )?;
+        Ok(n)
+    })?;
+    if updated == 0 {
+        return Err("授权不存在、已撤销或已处于暂停状态".into());
+    }
+    Ok(())
+}
+
+/// 继续开放：清除暂停标记并刷新凭据（旧凭据在暂停期间/恢复后均不可用）。
+pub fn grant_resume(db: &Arc<Db>, id: &str) -> Result<(), String> {
+    let updated = db.with(|c| {
+        let n = c.execute(
+            "UPDATE remote_grants SET paused_at=NULL WHERE id=?1 AND revoked_at IS NULL AND paused_at IS NOT NULL",
+            rusqlite::params![id],
+        )?;
+        Ok(n)
+    })?;
+    if updated == 0 {
+        return Err("授权不存在、已撤销或未处于暂停状态".into());
+    }
+    grant_rotate_token(db, id)?;
+    Ok(())
 }
 
 fn grant_touch(db: &Arc<Db>, id: &str) {
@@ -196,6 +289,10 @@ pub struct RemoteRuntime {
     pub public_url: Arc<RwLock<Option<String>>>,
     pub logs: Arc<Mutex<VecDeque<String>>>,
     pub cloudflared_pid: Arc<Mutex<Option<u32>>>,
+    /// cloudflared 子进程句柄：用于看门狗 try_wait / 停止时 kill+wait（防孤儿进程）
+    pub cloudflared_child: Arc<Mutex<Option<std::process::Child>>>,
+    /// 隧道启动互斥：try_lock 失败 = 已有启动流程在进行（防重复 spawn cloudflared）
+    pub tunnel_lock: Arc<Mutex<()>>,
     pub tunnel_generation: Arc<AtomicU64>,
     pub port: u16,
 }
@@ -236,7 +333,7 @@ impl RemoteManager {
     pub fn status(&self, db: &Arc<Db>) -> RemoteStatus {
         let guard = self.runtime.read().unwrap_or_else(|p| p.into_inner());
         let grants_active = grants_list(db)
-            .map(|g| g.iter().filter(|g| g.revoked_at.is_none()).count() as i64)
+            .map(|g| g.iter().filter(|g| g.revoked_at.is_none() && g.paused_at.is_none()).count() as i64)
             .unwrap_or(0);
         match guard.as_ref() {
             Some(rt) => RemoteStatus {
@@ -293,10 +390,21 @@ impl RemoteManager {
         let logs = Arc::new(Mutex::new(VecDeque::new()));
         let public_url = Arc::new(RwLock::new(None));
         let cloudflared_pid = Arc::new(Mutex::new(None::<u32>));
+        let cloudflared_child = Arc::new(Mutex::new(None::<std::process::Child>));
+        let tunnel_lock = Arc::new(Mutex::new(()));
         let generation = Arc::new(AtomicU64::new(0));
         let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let started_at = now();
         Self::log_into(&logs, format!("服务已启动：{listen_host}:{port}（提示：监听 0.0.0.0 时同网络设备可能访问到）"));
+        // 凭据刷新时机①：Quick Tunnel 的临时地址随重启变化，凭据同步轮换（旧提示词
+        // 整体失效，重新复制即可）。自定义地址（frp/固定域名）地址不变，重启不轮换，
+        // 避免稳定集成的凭据被无谓作废（需要重置时用「暂停→继续」或手动轮换）。
+        if quick_tunnel {
+            match rotate_all_active(&db) {
+                Ok(n) if n > 0 => Self::log_into(&logs, format!("已为 {n} 个有效授权刷新凭据，旧提示词已失效，请重新复制")),
+                _ => {}
+            }
+        }
 
         // accept 循环线程：stop_flag 置位后以自身连接唤醒并退出
         let accept_logs = logs.clone();
@@ -309,13 +417,24 @@ impl RemoteManager {
             loop {
                 if accept_stop.load(Ordering::SeqCst) { break; }
                 match listener.accept() {
-                    Ok((stream, _)) => {
+                    Ok((mut stream, _)) => {
                         if accept_stop.load(Ordering::SeqCst) { drop(stream); break; }
+                        // 公网暴露加固：显式回到阻塞模式（部分平台 accept 会继承监听端
+                        // 的非阻塞标记），并设读写超时，防慢速连接占住处理线程。
+                        stream.set_nonblocking(false).ok();
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+                        stream.set_write_timeout(Some(std::time::Duration::from_secs(30))).ok();
+                        if OPEN_CONNS.load(Ordering::SeqCst) >= MAX_CONNS {
+                            let _ = write_http(&mut stream, 503, "application/json", "{\"error\":\"并发连接数已达上限，请稍后重试\"}");
+                            continue;
+                        }
                         let state = accept_state.clone();
                         let app = accept_app.clone();
                         let db = accept_db.clone();
                         let logs = accept_logs.clone();
+                        OPEN_CONNS.fetch_add(1, Ordering::SeqCst);
                         std::thread::spawn(move || {
+                            let _dec = ConnDec;
                             if let Err(e) = handle_remote_http(stream, logs, state, app, db) {
                                 log::warn!("[remote-mcp] conn: {e}");
                             }
@@ -336,6 +455,8 @@ impl RemoteManager {
             public_url,
             logs,
             cloudflared_pid,
+            cloudflared_child,
+            tunnel_lock,
             tunnel_generation: generation,
             port,
         });
@@ -375,6 +496,13 @@ impl RemoteManager {
         if let Some(rt) = guard.as_ref() {
             rt.tunnel_generation.fetch_add(1, Ordering::SeqCst);
             let pid = rt.cloudflared_pid.lock().unwrap_or_else(|p| p.into_inner()).take();
+            // 优先用子进程句柄 kill+wait 收割（跨平台）；taskkill 作为兜底
+            if let Ok(mut slot) = rt.cloudflared_child.lock() {
+                if let Some(mut c) = slot.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
             if let Ok(mut u) = rt.public_url.write() {
                 *u = None;
             }
@@ -394,7 +522,14 @@ impl RemoteManager {
             if let Some(h) = rt.handle.lock().unwrap_or_else(|p| p.into_inner()).take() {
                 let _ = h.join();
             }
-            if let Some(pid) = rt.cloudflared_pid.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let pid = rt.cloudflared_pid.lock().unwrap_or_else(|p| p.into_inner()).take();
+            if let Ok(mut slot) = rt.cloudflared_child.lock() {
+                if let Some(mut c) = slot.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+            if let Some(pid) = pid {
                 let _ = crate::setup::hide_console(&mut std::process::Command::new("taskkill")).args(["/F", "/T", "/PID", &pid.to_string()]).output();
             }
             Self::log_into(&rt.logs, "服务已停止".into());
@@ -405,6 +540,12 @@ impl RemoteManager {
 
 /// 启动 cloudflared Quick Tunnel；从输出流严格校验并提取临时地址。
 fn start_quick_tunnel(rt: Arc<RemoteRuntime>, app: tauri::AppHandle, db: Arc<Db>) -> Result<(), String> {
+    // 启动互斥：已有启动流程在进行时幂等返回，防止重复 spawn cloudflared
+    // （否则 generation 自增会让旧监控线程失效，旧进程却没人 kill，留下孤儿）。
+    let _spawn_guard = match rt.tunnel_lock.try_lock() {
+        Ok(g) => g,
+        Err(_) => return Ok(()),
+    };
     let logs = rt.logs.clone();
     let port = rt.port;
     let exe = resolve_cloudflared(db.as_ref())?;
@@ -416,13 +557,17 @@ fn start_quick_tunnel(rt: Arc<RemoteRuntime>, app: tauri::AppHandle, db: Arc<Db>
     crate::setup::hide_console(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| format!("启动 cloudflared 失败: {e}"))?;
     let pid = child.id();
+    let out = child.stdout.take();
+    let err = child.stderr.take();
+    // 句柄入槽：看门狗 try_wait / 停止路径 kill+wait 都依赖它（此前句柄直接丢弃，
+    // 进程退出后无人收割，也无法感知隧道中途断开）。
+    if let Ok(mut slot) = rt.cloudflared_child.lock() {
+        *slot = Some(child);
+    }
     if let Some(mut slot) = rt.cloudflared_pid.lock().ok() {
         *slot = Some(pid);
     }
     rt_log(&rt, format!("cloudflared 已启动（pid {pid}），正在获取临时地址…"));
-
-    let out = child.stdout.take();
-    let err = child.stderr.take();
     let rt2 = rt.clone();
     let app2 = app.clone();
     let logs2 = logs.clone();
@@ -462,6 +607,8 @@ fn start_quick_tunnel(rt: Arc<RemoteRuntime>, app: tauri::AppHandle, db: Arc<Db>
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
             if !still_current() {
+                // 已被停止/重启接管：清理本代进程，避免留下无人管理的孤儿 cloudflared
+                cleanup_tunnel_child(&rt2, pid2);
                 break;
             }
             let snapshot = text.lock().map(|t| t.clone()).unwrap_or_default();
@@ -477,10 +624,14 @@ fn start_quick_tunnel(rt: Arc<RemoteRuntime>, app: tauri::AppHandle, db: Arc<Db>
                 }
                 rt_log_logs(&logs2, format!("隧道地址：{url}"));
                 let _ = app2.emit("remote://tunnel", serde_json::json!({ "publicUrl": url, "generation": gen }));
+                // 看门狗：地址到手后继续盯进程，cloudflared 退出即清 pid/地址并上报，
+                // 避免 UI 永远显示「已连接」+ 死地址（此前只覆盖拿地址前退出的场景）。
+                tunnel_watchdog(&rt2, &app2, &logs2, pid2, gen);
                 break;
             }
             if readers.iter().all(|h| h.is_finished()) {
                 // 进程已退出：清 pid/地址让状态回到真实（隧道已断）
+                reap_child_slot(&rt2);
                 if let Some(mut p) = rt2.cloudflared_pid.lock().ok() {
                     if *p == Some(pid2) { *p = None; }
                 }
@@ -494,6 +645,7 @@ fn start_quick_tunnel(rt: Arc<RemoteRuntime>, app: tauri::AppHandle, db: Arc<Db>
             if std::time::Instant::now() > deadline {
                 rt_log_logs(&logs2, "获取隧道地址超时（90s），已终止 cloudflared".into());
                 let _ = crate::setup::hide_console(&mut std::process::Command::new("taskkill")).args(["/F", "/T", "/PID", &pid2.to_string()]).output();
+                reap_child_slot(&rt2);
                 if let Some(mut p) = rt2.cloudflared_pid.lock().ok() {
                     if *p == Some(pid2) { *p = None; }
                 }
@@ -503,6 +655,64 @@ fn start_quick_tunnel(rt: Arc<RemoteRuntime>, app: tauri::AppHandle, db: Arc<Db>
         }
     });
     Ok(())
+}
+
+/// 取走并收割 cloudflared 子进程句柄（kill + wait，防孤儿/句柄泄漏）。
+fn reap_child_slot(rt: &RemoteRuntime) {
+    if let Ok(mut slot) = rt.cloudflared_child.lock() {
+        if let Some(mut c) = slot.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// 按 pid 清理本代 cloudflared（generation 失配路径专用：句柄槽可能已被他人取走）。
+fn cleanup_tunnel_child(rt: &RemoteRuntime, pid: u32) {
+    let taken = rt.cloudflared_child.lock().ok().and_then(|mut s| s.take());
+    if let Some(mut c) = taken {
+        let _ = c.kill();
+        let _ = c.wait();
+    } else {
+        let cur = rt.cloudflared_pid.lock().map(|p| *p).unwrap_or(None);
+        if cur == Some(pid) {
+            let _ = crate::setup::hide_console(&mut std::process::Command::new("taskkill")).args(["/F", "/T", "/PID", &pid.to_string()]).output();
+        }
+    }
+    if let Some(mut p) = rt.cloudflared_pid.lock().ok() {
+        if *p == Some(pid) { *p = None; }
+    }
+    if let Ok(mut u) = rt.public_url.write() {
+        *u = None;
+    }
+}
+
+/// 隧道地址获取成功后的存活看守：每秒探测 cloudflared 进程，
+/// 意外退出即清 pid/地址并向 UI 发错误事件（generation 失配 = 已被停止/重启接管，静默返回）。
+fn tunnel_watchdog(rt: &RemoteRuntime, app: &tauri::AppHandle, logs: &Arc<Mutex<VecDeque<String>>>, pid: u32, gen: u64) {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if rt.tunnel_generation.load(Ordering::SeqCst) != gen {
+            return; // 已被 tunnel_stop / 重启 / 服务停止接管，清理归它们
+        }
+        let exited = rt
+            .cloudflared_child
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(|c| c.try_wait().ok()))
+            .flatten();
+        if let Some(status) = exited {
+            if let Some(mut p) = rt.cloudflared_pid.lock().ok() {
+                if *p == Some(pid) { *p = None; }
+            }
+            if let Ok(mut u) = rt.public_url.write() {
+                *u = None;
+            }
+            rt_log_logs(logs, format!("cloudflared 进程已退出（{status}），隧道断开，接入地址已失效"));
+            let _ = app.emit("remote://tunnel", serde_json::json!({ "error": "tunnel_exited", "generation": gen }));
+            return;
+        }
+    }
 }
 
 
@@ -655,7 +865,19 @@ fn handle_remote_http(
         }
     }
     if content_length > 8 * 1024 * 1024 {
-        return write_http(stream, 413, "application/json", "{\"error\":\"请求体过大（上限 8MB）\"}");
+        return write_http(&mut stream, 413, "application/json", "{\"error\":\"请求体过大（上限 8MB）\"}");
+    }
+
+    // CORS 预检必须在鉴权前响应：浏览器预检请求不携带 Authorization，
+    // 放到鉴权后会让 header 型浏览器客户端永远过不了预检。
+    if method == "OPTIONS" {
+        return write_http_h(
+            &mut stream,
+            204,
+            "text/plain",
+            "",
+            "Access-Control-Allow-Headers: authorization,content-type,x-shidrive-token\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\n",
+        );
     }
 
     // 鉴权前置于读 body：未授权连接在这里就被挡掉，不再消耗读体资源
@@ -681,13 +903,23 @@ fn handle_remote_http(
         }
     }
     let Some(token) = token else {
-        return write_http(stream, 401, "application/json", "{\"error\":\"需要凭据：Authorization: Bearer <token> 或 ?passcode=<token>\"}");
+        return write_http_h(
+            &mut stream,
+            401,
+            "application/json",
+            "{\"error\":\"需要凭据：Authorization: Bearer <token> 或 ?passcode=<token>\"}",
+            "WWW-Authenticate: Bearer\r\n",
+        );
     };
     let hash = sha256_hex(&token);
     let grants = grants_list(&db).map_err(|e| e.to_string())?;
-    let Some(grant) = grants.iter().find(|g| g.token_hash == hash && g.revoked_at.is_none()) else {
-        return write_http(stream, 401, "application/json", "{\"error\":\"凭据无效或已撤销\"}");
+    let Some(grant) = grants.iter().find(|g| ct_eq(&g.token_hash, &hash) && g.revoked_at.is_none()) else {
+        return write_http(&mut stream, 401, "application/json", "{\"error\":\"凭据无效或已撤销\"}");
     };
+    // 暂停开放：凭据本身有效但该授权已暂停，明确 403 提示去恢复
+    if grant.paused_at.is_some() {
+        return write_http(&mut stream, 403, "application/json", "{\"error\":\"此授权已暂停开放：请在使驾设置中「继续开放」（凭据将刷新）\"}");
+    }
     grant_touch(&db, &grant.id);
 
     // 鉴权通过后再读 body
@@ -700,14 +932,16 @@ fn handle_remote_http(
     }
     let body = String::from_utf8_lossy(&buf[header_end..]).to_string();
 
-    // OPTIONS 预检
-    if method == "OPTIONS" {
-        let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: authorization,content-type,x-shidrive-token\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        stream.write_all(resp.as_bytes()).map_err(|e| e.to_string())?;
-        return Ok(());
+    // MCP 端点：/mcp 仅接受 POST（GET/SSE 不支持），其余方法明确 405 而非 404
+    if path.ends_with("/mcp") && method != "POST" {
+        return write_http_h(
+            &mut stream,
+            405,
+            "application/json",
+            "{\"error\":\"Method Not Allowed：/mcp 仅支持 POST\"}",
+            "Allow: POST\r\n",
+        );
     }
-
-    // MCP 端点（仅 POST /mcp）
     if path.ends_with("/mcp") && method == "POST" {
         let msg: serde_json::Value = serde_json::from_str(body.trim()).map_err(|e| format!("JSON 解析失败: {e}"))?;
         let method_name = msg.get("method").and_then(|m| m.as_str()).unwrap_or_default().to_string();
@@ -733,7 +967,7 @@ fn handle_remote_http(
                 // 授权边界：context_* 仅在勾选共享上下文时放行，context_id 由服务端固定
                 if name.starts_with("context_") {
                     if !grant.context_enabled {
-                        return write_http(stream, 403, "application/json", "{\"error\":\"此授权未开放共享上下文\"}");
+                        return write_http(&mut stream, 403, "application/json", "{\"error\":\"此授权未开放共享上下文\"}");
                     }
                     if let Some(cid) = &grant.context_id {
                         args["context_id"] = serde_json::json!(cid);
@@ -748,11 +982,11 @@ fn handle_remote_http(
                         .map(|v| v == "1")
                         .unwrap_or(false);
                     if !(global && grant.exec_allowed) {
-                        return write_http(stream, 403, "application/json", "{\"error\":\"命令执行未授权\"}");
+                        return write_http(&mut stream, 403, "application/json", "{\"error\":\"命令执行未授权\"}");
                     }
                 }
                 if name.starts_with("pc.fs.write") && !grant.fs_write {
-                    return write_http(stream, 403, "application/json", "{\"error\":\"文件写入未授权（只读）\"}");
+                    return write_http(&mut stream, 403, "application/json", "{\"error\":\"文件写入未授权（只读）\"}");
                 }
                 let result = if name.starts_with("context_") {
                     crate::mcp::call_tool(&state, &app, &name, &args)
@@ -779,8 +1013,9 @@ fn handle_remote_http(
             other => serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("未知方法 {other}") } }),
         };
         if resp.is_null() {
-            // notification：无响应体
-            return Ok(());
+            // notification：无响应体，但必须回 202 Accepted。
+            // 此前一个字节都不写，严格实现的客户端会以「Empty reply from server」报传输错误。
+            return write_http(&mut stream, 202, "application/json", "");
         }
         let body_text = serde_json::to_string(&resp).unwrap_or_default();
         let resp_text = format!(
@@ -791,7 +1026,7 @@ fn handle_remote_http(
         return Ok(());
     }
 
-    write_http(stream, 404, "text/plain", "not found")
+    write_http(&mut stream, 404, "text/plain", "not found")
 }
 
 fn scoped_tools(grant: &RemoteGrant) -> serde_json::Value {
@@ -821,11 +1056,63 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn write_http(mut stream: std::net::TcpStream, status: u16, ctype: &str, body: &str) -> Result<(), String> {
-    let text = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
-        if status < 400 { "OK" } else { "Error" },
-        body.len()
+/// 常量时间比较：防时序侧信道逐字节猜 token 哈希（长度差提前返回无妨，哈希定长）
+fn ct_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// 并发连接上限：超出直接 503，防慢速连接把处理线程耗尽
+const MAX_CONNS: usize = 64;
+static OPEN_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct ConnDec;
+impl Drop for ConnDec {
+    fn drop(&mut self) {
+        OPEN_CONNS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        202 => "Accepted",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => if status < 400 { "OK" } else { "Error" },
+    }
+}
+
+fn write_http(stream: &mut std::net::TcpStream, status: u16, ctype: &str, body: &str) -> Result<(), String> {
+    write_http_h(stream, status, ctype, body, "")
+}
+
+/// extra_headers：附加响应头，每行自带 \r\n（可为空）。
+fn write_http_h(stream: &mut std::net::TcpStream, status: u16, ctype: &str, body: &str, extra_headers: &str) -> Result<(), String> {
+    let mut head = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nAccess-Control-Allow-Origin: *\r\n",
+        reason(status)
     );
+    if !extra_headers.is_empty() {
+        head.push_str(extra_headers);
+    }
+    // 204/304 不携带响应体与 Content-Length
+    if status != 204 && status != 304 {
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    let text = format!("{head}{body}");
     stream.write_all(text.as_bytes()).map_err(|e| e.to_string())
 }

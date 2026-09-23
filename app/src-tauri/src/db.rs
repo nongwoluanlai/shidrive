@@ -127,8 +127,11 @@ impl Db {
             let _ = c.execute_batch("ALTER TABLE agent_bindings ADD COLUMN model TEXT NOT NULL DEFAULT ''");
             // 外部编程接入（MCP）：项目级授权
             let _ = c.execute_batch(
-                "CREATE TABLE IF NOT EXISTS remote_grants (                  id TEXT PRIMARY KEY,                  project_id TEXT NOT NULL,                  project_name TEXT NOT NULL DEFAULT '',                  project_root TEXT NOT NULL,                  context_id TEXT,                  context_name TEXT NOT NULL DEFAULT '',                  context_enabled INTEGER NOT NULL DEFAULT 0,                  fs_write INTEGER NOT NULL DEFAULT 0,                  exec_allowed INTEGER NOT NULL DEFAULT 0,                  token_hash TEXT NOT NULL UNIQUE,                  created_at TEXT NOT NULL,                  revoked_at TEXT,                  last_used_at TEXT                )",
+                "CREATE TABLE IF NOT EXISTS remote_grants (                  id TEXT PRIMARY KEY,                  project_id TEXT NOT NULL,                  project_name TEXT NOT NULL DEFAULT '',                  project_root TEXT NOT NULL,                  context_id TEXT,                  context_name TEXT NOT NULL DEFAULT '',                  context_enabled INTEGER NOT NULL DEFAULT 0,                  fs_write INTEGER NOT NULL DEFAULT 0,                  exec_allowed INTEGER NOT NULL DEFAULT 0,                  token_hash TEXT NOT NULL UNIQUE,                  token_plain TEXT NOT NULL DEFAULT '',                  paused_at TEXT,                  created_at TEXT NOT NULL,                  revoked_at TEXT,                  last_used_at TEXT                )",
             );
+            // 迁移：旧库补列（已存在时报 duplicate column，静默忽略）
+            let _ = c.execute("ALTER TABLE remote_grants ADD COLUMN token_plain TEXT NOT NULL DEFAULT ''", []);
+            let _ = c.execute("ALTER TABLE remote_grants ADD COLUMN paused_at TEXT", []);
             let _ = c.execute_batch("CREATE INDEX IF NOT EXISTS idx_remote_grants_project ON remote_grants(project_id)");
 
             // 会话对话本地持久化：key=ctxId:agent，整份条目 JSON，开聊天页秒开不再等适配器全量重放

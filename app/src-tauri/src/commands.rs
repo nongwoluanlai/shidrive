@@ -597,6 +597,33 @@ pub async fn remote_grant_delete(db: DbState<'_>, id: String) -> Result<(), Stri
     crate::remote_mcp::grant_delete(db.inner(), &id)
 }
 
+/// 重新签发授权凭据（旧凭据立即失效）。保留给「手动重置单个授权凭据」场景；
+/// 常规轮换已改为：服务启动时全部刷新 / 暂停→继续开放时刷新。
+#[tauri::command]
+pub async fn remote_grant_rotate_token(db: DbState<'_>, id: String) -> Result<serde_json::Value, String> {
+    let token = crate::remote_mcp::grant_rotate_token(db.inner(), &id)?;
+    Ok(serde_json::json!({ "token": token }))
+}
+
+/// 取授权当前有效凭据（不轮换）。供「复制提示词」随时取用。
+#[tauri::command]
+pub async fn remote_grant_token(db: DbState<'_>, id: String) -> Result<serde_json::Value, String> {
+    let token = crate::remote_mcp::grant_token_get(db.inner(), &id)?;
+    Ok(serde_json::json!({ "token": token }))
+}
+
+/// 暂停开放：暂停期间该授权的连接一律 403。
+#[tauri::command]
+pub async fn remote_grant_pause(db: DbState<'_>, id: String) -> Result<(), String> {
+    crate::remote_mcp::grant_pause(db.inner(), &id)
+}
+
+/// 继续开放：清除暂停标记并刷新凭据。
+#[tauri::command]
+pub async fn remote_grant_resume(db: DbState<'_>, id: String) -> Result<(), String> {
+    crate::remote_mcp::grant_resume(db.inner(), &id)
+}
+
 /// 检测 cloudflared 环境：解析路径 + 读取版本（供设置页展示）。
 #[tauri::command]
 pub async fn remote_cloudflared_status(db: DbState<'_>) -> Result<crate::remote_mcp::CloudflaredStatus, String> {
