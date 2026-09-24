@@ -79,6 +79,15 @@ export async function wireEvents() {
         ...p.response,
       },
     };
+    // 恢复/重连的 session-ready 常不带 models/configOptions：用该 agent 的
+    // 能力缓存补齐缺失字段（真实会话数据已在上面的合并中优先），配置栏不空
+    const cached = app.agentCaps[p.agentType];
+    if (cached) {
+      if (!merged.response.models && cached.models) merged.response.models = cached.models;
+      if (!merged.response.configOptions?.length && cached.configOptions) {
+        merged.response.configOptions = cached.configOptions as typeof merged.response.configOptions;
+      }
+    }
     app.sessionInfo[key] = merged;
     app.bindingSession[key] = p.sessionId;
     // 缓存 agent 能力（模型/配置项），供会话创建前展示

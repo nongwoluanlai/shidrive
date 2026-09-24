@@ -543,12 +543,9 @@ import type { DisplayItem } from "../state.svelte";
     return {} as { models?: SessionReadyInfo["response"]["models"]; configOptions?: any[] };
   });
 
-  // 有绑定会话时只用会话真实返回的列表（session-ready/load 时写入）；
-  // 全局 caps 缓存可能过期——用它兜底会导致选到当前会话不存在的模型 id，
-  // 适配器抛 -32602 Invalid params（codex-acp 在 availableModels 里找不到即抛）
-  const liveModels = $derived(
-    sessionId ? sessionInfo?.response?.models ?? null : sessionInfo?.response?.models ?? caps.models ?? null,
-  );
+  // 显示层允许 caps 兜底（恢复会话的 session-ready 常不带 models/configOptions，
+  // 没有兜底配置栏会整个消失）；选到过期 id 的 -32602 由 setCfg 的错误分支处理
+  const liveModels = $derived(sessionInfo?.response?.models ?? caps.models ?? null);
 
   const cfgItems = $derived.by((): CfgItem[] => {
     const out: CfgItem[] = [];
@@ -560,9 +557,7 @@ import type { DisplayItem } from "../state.svelte";
         const name = zh !== v ? zh : t(MODE_NAME_TEXT[String(x.name ?? "").toLowerCase()] ?? x.name);
         return { value: v, name };
       });
-    const cfgOpts: any[] = sessionId
-      ? sessionInfo?.response?.configOptions ?? []
-      : sessionInfo?.response?.configOptions ?? caps.configOptions ?? [];
+    const cfgOpts: any[] = sessionInfo?.response?.configOptions ?? caps.configOptions ?? [];
     for (const o of cfgOpts) {
       if (o.type && o.type !== "select") continue;
       if (out.some((x) => x.id === o.id)) continue;
