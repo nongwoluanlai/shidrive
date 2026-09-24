@@ -3,15 +3,16 @@
 //! 设计要点：
 //! - 端点全部挂在当前服务上（/authorize、/token、/register、/.well-known/*），基于请求 Host
 //!   动态生成元数据 URL——Quick Tunnel 地址随重启变化也不影响发现流程；
-//! - 浏览器 /authorize 只展示等待页；真正的「批准/拒绝」发生在使驾桌面端
-//!   （设置 → 外部编程接入 的授权卡片），审批者必须是能操作本机的人，公网机器人无法自批；
-//! - OAuth 令牌映射到内部 RemoteGrant 授权行：批准时按（可缩减的）scope 创建授权行，
-//!   此后越界防护/工具裁剪/目录限制/执行双开关与静态 token 完全同一套代码；
+//! - 浏览器 /authorize 只展示等待页；真正的「批准/拒绝」发生在使驾桌面端的全局授权窗口，
+//!   审批者必须是能操作本机的人，公网机器人无法自批；
+//! - 新 OAuth 令牌不再创建单项目授权：按客户端请求的 scope 使用当前「开放目录与上下文」
+//!   中未暂停/未撤销的授权行，权限随开放列表实时变化；旧版单项目 OAuth 令牌仍可使用；
+//! - 文件/命令工具仍由 coding_mcp 的根目录检查和远端全局执行开关保护；
 //! - access/refresh 令牌只存 sha256（sdo1_/sdr1_ 前缀），不落明文；refresh 轮换；
 //! - 授权码一次性、10 分钟有效，PKCE 强制 S256。
 
 use crate::db::Db;
-use crate::remote_mcp::{grant_create, sha256_hex, RemoteGrant, RemoteGrantInput};
+use crate::remote_mcp::{active_grants, grants_list, sha256_hex, RemoteGrant};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -25,7 +26,21 @@ pub const ACCESS_TTL_SECS: i64 = 3600;
 pub const REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
 pub const TXN_TTL: Duration = Duration::from_secs(600);
 pub const CODE_TTL: Duration = Duration::from_secs(600);
+const MAX_PENDING_CONSENTS: usize = 16; // 公网可注册客户端；防止未审批请求淹没桌面端
 pub const SCOPES_SUPPORTED: &[&str] = &["fs:read", "fs:write", "exec", "context"];
+
+fn normalize_scope(raw: &str) -> Option<String> {
+    // 客户端不传 scope 时，经桌面确认后默认请求完整开放权限；显式 scope 不可提升。
+    let default = SCOPES_SUPPORTED.join(" ");
+    let requested = if raw.trim().is_empty() { &default } else { raw };
+    let mut scopes = Vec::new();
+    for scope in requested.split_whitespace() {
+        if SCOPES_SUPPORTED.contains(&scope) && !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+    (!scopes.is_empty()).then(|| scopes.join(" "))
+}
 
 fn now_str() -> String {
     chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
@@ -58,8 +73,41 @@ pub struct AuthCode {
     pub redirect_uri: String,
     pub code_challenge: String,
     pub scope: String,
+    /// 空字符串表示动态共享授权；旧版 OAuth 授权码/令牌仍绑定单个 grant_id。
     pub grant_id: String,
     pub created: Instant,
+}
+
+/// 已认证的 OAuth 身份。共享授权每次请求重新读取开放列表，旧令牌维持原项目边界。
+pub enum OAuthAccess {
+    Shared { scopes: String },
+    Legacy(RemoteGrant),
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingConsent {
+    pub txn_id: String,
+    pub client_id: String,
+    pub client_name: String,
+    pub redirect_uri: String,
+    pub scopes: Vec<String>,
+}
+
+/// 快照查询：即使设置页从未打开、前端错过事件，仍能恢复有效的待授权请求。
+pub fn pending_list(oauth: &OAuthState) -> Vec<PendingConsent> {
+    let mut map = oauth.txns.lock().unwrap_or_else(|p| p.into_inner());
+    map.retain(|_, txn| txn.created.elapsed() < TXN_TTL);
+    let mut pending: Vec<_> = map.iter().filter(|(_, txn)| txn.decision.is_none()).collect();
+    pending.sort_by_key(|(_, txn)| txn.created);
+    pending.into_iter().map(|(id, txn)| PendingConsent {
+            txn_id: id.clone(),
+            client_id: txn.client_id.clone(),
+            client_name: txn.client_name.clone(),
+            redirect_uri: txn.redirect_uri.clone(),
+            scopes: txn.scope.split_whitespace().map(str::to_owned).collect(),
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -423,32 +471,34 @@ fn authorize_begin(
     if code_challenge.is_empty() || q("code_challenge_method") != "S256" {
         return bad("必须提供 PKCE 参数（code_challenge + code_challenge_method=S256）。");
     }
-    let mut scope = q("scope");
-    if scope.is_empty() {
-        scope = "fs:read".into();
-    }
-    let scope: Vec<String> = scope
-        .split([' ', '+'])
-        .filter(|s| SCOPES_SUPPORTED.contains(s))
-        .map(|s| s.to_string())
-        .collect();
-    let scope = if scope.is_empty() { vec!["fs:read".to_string()] } else { scope };
-    let scope = scope.join(" ");
+    let Some(scope) = normalize_scope(&q("scope")) else {
+        return bad("未请求受支持的 scope。");
+    };
 
     let txn_id = uuid::Uuid::new_v4().to_string();
-    oauth.txns.lock().unwrap_or_else(|p| p.into_inner()).insert(
-        txn_id.clone(),
-        PendingTxn {
-            client_id: client_id.clone(),
-            client_name: client_name.clone(),
-            redirect_uri: redirect_uri.clone(),
-            scope: scope.clone(),
-            state: q("state"),
-            code_challenge,
-            created: Instant::now(),
-            decision: None,
-        },
-    );
+    let wake = {
+        let mut txns = oauth.txns.lock().unwrap_or_else(|p| p.into_inner());
+        txns.retain(|_, txn| txn.created.elapsed() < TXN_TTL);
+        let count = txns.values().filter(|txn| txn.decision.is_none()).count();
+        if count >= MAX_PENDING_CONSENTS {
+            return bad("待授权请求过多，请先处理已有请求。");
+        }
+        txns.insert(
+            txn_id.clone(),
+            PendingTxn {
+                client_id: client_id.clone(),
+                client_name: client_name.clone(),
+                redirect_uri: redirect_uri.clone(),
+                scope: scope.clone(),
+                state: q("state"),
+                code_challenge,
+                created: Instant::now(),
+                decision: None,
+            },
+        );
+        count == 0 // 同时到达多个请求时只主动聚焦一次（其余由全局弹窗展示）
+    };
+    if wake { crate::show_main_window(app); }
     let _ = app.emit(
         "remote://oauth-consent",
         json!({
@@ -463,7 +513,7 @@ fn authorize_begin(
         "<h1>🔐 使驾 OAuth 授权请求</h1>\
 <p>客户端 <code>{client}</code> 正在请求访问你的使驾外部编程接口。</p>\
 <p class=\"dim\">请求权限：{scope}</p>\
-<p><b>请在使驾桌面端 → 设置 → 外部编程接入 中确认或拒绝本次授权。</b></p>\
+<p><b>请在使驾桌面端弹出的授权窗口中确认或拒绝本次授权。</b></p>\
 <p class=\"dim\">本页会自动检测确认结果，无需刷新（10 分钟内有效）。</p>",
         client = html_escape(&client_name),
         scope = html_escape(&scope),
@@ -527,87 +577,42 @@ fn authorize_wait(oauth: &OAuthState, query: &str, stream: &mut std::net::TcpStr
 
 // ---------------- 桌面端批准/拒绝（Tauri command 调用） ----------------
 
-#[allow(clippy::too_many_arguments)]
-pub fn oauth_decide(
-    db: &Arc<Db>,
-    oauth: &OAuthState,
-    txn_id: &str,
-    approve: bool,
-    project_id: Option<String>,
-    project_name: Option<String>,
-    project_root: Option<String>,
-    context_id: Option<String>,
-    context_name: Option<String>,
-    fs_write: bool,
-    exec_allowed: bool,
-) -> Result<(), String> {
-    let (client_id, code_challenge, scope) = {
-        let mut map = oauth.txns.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(txn) = map.get_mut(txn_id) else {
-            return Err("授权请求不存在或已处理".into());
-        };
-        if txn.created.elapsed() > TXN_TTL {
-            map.remove(txn_id);
-            return Err("授权请求已过期".into());
-        }
-        if txn.decision.is_some() {
-            return Err("该请求已被处理".into());
-        }
-        if !approve {
-            txn.decision = Some(Decision::Denied);
-            return Ok(());
-        }
-        (txn.client_id.clone(), txn.code_challenge.clone(), txn.scope.clone())
+pub fn oauth_decide(db: &Arc<Db>, oauth: &OAuthState, txn_id: &str, approve: bool) -> Result<(), String> {
+    // 在持有事务锁期间完成裁决，避免两个设置窗口重复批准同一个请求。
+    let mut map = oauth.txns.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(txn) = map.get_mut(txn_id) else {
+        return Err("授权请求不存在或已处理".into());
     };
-    // 批准：按（不超出请求范围的）能力创建内部授权行，令牌随后绑定它
-    let pid = project_id.ok_or("请选择要授权的项目")?;
-    let root = project_root.ok_or("项目目录缺失")?;
-    if root.trim().is_empty() {
-        return Err("项目目录不能为空".into());
+    if txn.created.elapsed() >= TXN_TTL {
+        map.remove(txn_id);
+        return Err("授权请求已过期".into());
     }
-    let context_enabled = context_id.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-    let input = RemoteGrantInput {
-        project_id: pid,
-        project_name: project_name.unwrap_or_default(),
-        project_root: root,
-        context_id,
-        context_name: context_name.unwrap_or_default(),
-        context_enabled,
-        fs_write,
-        exec_allowed,
-    };
-    let (grant, _legacy_token) = grant_create(db, &input)?;
+    if txn.decision.is_some() {
+        return Err("该请求已被处理".into());
+    }
+    if !approve {
+        txn.decision = Some(Decision::Denied);
+        return Ok(());
+    }
+    if active_grants(db)?.is_empty() {
+        return Err("尚无开放目录：请先在「开放目录与上下文」中添加授权".into());
+    }
 
-    // 实际授予的 scope（可能少于请求）
-    let mut granted: Vec<&str> = vec!["fs:read"];
-    if fs_write {
-        granted.push("fs:write");
-    }
-    if exec_allowed {
-        granted.push("exec");
-    }
-    if context_enabled {
-        granted.push("context");
-    }
-    let granted_scope = granted.join(" ");
-    let _ = scope; // 请求范围已在 UI 侧限制勾选项，不超出
-
+    // 不再新建 RemoteGrant/静态凭据：空 grant_id 标记动态共享权限，
+    // 使用时取有效授权行与客户端实际请求的 scope 的交集。
     let code = format!("sdc_{}", rand_hex(1));
     oauth.codes.lock().unwrap_or_else(|p| p.into_inner()).insert(
         code.clone(),
         AuthCode {
-            client_id,
-            redirect_uri: String::new(), // 在 /token 处与请求重校验
-            code_challenge,
-            scope: granted_scope,
-            grant_id: grant.id,
+            client_id: txn.client_id.clone(),
+            redirect_uri: txn.redirect_uri.clone(),
+            code_challenge: txn.code_challenge.clone(),
+            scope: txn.scope.clone(),
+            grant_id: String::new(),
             created: Instant::now(),
         },
     );
-    let mut map = oauth.txns.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(txn) = map.get_mut(txn_id) {
-        txn.decision = Some(Decision::Approved { code });
-    }
+    txn.decision = Some(Decision::Approved { code });
     Ok(())
 }
 
@@ -692,12 +697,9 @@ fn token_endpoint(db: &Arc<Db>, oauth: &OAuthState, body: &str, stream: &mut std
             if sha256_b64url(&verifier) != rec.code_challenge {
                 return err(400, "invalid_grant", "PKCE 校验失败");
             }
-            // redirect_uri 校验：与客户端注册表比对
-            let Some((_, uris)) = client_get(db, &client_id) else {
-                return err(400, "invalid_client", "未知 client");
-            };
-            if !redirect_uri.is_empty() && !uris.iter().any(|u| u == &redirect_uri) {
-                return err(400, "invalid_grant", "redirect_uri 与注册信息不一致");
+            // 与 /authorize 时的 redirect_uri 完全相同，不能换用同一客户端注册过的另一个地址。
+            if redirect_uri != rec.redirect_uri {
+                return err(400, "invalid_grant", "redirect_uri 与授权请求不一致");
             }
             let resource = get("resource");
             let mut resp = issue_tokens(db, &client_id, &rec.grant_id, &rec.scope)?;
@@ -716,7 +718,7 @@ fn token_endpoint(db: &Arc<Db>, oauth: &OAuthState, body: &str, stream: &mut std
             let row = db
                 .with(|c| {
                     let mut st = c.prepare(
-                        "SELECT id, client_id, grant_id, scopes, refresh_expires_epoch FROM remote_oauth_tokens WHERE refresh_hash=?1 AND revoked_at IS NULL",
+                        "SELECT id, client_id, scopes, refresh_expires_epoch FROM remote_oauth_tokens WHERE refresh_hash=?1 AND revoked_at IS NULL",
                     )?;
                     let r = st
                         .query_row(rusqlite::params![hash], |r| {
@@ -724,8 +726,7 @@ fn token_endpoint(db: &Arc<Db>, oauth: &OAuthState, body: &str, stream: &mut std
                                 r.get::<_, String>(0)?,
                                 r.get::<_, String>(1)?,
                                 r.get::<_, String>(2)?,
-                                r.get::<_, String>(3)?,
-                                r.get::<_, i64>(4)?,
+                                r.get::<_, i64>(3)?,
                             ))
                         })
                         .optional()?;
@@ -733,7 +734,7 @@ fn token_endpoint(db: &Arc<Db>, oauth: &OAuthState, body: &str, stream: &mut std
                 })
                 .ok()
                 .flatten();
-            let Some((id, tok_client, grant_id, scopes, refresh_exp)) = row else {
+            let Some((id, tok_client, scopes, refresh_exp)) = row else {
                 return err(400, "invalid_grant", "refresh_token 无效或已撤销");
             };
             if tok_client != client_id {
@@ -806,34 +807,42 @@ fn issue_tokens(db: &Arc<Db>, client_id: &str, grant_id: &str, scope: &str) -> R
 
 // ---------------- 令牌鉴权（中间件用）与管理（设置页用） ----------------
 
-/// OAuth 访问令牌 → 内部授权行。None = 无效/过期/已撤销（按 401 invalid_token 处理）。
-/// 暂停状态不在此拦截（由中间件统一 403，提示去「继续开放」）。
-pub fn resolve_access_token(db: &Arc<Db>, token: &str) -> Result<Option<RemoteGrant>, String> {
+/// OAuth 访问令牌 → 共享权限（空 grant_id）或旧版单授权。None = 无效/过期/已撤销。
+pub fn resolve_access_token(db: &Arc<Db>, token: &str) -> Result<Option<OAuthAccess>, String> {
     if !token.starts_with("sdo1_") {
         return Ok(None);
     }
     let hash = sha256_hex(token);
     let row = db.with(|c| {
         let mut st = c.prepare(
-            "SELECT id, grant_id, access_expires_epoch FROM remote_oauth_tokens WHERE access_hash=?1 AND revoked_at IS NULL",
+            "SELECT id, grant_id, scopes, access_expires_epoch FROM remote_oauth_tokens WHERE access_hash=?1 AND revoked_at IS NULL",
         )?;
         let r = st
             .query_row(rusqlite::params![hash], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
                 ))
             })
             .optional()?;
         Ok::<_, rusqlite::Error>(r)
     })?;
-    let Some((tok_id, grant_id, expires)) = row else {
+    let Some((tok_id, grant_id, scopes, expires)) = row else {
         return Ok(None);
     };
     if expires < now_epoch() {
         return Ok(None);
     }
+    let access = if grant_id.is_empty() {
+        OAuthAccess::Shared { scopes }
+    } else {
+        // v0.3.6 签发的令牌仍限定在原授权行；不会因为升级而悄悄扩大权限。
+        let grant = grants_list(db)?.into_iter().find(|g| g.id == grant_id && g.revoked_at.is_none());
+        let Some(grant) = grant else { return Ok(None) };
+        OAuthAccess::Legacy(grant)
+    };
     let _ = db.with(|c| {
         c.execute(
             "UPDATE remote_oauth_tokens SET last_used_at=?2 WHERE id=?1",
@@ -841,65 +850,39 @@ pub fn resolve_access_token(db: &Arc<Db>, token: &str) -> Result<Option<RemoteGr
         )
         .map(|_| ())
     });
-    let grants = crate::remote_mcp::grants_list(db)?;
-    let grant = grants.into_iter().find(|g| g.id == grant_id && g.revoked_at.is_none());
-    Ok(grant)
+    Ok(Some(access))
 }
 
 #[derive(serde::Serialize)]
 pub struct OAuthTokenRow {
     pub id: String,
     pub client_id: String,
-    pub grant_id: String,
-    pub grant_name: String,
+    pub client_name: String,
     pub scopes: String,
-    pub created_at: String,
-    pub expires_in_secs: i64,
-    pub refresh_expires_in_secs: i64,
     pub last_used_at: Option<String>,
     pub revoked_at: Option<String>,
 }
 
 pub fn tokens_list(db: &Arc<Db>) -> Result<Vec<OAuthTokenRow>, String> {
-    let rows = db.with(|c| {
+    db.with(|c| {
         let mut st = c.prepare(
-            "SELECT t.id, t.client_id, t.grant_id, COALESCE(g.project_name,''), t.scopes, t.created_at, t.access_expires_epoch, t.refresh_expires_epoch, t.last_used_at, t.revoked_at
-             FROM remote_oauth_tokens t LEFT JOIN remote_grants g ON g.id = t.grant_id ORDER BY t.created_at DESC",
+            "SELECT t.id, t.client_id, COALESCE(c.client_name,''), t.scopes, t.last_used_at, t.revoked_at
+             FROM remote_oauth_tokens t LEFT JOIN remote_oauth_clients c ON c.client_id = t.client_id
+             ORDER BY t.created_at DESC",
         )?;
-        let rows = st
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, i64>(6)?,
-                    r.get::<_, i64>(7)?,
-                    r.get::<_, Option<String>>(8)?,
-                    r.get::<_, Option<String>>(9)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok::<_, rusqlite::Error>(rows)
-    })?;
-    let now = now_epoch();
-    Ok(rows
-        .into_iter()
-        .map(|(id, client_id, grant_id, grant_name, scopes, created_at, aexp, rexp, last_used_at, revoked_at)| OAuthTokenRow {
-            id,
-            client_id,
-            grant_id,
-            grant_name,
-            scopes,
-            created_at,
-            expires_in_secs: aexp - now,
-            refresh_expires_in_secs: rexp - now,
-            last_used_at,
-            revoked_at,
-        })
-        .collect())
+        let rows = st.query_map([], |r| {
+            Ok(OAuthTokenRow {
+                id: r.get(0)?,
+                client_id: r.get(1)?,
+                client_name: r.get(2)?,
+                scopes: r.get(3)?,
+                last_used_at: r.get(4)?,
+                revoked_at: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
 }
 
 pub fn token_revoke(db: &Arc<Db>, id: &str) -> Result<(), String> {
@@ -914,3 +897,7 @@ pub fn token_revoke(db: &Arc<Db>, id: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "remote_oauth_tests.rs"]
+mod tests;

@@ -35,3 +35,6 @@ website/shidrive-admin-pw.txt
 
 # 产品站（不开源，仅本地部署）
 website/
+
+# 外部合并包备份目录
+.merge-backup-oauth/

@@ -643,35 +643,23 @@ pub async fn remote_grant_resume(db: DbState<'_>, id: String) -> Result<(), Stri
     crate::remote_mcp::grant_resume(db.inner(), &id)
 }
 
-/// OAuth 授权请求的桌面端裁决：批准（按 scope 创建内部授权行并签发授权码）/ 拒绝。
+/// 查询尚未处理、尚未过期的 OAuth 授权请求（页面切换/错过事件后可恢复）。
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
+pub async fn remote_oauth_pending_list(
+    oauth: tauri::State<'_, std::sync::Arc<crate::remote_oauth::OAuthState>>,
+) -> Result<Vec<crate::remote_oauth::PendingConsent>, String> {
+    Ok(crate::remote_oauth::pending_list(oauth.inner()))
+}
+
+/// 批准时绑定当前开放列表而不是新建单项目授权；拒绝不需开放目录。
+#[tauri::command]
 pub async fn remote_oauth_decide(
     db: DbState<'_>,
     oauth: tauri::State<'_, std::sync::Arc<crate::remote_oauth::OAuthState>>,
     txn_id: String,
     approve: bool,
-    project_id: Option<String>,
-    project_name: Option<String>,
-    project_root: Option<String>,
-    context_id: Option<String>,
-    context_name: Option<String>,
-    fs_write: bool,
-    exec_allowed: bool,
 ) -> Result<(), String> {
-    crate::remote_oauth::oauth_decide(
-        db.inner(),
-        oauth.inner(),
-        &txn_id,
-        approve,
-        project_id,
-        project_name,
-        project_root,
-        context_id,
-        context_name,
-        fs_write,
-        exec_allowed,
-    )
+    crate::remote_oauth::oauth_decide(db.inner(), oauth.inner(), &txn_id, approve)
 }
 
 /// 已签发的 OAuth 令牌列表（设置页展示与吊销）。

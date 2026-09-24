@@ -543,12 +543,38 @@ import type { DisplayItem } from "../state.svelte";
     return {} as { models?: SessionReadyInfo["response"]["models"]; configOptions?: any[] };
   });
 
-  const liveModels = $derived(sessionInfo?.response?.models ?? caps.models ?? null);
+  // 有绑定会话时只用会话真实返回的列表（session-ready/load 时写入）；
+  // 全局 caps 缓存可能过期——用它兜底会导致选到当前会话不存在的模型 id，
+  // 适配器抛 -32602 Invalid params（codex-acp 在 availableModels 里找不到即抛）
+  const liveModels = $derived(
+    sessionId ? sessionInfo?.response?.models ?? null : sessionInfo?.response?.models ?? caps.models ?? null,
+  );
 
   const cfgItems = $derived.by((): CfgItem[] => {
     const out: CfgItem[] = [];
+    const mapOpts = (list: any[]) =>
+      (list ?? []).map((x: any) => {
+        const v = String(x.value);
+        const zh = zhValue(v);
+        // 值有中文映射用映射；否则尝试按英文名映射；都没有保留原名
+        const name = zh !== v ? zh : t(MODE_NAME_TEXT[String(x.name ?? "").toLowerCase()] ?? x.name);
+        return { value: v, name };
+      });
+    const cfgOpts: any[] = sessionId
+      ? sessionInfo?.response?.configOptions ?? []
+      : sessionInfo?.response?.configOptions ?? caps.configOptions ?? [];
+    for (const o of cfgOpts) {
+      if (o.type && o.type !== "select") continue;
+      if (out.some((x) => x.id === o.id)) continue;
+      // 模型项必须用 configOptions 里的 value：适配器只认自己给出的 id。
+      // models 能力的 modelId 是"模型 (思考等级)"复合 id，codex 会报 -32602。
+      const opts = mapOpts(o.options ?? []);
+      if (!opts.length) continue;
+      out.push({ id: o.id, label: zhLabel(o.id, o.name ?? o.id), value: String(o.currentValue ?? ""), options: opts });
+    }
+    // 回退：适配器没提供 model 配置项时才用 models 能力
     const models = liveModels;
-    if (models?.availableModels?.length) {
+    if (!out.some((x) => x.id === "model") && models?.availableModels?.length) {
       const cur = models.currentModelId ?? models.currentModel ?? "";
       out.push({
         id: "model",
@@ -556,20 +582,6 @@ import type { DisplayItem } from "../state.svelte";
         value: cur,
         options: models.availableModels.map((m) => ({ value: m.modelId, name: m.name })),
       });
-    }
-    const cfgOpts: any[] = sessionInfo?.response?.configOptions ?? caps.configOptions ?? [];
-    for (const o of cfgOpts) {
-      if (o.type && o.type !== "select") continue;
-      if (out.some((x) => x.id === o.id)) continue;
-      const opts = (o.options ?? []).map((x: any) => {
-        const v = String(x.value);
-        const zh = zhValue(v);
-        // 值有中文映射用映射；否则尝试按英文名映射；都没有保留原名
-        const name = zh !== v ? zh : t(MODE_NAME_TEXT[String(x.name ?? "").toLowerCase()] ?? x.name);
-        return { value: v, name };
-      });
-      if (!opts.length) continue;
-      out.push({ id: o.id, label: zhLabel(o.id, o.name ?? o.id), value: String(o.currentValue ?? ""), options: opts });
     }
     return out;
   });
@@ -593,7 +605,21 @@ import type { DisplayItem } from "../state.svelte";
     void api
       .acpSetConfigOption(ctx.id, app.agent, id, value)
       .then(() => toast("ok", t("已应用")))
-      .catch((e) => toast("error", String(e)));
+      .catch((e) => {
+        const msg = String(e);
+        if (msg.includes("-32602") || msg.includes("Invalid params")) {
+          // 会话真实列表与界面不一致（caps 缓存过期/会话列表变化）：
+          // 清掉缓存，重连后拿适配器真实列表
+          delete app.agentCaps[app.agent];
+          void api.settingsSet("caps." + app.agent, "").catch(() => {});
+          toast(
+            "error",
+            t("该选项在当前会话不可用（列表已过期）。请点「重新连接」刷新后重试。"),
+          );
+        } else {
+          toast("error", msg);
+        }
+      });
   }
 
   // 会话配置记忆：session-ready / 重放刷新后，把用户记住的配置（模型/模式等）

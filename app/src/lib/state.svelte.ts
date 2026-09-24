@@ -5,6 +5,7 @@ import type {
   Context,
   ElicitationRequest,
   PermissionRequest,
+  OAuthPending,
   Project,
   Prompt,
   SessionReadyInfo,
@@ -62,6 +63,9 @@ export const app = $state({
   agents: [] as { id: string; name: string }[],
   theme: { preset: "light", accent: "#268f78", radius: 10, font_size: 14 } as ThemeConfig,
   settingsOpen: false,
+  /** 页面切换时也保留待审批请求；标题栏随时可打开全局审批窗口。 */
+  oauthPending: [] as OAuthPending[],
+  oauthConsentOpen: false,
   overlay: null as Overlay,
   /** history-session binding dialog for (agent) */
   historyBind: null as AgentType | null,

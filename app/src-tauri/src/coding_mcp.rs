@@ -420,10 +420,13 @@ fn norm_prefix(p: &Path) -> String {
     s.trim_end_matches(['\\', '/']).to_ascii_lowercase()
 }
 
-fn within_root(child: &Path, root: &Path) -> bool {
+pub(crate) fn within_root(child: &Path, root: &Path) -> bool {
     let c = norm_prefix(child);
     let r = norm_prefix(root);
-    c.starts_with(&r)
+    // 字符串前缀会误把 C:\\work-old 当作 C:\\work 的子目录；必须在目录分隔处截断。
+    if c == r { return true; }
+    if r.is_empty() { return root == Path::new("/") && c.starts_with('\\'); }
+    c.strip_prefix(&r).is_some_and(|rest| rest.starts_with('\\'))
 }
 
 fn safe_path(cfg: &Cfg, raw: &str) -> Result<PathBuf, String> {
@@ -592,12 +595,26 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                 return Err("路径包含 ..，已拒绝。".into());
             }
             match std::fs::symlink_metadata(&joined) {
-                Ok(m) => Ok(json!({
-                    "exists": true,
-                    "is_dir": m.is_dir(),
-                    "is_symlink": m.file_type().is_symlink(),
-                    "size": if m.is_file() { m.len() } else { 0 },
-                })),
+                Ok(m) => {
+                    // 存在的绝对路径也要校验根目录（此前此分支直接返回元数据，可探测任意文件）。
+                    // 符号链接目标不可指向开放目录外；断链只允许读取目录内的链接元数据。
+                    let canonical = if m.file_type().is_symlink() {
+                        std::fs::canonicalize(&joined).or_else(|_| {
+                            std::fs::canonicalize(joined.parent().unwrap_or(&cfg.root))
+                        })
+                    } else {
+                        std::fs::canonicalize(&joined)
+                    }.map_err(|e| format!("路径检查失败：{e}"))?;
+                    if !within_root(&canonical, &cfg.root) {
+                        return Err("路径越界：不在开放目录内".into());
+                    }
+                    Ok(json!({
+                        "exists": true,
+                        "is_dir": m.is_dir(),
+                        "is_symlink": m.file_type().is_symlink(),
+                        "size": if m.is_file() { m.len() } else { 0 },
+                    }))
+                }
                 Err(_) => {
                     let parent = joined.parent().unwrap_or(&cfg.root).to_path_buf();
                     let canon = std::fs::canonicalize(&parent)
@@ -1033,3 +1050,30 @@ fn wait_with_timeout(child: &mut std::process::Child, timeout: u64) -> Option<st
     }
 }
 
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[test]
+    fn exists_and_read_cannot_probe_sibling_or_outside_root() {
+        let base = std::env::temp_dir().join(format!("shidrive-boundary-test-{}", uuid::Uuid::new_v4()));
+        let root = base.join("project");
+        let sibling = base.join("project-backup");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let external_file = sibling.join("secret.txt");
+        std::fs::write(&external_file, "private").unwrap();
+        assert!(within_root(&root, &root));
+        assert!(!within_root(&sibling, &root), "相同前缀不代表子目录");
+        let cfg = Cfg { root, token: String::new(), auth_user: String::new(), auth_pass: String::new(), exec_enabled: false };
+        let args = json!({ "path": external_file.to_string_lossy() });
+        assert!(call_tool(&cfg, "pc.fs.read", &args).is_err());
+        assert!(call_tool(&cfg, "pc.fs.exists", &args).is_err());
+        #[cfg(unix)] {
+            let link = cfg.root.join("link");
+            std::os::unix::fs::symlink(&external_file, &link).unwrap();
+            assert!(call_tool(&cfg, "pc.fs.exists", &json!({ "path": "link" })).is_err());
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+}

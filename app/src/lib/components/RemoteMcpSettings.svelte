@@ -2,10 +2,10 @@
   // 设置 → 外部编程接入（MCP）：远端服务生命周期 + 项目授权列表 + 临时隧道
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
-  import { app, currentProject, toast } from "../state.svelte";
+  import { app, toast } from "../state.svelte";
   import { api } from "../ipc";
   import { t } from "../i18n";
-  import type { Project, Context } from "../types";
+  import type { Context, OAuthToken } from "../types";
 
   interface RemoteStatus {
     running: boolean;
@@ -53,14 +53,8 @@
   // 定时停止：小时数（配置）+ 本地每秒倒计时（3s 轮询之外保持显示活性）
   let timerHours = $state(6);
   let timerTick = $state(0);
-  // OAuth 2.1：待裁决的授权请求 + 已签发令牌
-  interface OAuthPending {
-    txnId: string; clientId: string; clientName: string; redirectUri: string; scopes: string[];
-    projectId: string; projectName: string; projectRoot: string; contexts: Context[]; contextId: string;
-    fsWrite: boolean; execAllowed: boolean;
-  }
-  let oauthPending = $state<OAuthPending[]>([]);
-  let oauthTokens = $state<any[]>([]);
+  // OAuth 待授权弹窗全局常驻；这里仅保留客户端列表及吊销入口。
+  let oauthTokens = $state<OAuthToken[]>([]);
   let cf = $state<{ installed: boolean; path: string; version: string } | null>(null);
   let cfBusy = $state(false);
 
@@ -79,7 +73,7 @@
   }
 
   async function refreshOauthTokens() {
-    oauthTokens = ((await api.remoteOauthTokensList().catch(() => [])) as any[]) ?? [];
+    oauthTokens = await api.remoteOauthTokensList().catch(() => []);
   }
 
   async function refreshCf() {
@@ -114,57 +108,14 @@
       if (d.publicUrl) { void refresh(); toast("ok", t("隧道地址已获取")); }
       else if (d.error) { toast("error", t("隧道地址获取失败，请查看运行日志")); void refresh(); }
     });
-    const unOauth = listen("remote://oauth-consent", (e) => {
-      const d = (e.payload ?? {}) as any;
-      const scopes: string[] = Array.isArray(d.scopes) ? d.scopes : ["fs:read"];
-      const proj = projects[0];
-      const card: OAuthPending = {
-        txnId: d.txnId ?? "", clientId: d.clientId ?? "", clientName: d.clientName ?? "client",
-        redirectUri: d.redirectUri ?? "", scopes,
-        projectId: proj?.id ?? "", projectName: proj?.name ?? "", projectRoot: proj?.root_path ?? "",
-        contexts: [], contextId: "",
-        fsWrite: scopes.includes("fs:write"),
-        execAllowed: scopes.includes("exec"),
-      };
-      oauthPending = [...oauthPending, card];
-      if (proj) void onConsentProjectChange(card, proj.id);
-      toast("info", t("收到 OAuth 授权请求，请在本页处理"));
-    });
+    const oauthPoll = setInterval(() => void refreshOauthTokens(), 4000);
     return () => {
       void un.then((f) => f());
-      void unOauth.then((f) => f());
       void unTimer.then((f) => f());
       clearInterval(tId);
+      clearInterval(oauthPoll);
     };
   });
-
-  // OAuth 授权卡片：切换项目 → 载入该项目上下文
-  async function onConsentProjectChange(card: OAuthPending, id: string) {
-    const proj = app.projects.find((x) => x.id === id);
-    card.projectId = id;
-    card.projectName = proj?.name ?? "";
-    card.projectRoot = proj?.root_path ?? "";
-    card.contexts = id ? await api.contextsList(id).catch(() => []) : [];
-    if (!card.contexts.some((c) => c.id === card.contextId)) card.contextId = "";
-  }
-
-  // OAuth 批准/拒绝：批准时按（可缩减的）scope 创建内部授权行并签发授权码
-  async function consentDecide(card: OAuthPending, approve: boolean) {
-    try {
-      const ctx = card.contexts.find((c) => c.id === card.contextId) ?? null;
-      await api.remoteOauthDecide({
-        txnId: card.txnId, approve,
-        projectId: card.projectId, projectName: card.projectName, projectRoot: card.projectRoot,
-        contextId: ctx?.id ?? null, contextName: ctx?.name ?? "",
-        fsWrite: card.fsWrite, execAllowed: card.execAllowed,
-      });
-      oauthPending = oauthPending.filter((x) => x.txnId !== card.txnId);
-      toast("ok", approve ? t("已批准并签发授权码，客户端页面将自动跳转") : t("已拒绝该授权请求"));
-      if (approve) void refreshOauthTokens();
-    } catch (err) {
-      toast("error", String(err));
-    }
-  }
 
   async function oauthRevoke(id: string) {
     try {
@@ -174,19 +125,6 @@
     } catch (e) {
       toast("error", String(e));
     }
-  }
-
-  function copyOauthMeta() {
-    const meta = {
-      resource: `${publicUrl}/mcp`,
-      authorization_servers: [publicUrl],
-      authorization_endpoint: `${publicUrl}/authorize`,
-      token_endpoint: `${publicUrl}/token`,
-      registration_endpoint: `${publicUrl}/register`,
-      scopes_supported: ["fs:read", "fs:write", "exec", "context"],
-      code_challenge_methods_supported: ["S256"],
-    };
-    void copyText(JSON.stringify(meta, null, 2), t("元数据 JSON 已复制"));
   }
 
   // 切换接入方式：记住选择；服务运行中即时起/停隧道
@@ -573,86 +511,38 @@
   </div>
 
   <div class="sec">
-    <h3>{t("OAuth 授权（MCP 标准握手）")}</h3>
-    {#if publicUrl}
-      <div class="row"><span class="lbl oauth-lbl">{t("受保护资源元数据")}</span><code class="grow oauth-url">{publicUrl}/.well-known/oauth-protected-resource</code><button class="btn sm" onclick={() => void copyText(`${publicUrl}/.well-known/oauth-protected-resource`, t("已复制"))}>{t("复制")}</button></div>
-      <div class="row"><span class="lbl oauth-lbl">{t("客户端注册端点")}</span><code class="grow oauth-url">{publicUrl}/register</code><button class="btn sm" onclick={() => void copyText(`${publicUrl}/register`, t("已复制"))}>{t("复制")}</button></div>
-      <div class="row"><span class="lbl oauth-lbl">{t("授权端点")}</span><code class="grow oauth-url">{publicUrl}/authorize</code><button class="btn sm" onclick={() => void copyText(`${publicUrl}/authorize`, t("已复制"))}>{t("复制")}</button></div>
-      <div class="row"><span class="lbl oauth-lbl">{t("令牌端点")}</span><code class="grow oauth-url">{publicUrl}/token</code><button class="btn sm" onclick={() => void copyText(`${publicUrl}/token`, t("已复制"))}>{t("复制")}</button></div>
-      <div class="row">
-        <button class="btn sm" onclick={copyOauthMeta}>{t("复制元数据 JSON")}</button>
-        <span class="note grow">{t("Claude / ChatGPT 等 MCP 客户端收到 401 后会自动发现以上端点，一般无需手动填写；链接供需要手动配置的客户端使用。")}</span>
-      </div>
-    {:else}
-      <p class="note">{t("服务启动后，这里会基于当前接入地址生成可复制的 OAuth 端点链接。")}</p>
-    {/if}
-
-    {#each oauthPending as card (card.txnId)}
-      <div class="consent-card">
-        <div><b>{card.clientName}</b> <span class="dim mono">{card.clientId}</span></div>
-        <div class="dim mono">{t("回调地址")}：{card.redirectUri}</div>
-        <div class="dim">{t("请求权限")}：{card.scopes.join(" / ")}</div>
-        <div class="row">
-          <label class="lbl">{t("授权项目")}</label>
-          <select value={card.projectId} onchange={(e) => void onConsentProjectChange(card, e.currentTarget.value)}>
-            {#each projects as pj (pj.id)}
-              <option value={pj.id}>{pj.name} · {pj.root_path}</option>
-            {/each}
-          </select>
-          <label class="lbl">{t("共享上下文")}</label>
-          <select value={card.contextId} onchange={(e) => (card.contextId = e.currentTarget.value)}>
-            <option value="">{t("（不开放）")}</option>
-            {#each card.contexts as c (c.id)}
-              <option value={c.id}>{c.name}</option>
-            {/each}
-          </select>
-        </div>
-        <div class="row">
-          {#if card.scopes.includes("fs:write")}
-            <label class="check"><input type="checkbox" bind:checked={card.fsWrite} /> {t("文件读写")}</label>
-          {/if}
-          {#if card.scopes.includes("exec")}
-            <label class="check"><input type="checkbox" bind:checked={card.execAllowed} /> {t("允许命令执行")}</label>
-          {/if}
-          <span class="grow"></span>
-          <button class="btn sm primary" onclick={() => void consentDecide(card, true)}>{t("批准")}</button>
-          <button class="btn sm" onclick={() => void consentDecide(card, false)}>{t("拒绝")}</button>
-        </div>
-      </div>
-    {/each}
-
-    {#if oauthTokens.length}
-      <div class="tbl-wrap">
-        <table class="tbl">
-          <thead>
-            <tr><th>{t("客户端")}</th><th>{t("权限")}</th><th>{t("授权项目")}</th><th>{t("有效期")}</th><th>{t("最近使用")}</th><th>{t("操作")}</th></tr>
-          </thead>
-          <tbody>
-            {#each oauthTokens as tk (tk.id)}
-              <tr class:revoked={!!tk.revoked_at}>
-                <td><span class="mono">{tk.client_id}</span></td>
-                <td><span class="mono">{tk.scopes}</span></td>
-                <td>{tk.grant_name}</td>
-                <td>
-                  {#if tk.revoked_at}
-                    {t("已吊销")}
-                  {:else}
-                    {t("访问")} {tk.expires_in_secs > 0 ? `${Math.floor(tk.expires_in_secs / 60)}${t("分钟")}` : t("已过期")}
-                    · {t("刷新")} {Math.max(0, Math.floor(tk.refresh_expires_in_secs / 86400))}{t("天")}
-                  {/if}
-                </td>
-                <td>{tk.last_used_at ?? "—"}</td>
-                <td class="op">
-                  {#if !tk.revoked_at}
-                    <button class="btn ghost sm" onclick={() => void oauthRevoke(tk.id)}>{t("吊销")}</button>
-                  {/if}
-                </td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
-    {/if}
+    <div class="sec-head-row">
+      <h3>{t("OAuth 客户端")}</h3>
+      {#if app.oauthPending.length}
+        <button class="btn sm primary" onclick={() => (app.oauthConsentOpen = true)}>{t("待授权")}（{app.oauthPending.length}）</button>
+      {/if}
+    </div>
+    <p class="note">{t("OAuth 客户端可通过接入地址自动发现授权流程。批准后复用下方开放目录与上下文；实际能力受请求 scope、授权权限及全局执行开关共同限制。")}</p>
+    <div class="tbl-wrap">
+      <table class="tbl">
+        <thead>
+          <tr><th>{t("客户端")}</th><th>{t("权限")}</th><th>{t("最近使用")}</th><th>{t("操作")}</th></tr>
+        </thead>
+        <tbody>
+          {#each oauthTokens as tk (tk.id)}
+            <tr class:revoked={!!tk.revoked_at}>
+              <td>{tk.client_name || tk.client_id}{#if tk.client_name}<br /><span class="dim mono">{tk.client_id}</span>{/if}</td>
+              <td><span class="mono">{tk.scopes}</span></td>
+              <td>{tk.last_used_at ?? "—"}</td>
+              <td class="op">
+                {#if tk.revoked_at}
+                  {t("已吊销")}
+                {:else}
+                  <button class="btn ghost sm" onclick={() => void oauthRevoke(tk.id)}>{t("吊销")}</button>
+                {/if}
+              </td>
+            </tr>
+          {:else}
+            <tr><td colspan="4" class="none">{t("暂无 OAuth 客户端")}</td></tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
   </div>
 
   <div class="sec">
@@ -783,10 +673,4 @@
   }
   .token-banner code { user-select: text; word-break: break-all; }
   .warn-txt { color: #b57e17; font-weight: 600; }
-  .oauth-lbl { min-width: 9em; }
-  .oauth-url { word-break: break-all; }
-  .consent-card {
-    border: 1px solid rgba(240, 170, 40, .4); background: rgba(240, 170, 40, .06);
-    border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 6px; margin-top: 8px; font-size: .9em;
-  }
 </style>

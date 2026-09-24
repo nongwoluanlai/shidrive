@@ -133,7 +133,8 @@ impl Db {
             let _ = c.execute("ALTER TABLE remote_grants ADD COLUMN token_plain TEXT NOT NULL DEFAULT ''", []);
             let _ = c.execute("ALTER TABLE remote_grants ADD COLUMN paused_at TEXT", []);
 
-            // OAuth 2.1（MCP 标准握手）：动态注册客户端 + 令牌（access/refresh 只存哈希）
+            // OAuth 2.1（MCP 标准握手）：动态注册客户端 + 令牌（access/refresh 只存哈希）。
+            // remote_oauth_tokens.grant_id='' 表示共享当前开放列表；非空值保留旧版单项目令牌。
             let _ = c.execute_batch(
                 "CREATE TABLE IF NOT EXISTS remote_oauth_clients (                  client_id TEXT PRIMARY KEY,                  client_name TEXT NOT NULL DEFAULT '',                  redirect_uris TEXT NOT NULL DEFAULT '[]',                  created_at TEXT NOT NULL                )",
             );

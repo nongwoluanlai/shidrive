@@ -27,6 +27,11 @@
   </div>
 
   <div class="quick">
+    {#if app.oauthPending.length}
+      <button class="qbtn consent-btn" class:active={app.oauthConsentOpen} title={t("查看待授权 OAuth 请求")} onclick={() => (app.oauthConsentOpen = true)}>
+        🔐 {t("待授权")} <span class="consent-count">{app.oauthPending.length}</span>
+      </button>
+    {/if}
     <button class="qbtn" class:active={app.overlay === "sessions"} title={t("会话管理")} onclick={() => (app.overlay = app.overlay === "sessions" ? null : "sessions")}>
       <Icon name="sessions" size={15} /> {t("会话管理")}
     </button>
@@ -122,6 +127,8 @@
   .qbtn.icon-only {
     padding: 7px;
   }
+  .consent-btn { color: var(--warn); }
+  .consent-count { border-radius: 10px; padding: 0 6px; color: #fff; background: var(--warn); }
   .divider {
     width: 1px;
     height: 20px;

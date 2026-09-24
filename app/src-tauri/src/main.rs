@@ -265,6 +265,7 @@ fn main() {
             commands::remote_grant_resume,
             commands::remote_timer_set,
             commands::system_after_action,
+            commands::remote_oauth_pending_list,
             commands::remote_oauth_decide,
             commands::remote_oauth_tokens_list,
             commands::remote_oauth_token_revoke,

@@ -14,6 +14,7 @@ ShiDrive (使驾, "driving seat") is a local-first AI development workbench buil
 - **Visual workflows**: drag / free-wire / double-click editing on a canvas; start, note, toast, env, command (cmd/powershell/python), agent dispatch and delay nodes; parallel branches, scheduled or manual runs, live logs, copy/paste, autosave.
 - **Shared-context MCP**: a local HTTP MCP service (default `127.0.0.1:8345`) exposing project context to agents with a git-like commit model — `context_get/update/history/search` plus six workflow tools, with conflict detection and size limits.
 - **Coding MCP (standalone)**: `shidrive.exe --coding-mcp` exposes file & command tools as a separate process (path-escape protection, Token/Basic auth, execution switch).
+- **External coding access**: Passcode and OAuth access; desktop-wide OAuth consent reuses the current open directories and contexts across projects, with token revocation and standard MCP endpoint discovery. See [merge notes](docs/oauth-global-permissions.md).
 - **File tree & editor**: directory tree, system clipboard interop, open in terminal/explorer, built-in editor.
 - **Desktop integration**: custom title bar and dialogs, dark/light themes; closing the window keeps ShiDrive in the tray (right-click to reopen or quit), optional launch-on-startup.
 - **Zero environment setup**: Node (≥22) is auto-detected, or downloaded as a portable runtime into the user data directory with one click (never touches the system install); adapters install on demand, everything proxy-capable.

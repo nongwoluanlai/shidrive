@@ -602,37 +602,55 @@ impl AgentManager {
         let binding = self.db.get_binding(context_id, agent_type)?;
         if let Some(sid) = binding.and_then(|b| b.session_id) {
             let conn = self.ensure_connected(agent_type).await?;
-            conn.notify("session/cancel", json!({ "sessionId": sid }));
+            // 连接重建过的话先装载会话，避免 cancel 打到适配器不认识的 id 上
+            if !conn.is_loaded(&sid) {
+                if let Some(context) = self.db.get_context_row(context_id) {
+                    let _ = self.ensure_session(&context, agent_type).await;
+                }
+            }
+            let live = self
+                .db
+                .get_binding(context_id, agent_type)
+                .ok()
+                .flatten()
+                .and_then(|b| b.session_id)
+                .unwrap_or(sid);
+            conn.notify("session/cancel", json!({ "sessionId": live }));
         }
         Ok(())
     }
 
     pub async fn set_mode(&self, context_id: &str, agent_type: &str, mode_id: &str) -> Result<(), String> {
-        let binding = self.db.get_binding(context_id, agent_type)?;
-        if let Some(sid) = binding.and_then(|b| b.session_id) {
-            let conn = self.ensure_connected(agent_type).await?;
-            conn.request("session/set_mode", json!({ "sessionId": sid, "modeId": mode_id }), Some(Duration::from_secs(15)))
-                .await?;
-        }
+        let Some(context) = self.db.get_context_row(context_id) else {
+            return Ok(());
+        };
+        let (_conn, sid) = self.ensure_session(&context, agent_type).await?;
+        self.ensure_connected(agent_type)
+            .await?
+            .request("session/set_mode", json!({ "sessionId": sid, "modeId": mode_id }), Some(Duration::from_secs(15)))
+            .await?;
         Ok(())
     }
 
     pub async fn set_config_option(&self, context_id: &str, agent_type: &str, option_id: &str, value: Value) -> Result<(), String> {
-        let binding = self.db.get_binding(context_id, agent_type)?;
-        if let Some(sid) = binding.and_then(|b| b.session_id) {
-            let conn = self.ensure_connected(agent_type).await?;
-            conn.request(
-                "session/set_config_option",
-                // codex-acp expects `configId`; zed-style adapters use `configOptionId` — send both
-                json!({ "sessionId": sid, "configOptionId": option_id, "configId": option_id, "value": value }),
-                Some(Duration::from_secs(15)),
-            )
-            .await?;
-            // 记住模型选择（会话恢复时也能看到）
-            if option_id == "model" {
-                if let Some(m) = value.as_str() {
-                    let _ = self.db.set_binding_model(context_id, agent_type, m);
-                }
+        let Some(context) = self.db.get_context_row(context_id) else {
+            return Ok(());
+        };
+        // 走 ensure_session 而非裸绑定 id：适配器重启后内存中无旧会话，
+        // 直接发请求会得到 "Session ... not found"（-32603）；装载/恢复失败时
+        // ensure_session 会解绑并新建，再对返回的活跃 id 应用配置
+        let (conn, sid) = self.ensure_session(&context, agent_type).await?;
+        conn.request(
+            "session/set_config_option",
+            // codex-acp expects `configId`; zed-style adapters use `configOptionId` — send both
+            json!({ "sessionId": sid, "configOptionId": option_id, "configId": option_id, "value": value }),
+            Some(Duration::from_secs(15)),
+        )
+        .await?;
+        // 记住模型选择（会话恢复时也能看到）
+        if option_id == "model" {
+            if let Some(m) = value.as_str() {
+                let _ = self.db.set_binding_model(context_id, agent_type, m);
             }
         }
         Ok(())

@@ -8,7 +8,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -102,6 +102,13 @@ pub fn grants_list(db: &Arc<Db>) -> Result<Vec<RemoteGrant>, String> {
             .collect::<rusqlite::Result<Vec<RemoteGrant>>>()?;
         Ok(rows)
     })
+}
+
+/// OAuth 共享模式与 Passcode 设置页使用的同一批当前开放授权（不包含已暂停/撤销的行）。
+pub(crate) fn active_grants(db: &Arc<Db>) -> Result<Vec<RemoteGrant>, String> {
+    Ok(grants_list(db)?.into_iter()
+        .filter(|g| g.revoked_at.is_none() && g.paused_at.is_none())
+        .collect())
 }
 
 pub fn grant_create(db: &Arc<Db>, input: &RemoteGrantInput) -> Result<(RemoteGrant, String), String> {
@@ -382,9 +389,7 @@ impl RemoteManager {
 
     pub fn status(&self, db: &Arc<Db>) -> RemoteStatus {
         let guard = self.runtime.read().unwrap_or_else(|p| p.into_inner());
-        let grants_active = grants_list(db)
-            .map(|g| g.iter().filter(|g| g.revoked_at.is_none() && g.paused_at.is_none()).count() as i64)
-            .unwrap_or(0);
+        let grants_active = active_grants(db).map(|g| g.len() as i64).unwrap_or(0);
         match guard.as_ref() {
             Some(rt) => RemoteStatus {
                 running: true,
@@ -897,6 +902,135 @@ pub fn cloudflared_set_path(db: &Arc<Db>, path: &str) -> Result<(), String> {
     db.set_setting("remote.cloudflared_path", p)
 }
 
+// Passcode / 老 OAuth 令牌：原有单授权；新 OAuth 令牌：当前开放列表与请求 scope 的交集。
+enum RemoteAccess {
+    Grant(RemoteGrant),
+    Shared { scopes: String },
+}
+
+const FS_WRITE_TOOLS: &[&str] = &[
+    "pc.fs.write", "pc.fs.writeBatch", "pc.fs.mkdir", "pc.fs.move", "pc.fs.copy", "pc.fs.delete",
+];
+
+fn scope_has(scopes: &str, scope: &str) -> bool {
+    scopes.split_whitespace().any(|s| s == scope)
+}
+
+fn global_exec_enabled(db: &Db) -> bool {
+    db.get_setting("remote.exec_allowed").ok().flatten().as_deref() == Some("1")
+}
+
+fn shared_can_use(grant: &RemoteGrant, scopes: &str, name: &str, global_exec: bool) -> bool {
+    match name {
+        "pc.fs.read" | "pc.fs.list" | "pc.fs.search" | "pc.fs.exists" => scope_has(scopes, "fs:read"),
+        n if FS_WRITE_TOOLS.contains(&n) => scope_has(scopes, "fs:write") && grant.fs_write,
+        "pc.process.exec" => scope_has(scopes, "exec") && global_exec && grant.exec_allowed,
+        _ => false,
+    }
+}
+
+/// 多授权时优先选择明确传入的 grant_id；绝对路径可自动定位已开放的根目录。
+/// 相对路径/无 workdir/批量写入等无法确定目标时必须由客户端指定 grant_id。
+fn select_shared_grant<'a>(
+    grants: &'a [RemoteGrant], scopes: &str, name: &str, args: &serde_json::Value, global_exec: bool,
+) -> Result<&'a RemoteGrant, String> {
+    if let Some(id) = args.get("grant_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        let grant = grants.iter().find(|g| g.id == id).ok_or("授权不存在或已暂停开放")?;
+        if !shared_can_use(grant, scopes, name, global_exec) {
+            return Err("该目录未开放此工具，或客户端 scope / 全局执行开关不允许".into());
+        }
+        return Ok(grant);
+    }
+    let allowed: Vec<&RemoteGrant> = grants.iter()
+        .filter(|g| shared_can_use(g, scopes, name, global_exec))
+        .collect();
+    if allowed.is_empty() {
+        return Err("此工具未获授权：请检查 OAuth scope、开放目录及全局执行开关".into());
+    }
+    if allowed.len() == 1 {
+        return Ok(allowed[0]);
+    }
+    let path = match name {
+        "pc.fs.move" | "pc.fs.copy" => args.get("src").and_then(|v| v.as_str()),
+        "pc.process.exec" => args.get("workdir").or_else(|| args.get("cwd")).and_then(|v| v.as_str()),
+        "pc.fs.writeBatch" => None, // 不可把一批文件悄悄分配到不同目录
+        _ => args.get("path").and_then(|v| v.as_str()),
+    };
+    if let Some(path) = path.map(Path::new).filter(|p| p.is_absolute()) {
+        // 取最近的现存祖先；不存在的目标仍由 coding_mcp::safe_path_parent 最终校验。
+        let mut ancestor = path;
+        while !ancestor.exists() {
+            ancestor = ancestor.parent().ok_or("路径不存在")?;
+        }
+        let canonical = std::fs::canonicalize(ancestor).map_err(|e| e.to_string())?;
+        if let Some(grant) = allowed.into_iter()
+            .filter(|g| std::fs::canonicalize(&g.project_root).ok()
+                .is_some_and(|root| crate::coding_mcp::within_root(&canonical, &root)))
+            .max_by_key(|g| g.project_root.len()) {
+            return Ok(grant);
+        }
+        return Err("路径不在当前可使用的开放目录内".into());
+    }
+    Err("多个目录可用：请先调用 pc.access.list，并在工具参数中传入 grant_id".into())
+}
+
+fn shared_access_list(grants: &[RemoteGrant], scopes: &str, global_exec: bool) -> serde_json::Value {
+    let rows: Vec<_> = grants.iter().filter_map(|g| {
+        let fs_read = scope_has(scopes, "fs:read");
+        let fs_write = scope_has(scopes, "fs:write") && g.fs_write;
+        let exec = scope_has(scopes, "exec") && global_exec && g.exec_allowed;
+        let context = scope_has(scopes, "context") && g.context_enabled && g.context_id.as_deref().is_some_and(|id| !id.is_empty());
+        if !(fs_read || fs_write || exec || context) { return None; }
+        Some(serde_json::json!({
+            "grant_id": g.id,
+            "project_name": g.project_name,
+            "root": if fs_read || fs_write || exec { Some(g.project_root.as_str()) } else { None },
+            "context_id": if context { g.context_id.as_deref() } else { None },
+            "context_name": if context { Some(g.context_name.as_str()) } else { None },
+            "fs_read": fs_read,
+            "fs_write": fs_write,
+            "exec_allowed": exec,
+        }))
+    }).collect();
+    serde_json::json!({ "grants": rows })
+}
+
+/// 再次检查每次调用时的授权行；context_id 在共享模式下必须是已开放的 ID。
+fn authorize_tool<'a>(
+    access: &'a RemoteAccess, shared_grants: &'a [RemoteGrant], db: &Arc<Db>,
+    name: &str, args: &mut serde_json::Value,
+) -> Result<Option<&'a RemoteGrant>, String> {
+    if !args.is_object() { return Err("工具 arguments 必须是对象".into()); }
+    match access {
+        RemoteAccess::Grant(g) => {
+            if name.starts_with("context_") {
+                if !g.context_enabled { return Err("此授权未开放共享上下文".into()); }
+                let cid = g.context_id.as_deref().filter(|s| !s.is_empty()).ok_or("未绑定共享上下文")?;
+                args["context_id"] = serde_json::json!(cid); // 旧模式仍强制绑定
+            } else if name == "pc.process.exec" {
+                if !(global_exec_enabled(db) && g.exec_allowed) { return Err("命令执行未授权".into()); }
+            } else if FS_WRITE_TOOLS.contains(&name) && !g.fs_write {
+                return Err("文件写入未授权（只读）".into());
+            }
+            Ok(Some(g))
+        }
+        RemoteAccess::Shared { scopes } => {
+            if name.starts_with("context_") {
+                if !scope_has(scopes, "context") { return Err("客户端未请求共享上下文 scope".into()); }
+                let cid = args.get("context_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+                    .ok_or("缺少 context_id：请先调用 pc.access.list 查看已开放上下文")?;
+                let g = shared_grants.iter().find(|g| g.context_enabled && g.context_id.as_deref() == Some(cid))
+                    .ok_or("上下文未开放或已暂停")?;
+                grant_touch(db, &g.id);
+                return Ok(None);
+            }
+            let g = select_shared_grant(shared_grants, scopes, name, args, global_exec_enabled(db))?;
+            grant_touch(db, &g.id);
+            Ok(Some(g))
+        }
+    }
+}
+
 fn handle_remote_http(
     mut stream: std::net::TcpStream,
     logs: Arc<Mutex<VecDeque<String>>>,
@@ -1004,10 +1138,10 @@ fn handle_remote_http(
             &format!("WWW-Authenticate: Bearer resource_metadata=\"{origin}/.well-known/oauth-protected-resource\"\r\n"),
         );
     };
-    let grant: RemoteGrant = if token.starts_with("sdo1_") {
-        // OAuth 2.1 访问令牌：查令牌表并映射到内部授权行（同一套越界/工具裁剪/执行门禁）
+    let access = if token.starts_with("sdo1_") {
         match crate::remote_oauth::resolve_access_token(&db, &token) {
-            Ok(Some(g)) => g,
+            Ok(Some(crate::remote_oauth::OAuthAccess::Shared { scopes })) => RemoteAccess::Shared { scopes },
+            Ok(Some(crate::remote_oauth::OAuthAccess::Legacy(g))) => RemoteAccess::Grant(g),
             Ok(None) => {
                 let origin = crate::remote_oauth::origin_from_head(&head);
                 let hdr = format!(
@@ -1028,19 +1162,24 @@ fn handle_remote_http(
         }
     } else {
         let hash = sha256_hex(&token);
-        let grants = grants_list(&db).map_err(|e| e.to_string())?;
+        let grants = grants_list(&db)?;
         match grants.iter().find(|g| ct_eq(&g.token_hash, &hash) && g.revoked_at.is_none()) {
             Some(g) => {
                 grant_touch(&db, &g.id);
-                g.clone()
+                RemoteAccess::Grant(g.clone())
             }
             None => return write_http(&mut stream, 401, "application/json", "{\"error\":\"凭据无效或已撤销\"}"),
         }
     };
-    // 暂停开放：凭据本身有效但该授权已暂停，明确 403 提示去恢复
-    if grant.paused_at.is_some() {
+    // 旧令牌 / Passcode 仍按单条授权暂停；共享 OAuth 只读取当前有效的开放目录。
+    if matches!(&access, RemoteAccess::Grant(g) if g.paused_at.is_some()) {
         return write_http(&mut stream, 403, "application/json", "{\"error\":\"此授权已暂停开放：请在使驾设置中「继续开放」（凭据将刷新）\"}");
     }
+    let shared_grants = if matches!(&access, RemoteAccess::Shared { .. }) {
+        active_grants(&db)?
+    } else {
+        Vec::new()
+    };
 
     // 鉴权通过后再读 body
     while buf.len() < header_end + content_length {
@@ -1078,53 +1217,41 @@ fn handle_remote_http(
             "notifications/initialized" | "notifications/cancelled" => serde_json::Value::Null,
             "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
             "tools/list" => {
-                let tools = scoped_tools(&grant);
+                let tools = match &access {
+                    RemoteAccess::Grant(g) => scoped_tools(g),
+                    RemoteAccess::Shared { scopes } => shared_tools(&shared_grants, scopes, global_exec_enabled(&db)),
+                };
                 serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools } })
             }
             "tools/call" => {
                 let name = msg.pointer("/params/name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 let mut args = msg.pointer("/params/arguments").cloned().unwrap_or(serde_json::json!({}));
-                // 授权边界：context_* 仅在勾选共享上下文时放行，context_id 由服务端固定
-                if name.starts_with("context_") {
-                    if !grant.context_enabled {
-                        return write_http(&mut stream, 403, "application/json", "{\"error\":\"此授权未开放共享上下文\"}");
+                let result = if name == "pc.access.list" {
+                    match &access {
+                        RemoteAccess::Shared { scopes } => Ok(shared_access_list(&shared_grants, scopes, global_exec_enabled(&db))),
+                        RemoteAccess::Grant(_) => Err("此工具仅供共享 OAuth 客户端使用".into()),
                     }
-                    if let Some(cid) = &grant.context_id {
-                        args["context_id"] = serde_json::json!(cid);
-                    }
-                }
-                if name == "pc.process.exec" {
-                    let global = state
-                        .db
-                        .get_setting("remote.exec_allowed")
-                        .ok()
-                        .flatten()
-                        .map(|v| v == "1")
-                        .unwrap_or(false);
-                    if !(global && grant.exec_allowed) {
-                        return write_http(&mut stream, 403, "application/json", "{\"error\":\"命令执行未授权\"}");
-                    }
-                }
-                const FS_WRITE_TOOLS: &[&str] = &[
-                    "pc.fs.write", "pc.fs.writeBatch", "pc.fs.mkdir",
-                    "pc.fs.move", "pc.fs.copy", "pc.fs.delete",
-                ];
-                if FS_WRITE_TOOLS.contains(&name.as_str()) && !grant.fs_write {
-                    return write_http(&mut stream, 403, "application/json", "{\"error\":\"文件写入未授权（只读）\"}");
-                }
-                let result = if name.starts_with("context_") {
-                    crate::mcp::call_tool(&state, &app, &name, &args)
-                } else if name.starts_with("pc.") {
-                    let cfg = crate::coding_mcp::Cfg {
-                        root: PathBuf::from(&grant.project_root),
-                        token: String::new(),
-                        auth_user: String::new(),
-                        auth_pass: String::new(),
-                        exec_enabled: grant.exec_allowed,
-                    };
-                    crate::coding_mcp::call_tool(&cfg, &name, &args)
                 } else {
-                    Err(format!("未知工具 {name}"))
+                    // 每次调用都在当前授权行/客户端 scope 上检查；context_id 不能越权传入。
+                    let authorized = match authorize_tool(&access, &shared_grants, &db, &name, &mut args) {
+                        Ok(g) => g,
+                        Err(e) => return write_http(&mut stream, 403, "application/json", &serde_json::json!({ "error": e }).to_string()),
+                    };
+                    if name.starts_with("context_") {
+                        crate::mcp::call_tool(&state, &app, &name, &args)
+                    } else if name.starts_with("pc.") {
+                        let grant = authorized.ok_or("未找到此工具的授权目录")?;
+                        let cfg = crate::coding_mcp::Cfg {
+                            root: PathBuf::from(&grant.project_root),
+                            token: String::new(),
+                            auth_user: String::new(),
+                            auth_pass: String::new(),
+                            exec_enabled: grant.exec_allowed,
+                        };
+                        crate::coding_mcp::call_tool(&cfg, &name, &args)
+                    } else {
+                        Err(format!("未知工具 {name}"))
+                    }
                 };
                 match result {
                     Ok(v) => serde_json::json!({
@@ -1154,13 +1281,27 @@ fn handle_remote_http(
 }
 
 fn scoped_tools(grant: &RemoteGrant) -> serde_json::Value {
-    let mut tools = vec![
+    tools_for_caps(true, grant.fs_write, grant.exec_allowed, grant.context_enabled, false)
+}
+
+fn shared_tools(grants: &[RemoteGrant], scopes: &str, global_exec: bool) -> serde_json::Value {
+    tools_for_caps(
+        scope_has(scopes, "fs:read") && !grants.is_empty(),
+        scope_has(scopes, "fs:write") && grants.iter().any(|g| g.fs_write),
+        scope_has(scopes, "exec") && global_exec && grants.iter().any(|g| g.exec_allowed),
+        scope_has(scopes, "context") && grants.iter().any(|g| g.context_enabled && g.context_id.as_deref().is_some_and(|id| !id.is_empty())),
+        true,
+    )
+}
+
+fn tools_for_caps(fs_read: bool, fs_write: bool, exec_allowed: bool, context_enabled: bool, shared: bool) -> serde_json::Value {
+    let mut tools = if fs_read { vec![
         serde_json::json!({ "name": "pc.fs.read", "description": "按行读取文本文件（1 起始行号；自动处理 UTF-8/UTF-16 BOM）", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"}, "offset": {"type":"integer","description":"起始行，默认 1"}, "limit": {"type":"integer","description":"行数，默认 2000"} }, "required": ["path"] } }),
         serde_json::json!({ "name": "pc.fs.list", "description": "列出目录（分页；含 size 与 mtime epoch 秒）", "inputSchema": { "type": "object", "properties": { "path": {"type":"string","description":"默认 ."}, "offset": {"type":"integer"}, "limit": {"type":"integer","description":"默认 200"} } } }),
         serde_json::json!({ "name": "pc.fs.search", "description": "字面文本搜索。path 可为目录或单个文件；自动解码 UTF-8/UTF-16 BOM；跳过原因见返回的 skipped 数组", "inputSchema": { "type": "object", "properties": { "query": {"type":"string"}, "path": {"type":"string","description":"目录或文件，默认 ."}, "glob": {"type":"string","description":"文件名通配，默认 *"}, "ignore_case": {"type":"boolean","description":"默认 false"}, "max_results": {"type":"integer","description":"默认 100"} }, "required": ["query"] } }),
         serde_json::json!({ "name": "pc.fs.exists", "description": "检查文件/目录是否存在（返回 exists/is_dir/size）", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"} }, "required": ["path"] } }),
-    ];
-    if grant.fs_write {
+    ] } else { Vec::new() };
+    if fs_write {
         tools.push(serde_json::json!({ "name": "pc.fs.write", "description": "写入文件（原子替换）。encoding=text（默认）或 base64（PNG 等二进制资源直接解码写入）", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"}, "content": {"type":"string","description":"文本内容，或 encoding=base64 时的 base64 字符串"}, "encoding": {"type":"string","enum":["text","base64"],"description":"默认 text"} }, "required": ["path","content"] } }));
         tools.push(serde_json::json!({ "name": "pc.fs.writeBatch", "description": "批量写入多个文件（单次最多 50），减少网络往返", "inputSchema": { "type": "object", "properties": { "items": {"type":"array","maxItems":50,"items":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"encoding":{"type":"string","enum":["text","base64"]}},"required":["path","content"]}} }, "required": ["items"] } }));
         tools.push(serde_json::json!({ "name": "pc.fs.mkdir", "description": "递归创建目录", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"} }, "required": ["path"] } }));
@@ -1168,11 +1309,11 @@ fn scoped_tools(grant: &RemoteGrant) -> serde_json::Value {
         tools.push(serde_json::json!({ "name": "pc.fs.copy", "description": "复制文件或目录（目录递归；符号链接跳过）", "inputSchema": { "type": "object", "properties": { "src": {"type":"string"}, "dst": {"type":"string"} }, "required": ["src","dst"] } }));
         tools.push(serde_json::json!({ "name": "pc.fs.delete", "description": "删除文件或目录（目录必须 recursive=true；不可恢复，谨慎使用）", "inputSchema": { "type": "object", "properties": { "path": {"type":"string"}, "recursive": {"type":"boolean","description":"目录递归删除，默认 false"} }, "required": ["path"] } }));
     }
-    if grant.exec_allowed {
+    if exec_allowed {
         tools.push(serde_json::json!({ "name": "pc.process.exec", "description": "执行命令（需同时开启全局允许执行）。多行脚本用 stdin 传给解释器（如 command=python + stdin=脚本），避免命令行转义", "inputSchema": { "type": "object", "properties": { "command": {"type":"string","description":"单行命令；解释器脚本内容请放 stdin"}, "stdin": {"type":"string","description":"可选：写入子进程标准输入的内容（多行脚本）"}, "workdir": {"type":"string","description":"工作目录，默认授权根目录；cwd 为其别名"}, "cwd": {"type":"string","description":"同 workdir"}, "timeout": {"type":"integer","description":"秒，默认 30"}, "max_output_chars": {"type":"integer","description":"默认 32000"} }, "required": ["command"] } }));
     }
-    if grant.context_enabled {
-        // context_id 由服务端按授权绑定并强制覆盖，无需（也无法）由远端指定
+    if context_enabled {
+        // 单授权强制覆盖 context_id；共享 OAuth 必须显式选择开放的 context_id。
         tools.push(serde_json::json!({ "name": "context_get", "description": "读取共享上下文完整内容（概述/待办/进展/注意/约束 + 当前版本号 version）", "inputSchema": { "type": "object", "properties": {} } }));
         tools.push(serde_json::json!({ "name": "context_get_version", "description": "轻量查询当前版本号与最近一次提交摘要", "inputSchema": { "type": "object", "properties": {} } }));
         tools.push(serde_json::json!({ "name": "context_update", "description": "提交一轮共享上下文更新（git 式）。base_version 不匹配会被拒绝并提示重新读取合并", "inputSchema": { "type": "object", "properties": {
@@ -1190,10 +1331,28 @@ fn scoped_tools(grant: &RemoteGrant) -> serde_json::Value {
         tools.push(serde_json::json!({ "name": "context_history", "description": "浏览提交历史（最新在前）", "inputSchema": { "type": "object", "properties": { "limit": {"type":"integer","description":"默认 20"} } } }));
         tools.push(serde_json::json!({ "name": "context_search", "description": "按关键词搜索历史提交的摘要/涉及文件/内容", "inputSchema": { "type": "object", "properties": { "query": {"type":"string"}, "limit": {"type":"integer"} }, "required": ["query"] } }));
     }
+    if shared {
+        for tool in &mut tools {
+            let name = tool["name"].as_str().unwrap_or_default().to_string();
+            let Some(schema) = tool.get_mut("inputSchema").and_then(|v| v.as_object_mut()) else { continue };
+            let Some(props) = schema.get_mut("properties").and_then(|v| v.as_object_mut()) else { continue };
+            if name.starts_with("context_") {
+                props.insert("context_id".into(), serde_json::json!({ "type": "string", "description": "必填：pc.access.list 返回的开放上下文 ID" }));
+                schema.entry("required").or_insert_with(|| serde_json::json!([]))
+                    .as_array_mut().unwrap().push(serde_json::json!("context_id"));
+            } else {
+                props.insert("grant_id".into(), serde_json::json!({ "type": "string", "description": "多目录且使用相对路径时必填；调用 pc.access.list 获取授权 ID。绝对路径可自动匹配开放目录" }));
+            }
+        }
+        tools.insert(0, serde_json::json!({
+            "name": "pc.access.list", "description": "列出当前开放目录与上下文及其 ID/实际权限。多目录时请在文件或命令工具传 grant_id，在上下文工具传 context_id；权限会随设置中的开放列表变化。",
+            "inputSchema": { "type": "object", "properties": {} }
+        }));
+    }
     serde_json::Value::Array(tools)
 }
 
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
@@ -1259,3 +1418,7 @@ pub(crate) fn write_http_h(stream: &mut std::net::TcpStream, status: u16, ctype:
     let text = format!("{head}{body}");
     stream.write_all(text.as_bytes()).map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+#[path = "remote_mcp_tests.rs"]
+mod tests;

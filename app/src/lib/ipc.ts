@@ -17,6 +17,8 @@ import type {
   SessionInfo,
   SetupStatus,
   NodeStat,
+  OAuthPending,
+  OAuthToken,
   Workflow,
   WorkflowRun,
   WorkflowStep,
@@ -145,11 +147,9 @@ export const api = {
   remoteGrantToken: (id: string) => invoke<{ token: string }>("remote_grant_token", { id }),
   remoteGrantPause: (id: string) => invoke<void>("remote_grant_pause", { id }),
   remoteGrantResume: (id: string) => invoke<void>("remote_grant_resume", { id }),
-  remoteOauthDecide: (args: {
-    txnId: string; approve: boolean; projectId: string; projectName: string; projectRoot: string;
-    contextId: string | null; contextName: string; fsWrite: boolean; execAllowed: boolean;
-  }) => invoke<void>("remote_oauth_decide", args),
-  remoteOauthTokensList: () => invoke<any[]>("remote_oauth_tokens_list"),
+  remoteOauthPendingList: () => invoke<OAuthPending[]>("remote_oauth_pending_list"),
+  remoteOauthDecide: (txnId: string, approve: boolean) => invoke<void>("remote_oauth_decide", { txnId, approve }),
+  remoteOauthTokensList: () => invoke<OAuthToken[]>("remote_oauth_tokens_list"),
   remoteOauthTokenRevoke: (id: string) => invoke<void>("remote_oauth_token_revoke", { id }),
   remoteCloudflaredInstall: () => invoke<string>("remote_cloudflared_install"),
   remoteCloudflaredStatus: () => invoke<{ installed: boolean; path: string; version: string }>("remote_cloudflared_status"),

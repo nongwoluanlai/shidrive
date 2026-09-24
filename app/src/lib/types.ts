@@ -17,6 +17,23 @@ export interface AgentEnvStatusItem {
   auto_env: Record<string, string>;
 }
 
+export interface OAuthPending {
+  txnId: string;
+  clientId: string;
+  clientName: string;
+  redirectUri: string;
+  scopes: string[];
+}
+
+export interface OAuthToken {
+  id: string;
+  client_id: string;
+  client_name: string;
+  scopes: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+}
+
 export interface Project {
   id: string;
   name: string;
