@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { app, chatKey, currentContext, finishTurn, setChatRows, pushLocal, toast, clearChat, sharedContextPrompt, switchAgent, loadChatLocal, saveCfgPref, fullAccessDefault } from "../state.svelte";
 import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { api } from "../ipc";
@@ -52,12 +52,80 @@ import type { DisplayItem } from "../state.svelte";
     return hMap.get(it.id) ?? estHeight(it);
   }
   // 窗口外占位高度（保持滚动条长度与位置大致成比例）
-  const topPad = $derived(items.slice(0, startIdx).reduce((a, it) => a + hOf(it), 0));
-  const botPad = $derived(items.slice(endIdx).reduce((a, it) => a + hOf(it), 0));
+  // 占位高度增量缓存：会话回放/流式期间 items 每条追加都会让 $derived 失效，
+  // 全量 reduce 会造成 O(n²)（数千条的长会话回放直接把主线程打满——页面表现为
+  // 「服务繁忙」：下拉打不开、历史迟迟不出）。策略：
+  // - 顶部前缀 [0..startIdx) 只在 整表替换(chatRev)/窗口移动/测量版本 变化时重算，
+  //   尾部追加不触碰前缀 → 回放期间 O(1)；
+  // - 底部后缀按追加增量累加（每条只消费一次）→ 摊还 O(1)。
+  const chatRevNum = () => app.chatRev[key] ?? 0;
+  const padCache = { rev: -1, start: -1, end: -1, hV: -1, len: -1, top: 0, bot: 0 };
+  const topPad = $derived.by(() => {
+    const rev = chatRevNum();
+    if (padCache.rev !== rev) {
+      // 整表替换（重绑/重放）：顺带清理 hMap 中已死条目的 id —— 每次重绑产生全新
+      // id 序列，不清会随重绑次数线性累积（内存持续上涨的来源之一）
+      hMap.clear();
+      padCache.rev = rev; padCache.start = -1; padCache.end = -1; padCache.len = -1;
+    }
+    if (padCache.hV !== hVersion) {
+      padCache.hV = hVersion; padCache.start = -1; padCache.end = -1;
+    }
+    if (padCache.start < 0 || padCache.start > startIdx) {
+      let sum = 0;
+      for (let i = 0; i < startIdx; i++) sum += hOf(items[i]);
+      padCache.top = sum; padCache.start = startIdx;
+    } else if (padCache.start < startIdx) {
+      // 窗口前滑：离场项从前缀扣除（每项只消费一次，摊还 O(1)）
+      for (let i = padCache.start; i < startIdx; i++) padCache.top -= hOf(items[i]);
+      padCache.start = startIdx;
+    }
+    return Math.max(0, padCache.top);
+  });
+  const botPad = $derived.by(() => {
+    topPad; // 顶部缓存先落地，保证 rev/hV 一致
+    if (padCache.end < 0 || padCache.end > endIdx || padCache.len > items.length) {
+      let sum = 0;
+      for (let i = endIdx; i < items.length; i++) sum += hOf(items[i]);
+      padCache.bot = sum; padCache.end = endIdx; padCache.len = items.length;
+    } else {
+      if (padCache.end < endIdx) {
+        // 窗口下沿前移：进入窗口的项从底部占位扣除
+        for (let i = padCache.end; i < endIdx; i++) padCache.bot -= hOf(items[i]);
+        padCache.end = endIdx;
+      }
+      if (padCache.len < items.length) {
+        // 尾部追加：增量累加（回放/流式每条只消费一次）
+        for (let i = padCache.len; i < items.length; i++) padCache.bot += hOf(items[i]);
+        padCache.len = items.length;
+      }
+    }
+    return Math.max(0, padCache.bot);
+  });
 
-  // 记录当前已渲染消息的实测高度（滚动/开窗后惰性调用）
-  function measureRendered() {
+  // 记录当前已渲染消息的实测高度（滚动/开窗后惰性调用）。
+  // 缩放防护：rAF 合并多次请求；视口宽度未变时跳过（高度自然变化不重测，
+  // 贴底由 ResizeObserver 负责）——否则拖拽缩放时每帧 240 次 getBoundingClientRect
+  // 强制回流 + 占位高度重算 + 再触发布局，形成正反馈把主线程打满。
+  let measureScheduled = false;
+  let lastMeasureWidth = -1;
+  function measureRendered(force = false) {
     if (!listEl) return;
+    if (force) { doMeasure(); return; }
+    if (measureScheduled) return;
+    measureScheduled = true;
+    requestAnimationFrame(() => {
+      measureScheduled = false;
+      if (!listEl) return;
+      const w = listEl.clientWidth;
+      if (w === lastMeasureWidth) return;
+      lastMeasureWidth = w;
+      doMeasure();
+    });
+  }
+  function doMeasure() {
+    if (!listEl) return;
+    lastMeasureWidth = listEl.clientWidth;
     const wrappers = listEl.querySelectorAll<HTMLDivElement>('.msgs-inner > div[id^="msg-"]');
     let changed = false;
     for (const el of wrappers) {
@@ -111,18 +179,23 @@ import type { DisplayItem } from "../state.svelte";
         const rel2 = el2.getBoundingClientRect().top - r2.top;
         listEl.scrollTop = Math.max(0, listEl.scrollTop + rel2 - (align === "center" ? listEl.clientHeight / 2 - el2.offsetHeight / 2 : 24));
       }
-      measureRendered();
+      measureRendered(true);
     });
   }
 
   const chatRev = () => app.chatRev[key] ?? 0;
 
-  // 切换会话/历史重载时：窗口重置到最新一页
+  // 切换会话/历史重载时：窗口重置到最新一页。
+  // items.length 用 untrack 读取：否则回放/流式期间每条追加都会重跑本 effect，
+  // startIdx 跟着尾巴滑动 → 顶部占位前缀逐条重算（O(n²)，长会话回放直接卡死，
+  // 用户表现为"服务繁忙"）。窗口尾随由下方的追加 effect 负责。
   $effect(() => {
     key;
     chatRev();
-    endIdx = items.length;
-    startIdx = Math.max(0, endIdx - CHUNK);
+    untrack(() => {
+      endIdx = items.length;
+      startIdx = Math.max(0, endIdx - CHUNK);
+    });
   });
 
   function loadOlder() {
@@ -148,7 +221,7 @@ import type { DisplayItem } from "../state.svelte";
         if (endIdx - startIdx > MAX_RENDER) endIdx = startIdx + MAX_RENDER;
         await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
         if (first) listEl.scrollTop += first.getBoundingClientRect().top - anchorTop;
-        measureRendered();
+        measureRendered(true);
         if (startIdx === 0 || startIdx === prevStart) break;
         // 仍在占位区深处才继续扩；已离开则停
         if (listEl.scrollTop > Math.min(480, topPad + 120)) break;
@@ -168,7 +241,7 @@ import type { DisplayItem } from "../state.svelte";
     requestAnimationFrame(() => {
       const a2 = listEl?.querySelector('.msgs-inner > div[id^="msg-"]:last-of-type') as HTMLElement | null;
       if (anchor && a2 && listEl) listEl.scrollTop += a2.getBoundingClientRect().bottom - anchorBottom;
-      measureRendered();
+      measureRendered(true);
     });
   }
 
@@ -297,24 +370,41 @@ import type { DisplayItem } from "../state.svelte";
   // 该事件不是用户操作，不能据此取消贴底。
   let lastProgScrollAt = 0;
   let prevScrollTop = 0;
+  let scrollBottomScheduled = false;
   function scrollToBottom() {
     if (!listEl) return;
-    lastProgScrollAt = performance.now();
-    prevScrollTop = listEl.scrollHeight; // 程序置底后的基准
-    listEl.scrollTop = listEl.scrollHeight;
+    // rAF 合并：流式追加/缩放时 ResizeObserver 可能每帧多次触发
+    if (scrollBottomScheduled) return;
+    scrollBottomScheduled = true;
+    requestAnimationFrame(() => {
+      scrollBottomScheduled = false;
+      if (!listEl) return;
+      lastProgScrollAt = performance.now();
+      listEl.scrollTop = listEl.scrollHeight;
+      prevScrollTop = listEl.scrollTop; // 程序置底后的基准（此前误写 scrollHeight，
+      // 导致贴底后首个滚动事件被误判为"用户上滚"而脱离贴底）
+    });
   }
+  let prevScrollH = 0;
+  let prevClientH = 0;
   function onScroll() {
     if (!listEl) return;
     const now = performance.now();
+    // 几何变化（缩放/内容重排/图片加载撑高）引发的滚动事件：只更新基准，
+    // 不做扩窗/导航——否则「重排→滚动→重开窗→测量→占位高度变→再重排」
+    // 正反馈循环会在拖拽缩放时把主线程打满（长会话尤甚）
+    const geometryChanged = listEl.scrollHeight !== prevScrollH || listEl.clientHeight !== prevClientH;
+    prevScrollH = listEl.scrollHeight;
+    prevClientH = listEl.clientHeight;
     // 1) 我们自己的程序滚动 echo（含 rAF 校准）一律忽略
     if (now - lastProgScrollAt < 300) return;
     // 2) 内容撑高/锚定只会让 scrollTop 增大或不变；只有用户向上滚才会让 scrollTop 减小
     const scrolledUp = listEl.scrollTop < prevScrollTop - 2;
     prevScrollTop = listEl.scrollTop;
+    if (scrolledUp) stickToBottom = false;
+    if (geometryChanged) return;
     if (scrolledUp) {
-      stickToBottom = false;
-      // 上滚同样要做顶部检查——此前此处直接 return，进入占位区永远不扩窗，
-      // 滚到顶只能看到大片空白（占位块）
+      // 上滚同样要做顶部检查——此前此处直接 return，进入占位区永远不扩窗
       if (startIdx > 0 && listEl.scrollTop < Math.min(480, topPad + 120)) {
         void onListScrollTop();
       } else if (startIdx > 0 && topPad > 0) {
@@ -330,8 +420,11 @@ import type { DisplayItem } from "../state.svelte";
 
   // 拖动滚动条直接跳进顶部占位区深处：按滚动比例换算目标索引，整窗重开到该处，
   // 而不是从当前窗口按 30 条逐步扩（那要滚很多轮才能把数千像素占位消费完）。
+  let lastNavAt = 0;
   async function navigatePadIfNeeded() {
     if (!listEl || startIdx === 0 || topPad <= 0) return;
+    if (performance.now() - lastNavAt < 400) return; // 防重排风暴下连环重开窗
+    lastNavAt = performance.now();
     const first = listEl.querySelector('.msgs-inner > div[id^="msg-"]') as HTMLElement | null;
     if (!first) return;
     const listRect = listEl.getBoundingClientRect();
@@ -353,7 +446,7 @@ import type { DisplayItem } from "../state.svelte";
       void el.offsetWidth;
       el.classList.add("flash");
     }
-    measureRendered();
+    measureRendered(true);
   }
 
   // 内容高度一变（历史重放渲染完成、流式追加、图片/字体加载）即贴底：
@@ -374,9 +467,16 @@ import type { DisplayItem } from "../state.svelte";
     }
     if (!(await confirmDialog({ title: t("新建会话"), message: t("创建新会话？当前绑定的 AI 会话将被解绑（AI 端历史仍保留）。") }))) return;
     try {
-      await api.bindingUnbind(ctx.id, app.agent);
-      clearChat(key);
-      const sid = await api.acpSessionNew(ctx, app.agent);
+      let sid: string;
+      if (app.agent === "deepseek") {
+        // 失败时保留旧绑定与聊天记录；只在真正建成新会话后替换。
+        sid = await api.acpDeepseekNew(ctx);
+        clearChat(key);
+      } else {
+        await api.bindingUnbind(ctx.id, app.agent);
+        clearChat(key);
+        sid = await api.acpSessionNew(ctx, app.agent);
+      }
       app.bindingSession[key] = sid;
       bindingTitle = t("新会话");
       stickToBottom = true;
@@ -625,13 +725,20 @@ import type { DisplayItem } from "../state.svelte";
   // 重新套用，避免被适配器默认值刷掉。无记忆时，给支持"完全访问"类档位的
   // 配置项一次性套默认完全访问（用户随后可改，改动即被记住）。
   let cfgAppliedKey = "";
+  let cfgApplying = false;
+  let cfgAppliedSession = "";
   $effect(() => {
     const info = sessionInfo;
     const sid = sessionId;
     if (!info?.response || !sid || !ctx) return;
     const sig = JSON.stringify(info.response.configOptions ?? []) + JSON.stringify(info.response.models ?? {});
     if (sig === cfgAppliedKey) return;
+    // 同一会话只自动回放一次；正在回放时跳过——防止「回放→session-ready 刷新→
+    // 再回放」的 IPC 风暴（曾把 Win32 消息队列灌爆导致整个应用假死）
+    if (cfgApplying || cfgAppliedSession === sid) return;
     cfgAppliedKey = sig;
+    cfgAppliedSession = sid;
+    cfgApplying = true;
     for (const item of cfgItems) {
       const remembered = app.cfgPref[`${app.agent}:${item.id}`];
       const desired = remembered ?? (item.id === "model" ? undefined : fullAccessDefault(item.id, item.options.map((o) => o.value)));
@@ -642,7 +749,12 @@ import type { DisplayItem } from "../state.svelte";
       const opt = info.response.configOptions?.find((o) => o.id === item.id);
       if (opt) opt.currentValue = desired;
       saveCfgPref(app.agent, item.id, desired);
-      void api.acpSetConfigOption(ctx.id, app.agent, item.id, desired).catch(() => {});
+      void api
+        .acpSetConfigOption(ctx.id, app.agent, item.id, desired)
+        .catch(() => {})
+        .finally(() => {
+          if (cfgAppliedSession === sid) cfgApplying = false;
+        });
     }
   });
 

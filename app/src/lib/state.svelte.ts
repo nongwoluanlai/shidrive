@@ -201,15 +201,34 @@ export function persistChat(key: string) {
   clearTimeout(persistTimers[key]);
   persistTimers[key] = setTimeout(() => {
     const snapshot = (app.chat[key] ?? []).map((it) => ({ ...it, streaming: false }));
-    void api.chatStoreSet(key, JSON.stringify(snapshot)).catch(() => {});
+    let json: string;
+    try {
+      json = JSON.stringify(snapshot);
+    } catch {
+      return;
+    }
+    // 超大快照不落库：巨型会话整份 stringify+IPC 会造成数倍内存放大
+    // （配合后端重放截断，正常会话远达不到该上限）
+    if (json.length > 8 * 1024 * 1024) {
+      console.info("[chat] snapshot too large, skip persist");
+      return;
+    }
+    void api.chatStoreSet(key, json).catch(() => {});
   }, 400);
 }
 
-/** 从本地库载入某会话的历史（无记录返回 null）。 */
+/** 从本地库载入某会话的历史（无记录返回 null）。
+ * 超大快照（历史版本可能在截断策略前落库）不载入并删除该行：
+ * 全量载入会造成与绑定重放同样的内存放大；下次打开走适配器重放（已截断）。 */
 export async function loadChatLocal(key: string): Promise<DisplayItem[] | null> {
   try {
     const raw = await api.chatStoreGet(key);
     if (!raw) return null;
+    if (raw.length > 8 * 1024 * 1024) {
+      void api.chatStoreDelete(key).catch(() => {});
+      console.info("[chat] local snapshot too large, dropped");
+      return null;
+    }
     const rows = JSON.parse(raw) as DisplayItem[];
     return Array.isArray(rows) && rows.length ? rows : null;
   } catch {

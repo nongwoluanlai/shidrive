@@ -147,6 +147,8 @@
       await refreshEnabled();
     } catch (e) {
       toast("error", String(e));
+      // 修复失败会撤销 DeepSeek 就绪标记；立即刷新，勿继续显示旧的“就绪”。
+      if (r.id === "deepseek") await loadRegistry();
     } finally {
       busy = null;
     }
@@ -230,7 +232,7 @@
 </script>
 
 <div class="agents-admin">
-  <p class="hint">{t("默认全部停用。启用后会话页顶部出现对应 Agent 标签；顺序即标签顺序（用 ↑↓ 调整）。npm 类工具：展开该行点「安装适配器」自动下载到用户数据目录（跳过大体积平台二进制，可配代理）；二进制类（Cursor/OpenCode）手动填命令路径。")}</p>
+  <p class="hint">{t("默认全部停用。启用后会话页顶部出现对应 Agent 标签；顺序即标签顺序（用 ↑↓ 调整）。npm 类工具：展开该行点「安装适配器」自动下载到用户数据目录（DeepSeek 会安装运行必需的原生依赖，可配代理）；二进制类（Cursor/OpenCode）手动填命令路径。")}</p>
   <div class="rows">
     {#each sortedRegistry as r (r.id)}
       <div class="agent-row" class:open={expanded === r.id} class:on={r.enabled}>
@@ -266,7 +268,7 @@
             {#if r.npm && !r.adapter_ready}
               <div class="cfg-line">
                 <button class="btn sm primary" disabled={busy === r.id} onclick={() => install(r)}>
-                  {busy === r.id ? t("安装中…") : t("安装适配器")}
+                  {busy === r.id ? t("安装中…") : t(r.id === "deepseek" ? "安装/修复 DeepSeek 适配器" : "安装适配器")}
                 </button>
                 <span class="pend">{t("安装后即可连接（npm：{package}）", { package: r.npm })}</span>
               </div>
@@ -275,6 +277,11 @@
                 <button class="btn sm" disabled={busy === r.id} onclick={() => uninstall(r)}>
                   {busy === r.id ? t("卸载中…") : t("卸载适配器")}
                 </button>
+                {#if r.id === "deepseek"}
+                  <button class="btn sm" disabled={busy === r.id} onclick={() => install(r)}>
+                    {busy === r.id ? t("修复中…") : t("检查并修复适配器")}
+                  </button>
+                {/if}
                 <span class="pend">{t("卸载后需重新安装才能连接")}</span>
               </div>
             {/if}

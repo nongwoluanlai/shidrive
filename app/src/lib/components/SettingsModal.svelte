@@ -83,6 +83,9 @@
       const ready = /^Node (.+) 已就绪（(.*)\)$/.exec(msg);
       toast("ok", ready ? t("Node {version} 已就绪（{path}）", { version: ready[1], path: ready[2] }) : msg);
       await loadNodeStatus();
+      if (nodePath.trim()) {
+        toast("warn", t("已下载 Node22，但自定义 Node 路径仍会优先使用；请清空自定义路径、保存并重启使驾。"));
+      }
     } catch (e) {
       toast("error", String(e));
     } finally {
@@ -250,6 +253,8 @@
             </div>
             {#if nodeStat && !nodeStat.ok}
               <p class="note warn">{nodeStat.source === "未找到" ? t("未检测到可用的 Node（≥ 22）") : t("检测到 {version}（{source}），版本过低或不可用", { version: nodeStat.version || t("不可用的 Node"), source: t(nodeStat.source) })}</p>
+            {:else if nodeStat && !nodeStat.deepseek_ok}
+              <p class="note warn">{t("当前实际使用的 Node {version} 不满足 DeepSeek 要求（Node 22.19+）；请下载内置 Node22，如配置了自定义 Node 则清除并重启。", { version: nodeStat.version })}</p>
             {/if}
             <div class="rowbtns">
               <button class="btn sm" disabled={nodeBusy} onclick={downloadNode}>{t(nodeBusy ? "下载中…" : "下载 node22（Windows x64）")}</button>

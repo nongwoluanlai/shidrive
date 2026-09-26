@@ -19,6 +19,23 @@ fn configured_env_path(env: &std::collections::BTreeMap<String, String>, key: &s
         .filter(|v| !v.trim().is_empty()).map(std::path::PathBuf::from)
 }
 
+fn retry_new_without_mcp(agent_type: &str, with_mcp: &Value) -> bool {
+    // DeepSeek declares HTTP MCP support. A -32603 persistence failure is NOT
+    // an MCP rejection: retrying it on the same bridge hides the first error
+    // behind "the ACP bridge has been disposed" and may create duplicate sessions.
+    agent_type != "deepseek" && with_mcp.as_array().is_some_and(|a| !a.is_empty())
+}
+
+fn deepseek_new_error(error: &str) -> String {
+    if error.contains("ACP session persistence flush failed") {
+        format!("DeepSeek 会话持久化失败。请在「Agent 管理」修复 DeepSeek 适配器（需要可选原生依赖），并检查 DSH_HOME/用户数据目录的写权限与磁盘空间。原始错误：{error}")
+    } else if error.contains("the ACP bridge has been disposed") {
+        format!("DeepSeek ACP 桥已关闭；请在「Agent 管理」修复适配器或检查数据目录权限。原始错误：{error}")
+    } else {
+        format!("DeepSeek 创建会话失败：{error}")
+    }
+}
+
 #[cfg(test)]
 mod audit_tests {
     use super::*;
@@ -30,6 +47,19 @@ mod audit_tests {
         ]);
         assert_eq!(configured_env_path(&env, "ZCODE_BIN"), Some("custom/zcode.cjs".into()));
         assert_eq!(configured_env_path(&env, "ZCODE_NODE"), Some("custom/node.exe".into()));
+    }
+
+    #[test]
+    fn deepseek_first_session_error_is_not_overwritten_by_mcp_retry() {
+        let with_mcp = json!([{ "type": "http", "name": "shidrive", "url": "http://127.0.0.1/mcp" }]);
+        assert!(!retry_new_without_mcp("deepseek", &with_mcp));
+        assert!(retry_new_without_mcp("codex", &with_mcp));
+        let original = "Internal error (code -32603)（{\"details\":\"ACP session persistence flush failed\"}）";
+        let shown = deepseek_new_error(original);
+        assert!(shown.contains("ACP session persistence flush failed"));
+        assert!(shown.contains("修复 DeepSeek 适配器"));
+        let disposed = deepseek_new_error("Internal error: the ACP bridge has been disposed (code -32603)");
+        assert!(disposed.contains("bridge has been disposed"));
     }
 }
 
@@ -76,6 +106,7 @@ pub struct AgentManager {
     overrides: RwLock<HashMap<String, AgentLaunch>>,
     /// Serialize connect, disconnect and config replacement for each adapter.
     connection_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    bind_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// serializes prompts per (context_id, agent_type) so a UI turn and a
     /// workflow turn on the same binding never interleave
     prompt_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -93,7 +124,7 @@ impl AgentManager {
                 }
             }
         }
-        Self { app, db, tools, conns: RwLock::new(HashMap::new()), overrides: RwLock::new(overrides), connection_locks: std::sync::Mutex::new(HashMap::new()), prompt_locks: std::sync::Mutex::new(HashMap::new()) }
+        Self { app, db, tools, conns: RwLock::new(HashMap::new()), overrides: RwLock::new(overrides), connection_locks: std::sync::Mutex::new(HashMap::new()), bind_locks: std::sync::Mutex::new(HashMap::new()), prompt_locks: std::sync::Mutex::new(HashMap::new()) }
     }
 
     fn prompt_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -108,6 +139,13 @@ impl AgentManager {
 
     fn connection_lock(&self, agent_type: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.connection_locks.lock().unwrap().entry(agent_type.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    }
+
+    /// 绑定互斥（与 connection_lock 分离：bind_session 内部还会经
+    /// ensure_connected/disconnect 获取 connection_lock，同一把锁会自死锁）
+    fn bind_lock(&self, agent_type: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.bind_locks.lock().unwrap().entry(agent_type.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
     }
 
@@ -203,10 +241,54 @@ impl AgentManager {
         }
     }
 
+    /// Verify the freshly installed DeepSeek binary, including lazy native dependencies.
+    /// A successful initialize alone is insufficient: missing Koffi/flock fails at session/new.
+    /// DSH_HOME is disposable so this never deletes or modifies the user's ~/.dsh sessions.
+    pub async fn probe_deepseek_adapter(&self, script: &std::path::Path) -> Result<(), String> {
+        struct ProbeHome(std::path::PathBuf);
+        impl Drop for ProbeHome {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+
+        let node = crate::node_rt::require_deepseek_node(&self.tools)?;
+        let root = crate::agents::managed_deepseek_dir().ok_or("无法确定 DeepSeek 安装目录")?;
+        let home = ProbeHome(root.join(format!(".probe-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir_all(&home.0).map_err(|e| format!("创建 DeepSeek 校验目录失败: {e}"))?;
+        let launch = AgentLaunch {
+            command: node.to_string_lossy().to_string(),
+            args: vec![
+                "--disable-warning=ExperimentalWarning".into(),
+                script.to_string_lossy().to_string(),
+                "--profile".into(), "acp".into(),
+            ],
+            env: std::collections::BTreeMap::from([("DSH_HOME".into(), home.0.to_string_lossy().to_string())]),
+        };
+        // 探针的状态事件使用独立 id，避免 initialize 成功时误把真实
+        // DeepSeek 连接显示成“已连接”（它还没有通过 session/new）。
+        let conn = AcpConnection::spawn(self.app.clone(), "deepseek-probe", &launch).await
+            .map_err(|e| format!("DeepSeek 安装校验：ACP initialize 失败: {e}"))?;
+        let result = async {
+            let cwd = home.0.to_string_lossy().to_string();
+            let res = conn.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }), Some(Duration::from_secs(90))).await
+                .map_err(|e| format!("DeepSeek 安装校验：session/new 失败: {e}"))?;
+            let sid = res.get("sessionId").and_then(Value::as_str)
+                .filter(|sid| !sid.is_empty()).ok_or("DeepSeek 安装校验：session/new 未返回 sessionId")?;
+            conn.request("session/close", json!({ "sessionId": sid }), Some(Duration::from_secs(30))).await
+                .map_err(|e| format!("DeepSeek 安装校验：session/close 失败: {e}"))?;
+            Ok::<(), String>(())
+        }.await;
+        conn.shutdown();
+        result
+    }
+
     pub async fn launch_for(&self, agent_type: &str) -> Result<AgentLaunch, String> {
         let manual = self.override_for(agent_type).await;
         if !manual.command.trim().is_empty() {
             return Ok(manual);
+        }
+        if agent_type == "deepseek" {
+            // 检查将真正执行 dsh 的 Node；不能依赖仅查 major 的通用状态。
+            crate::node_rt::require_deepseek_node(&self.tools)?;
         }
         let sp = crate::agents::spec(agent_type)
             .ok_or_else(|| format!("未知的 Agent 类型：{agent_type}（可在「设置 → Agent 管理」启用更多工具）"))?;
@@ -334,8 +416,8 @@ impl AgentManager {
     }
 
     /// mcpServers for session/new: inject the ShiDrive MCP endpoint when the
-    /// adapter supports HTTP MCP (or hasn't declared a capability). On failure
-    /// the caller retries without it.
+    /// adapter supports HTTP MCP (or hasn't declared a capability). Other agents
+    /// retain their old retry without MCP; DeepSeek preserves the first error.
     fn mcp_servers_param(&self, conn: &AcpConnection) -> Value {
         if conn.mcp_degraded() {
             return json!([]);
@@ -364,8 +446,19 @@ impl AgentManager {
         match res {
             Ok(r) => Ok((r.get("sessionId").and_then(|s| s.as_str()).unwrap_or_default().to_string(), r)),
             Err(e) => {
-                if !with_mcp.as_array().map(|a| a.is_empty()).unwrap_or(true) {
-                    // retry without the injected MCP server (adapter may not support http type)
+                if conn.agent_type == "deepseek" {
+                    // 首次错误通常含 persistence flush failed；不能在同一桥上重试
+                    // 造成第二个 disposed 错误覆盖它。连接可能已经被 dsh 关闭。
+                    log::warn!("[deepseek] first session/new failed: {e}");
+                    if e.contains("the ACP bridge has been disposed")
+                        || e.contains("ACP session persistence flush failed")
+                    {
+                        self.disconnect("deepseek").await;
+                    }
+                    return Err(deepseek_new_error(&e));
+                }
+                if retry_new_without_mcp(&conn.agent_type, &with_mcp) {
+                    // 其他适配器保留原有的无 MCP 回退行为。
                     let res = conn
                         .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }), Some(Duration::from_secs(90)))
                         .await?;
@@ -382,6 +475,14 @@ impl AgentManager {
 
     /// Ensure a live session for (context, agent): resume via session/load when bound.
     pub async fn ensure_session(&self, context: &Context, agent_type: &str) -> Result<(Arc<AcpConnection>, String), String> {
+        self.ensure_session_inner(context, agent_type, true).await
+    }
+
+    /// `emit_ready=false`：装载/恢复会话但不广播 session-ready。
+    /// 供 set_config_option/set_mode 使用——它们在每轮配置回放里都会调用本函数，
+    /// 若此时广播 session-ready，前端「会话配置记忆」effect 会重套配置并再次
+    /// 触发本函数，形成 IPC 风暴直至 Win32 消息队列耗尽（0x80070718）。
+    pub async fn ensure_session_inner(&self, context: &Context, agent_type: &str, emit_ready: bool) -> Result<(Arc<AcpConnection>, String), String> {
         let cwd = self.project_root_for(context);
         let conn = self.ensure_connected(agent_type).await?;
         let binding = self.db.get_binding(&context.id, agent_type)?;
@@ -395,10 +496,12 @@ impl AgentManager {
                         let _ = self.app.emit("acp://update", json!({ "agentType": agent_type, "sessionExpired": true, "contextId": context.id, "detail": e }));
                     } else {
                         let caps = conn.cached_caps();
-                        let _ = self.app.emit(
-                            "acp://session-ready",
-                            json!({ "agentType": agent_type, "contextId": context.id, "sessionId": sid, "title": self.db.get_binding(&context.id, agent_type).ok().flatten().and_then(|b| b.title), "response": caps }),
-                        );
+                        if emit_ready {
+                            let _ = self.app.emit(
+                                "acp://session-ready",
+                                json!({ "agentType": agent_type, "contextId": context.id, "sessionId": sid, "title": self.db.get_binding(&context.id, agent_type).ok().flatten().and_then(|b| b.title), "response": caps }),
+                            );
+                        }
                         return Ok((conn, sid));
                     }
                 } else {
@@ -412,20 +515,37 @@ impl AgentManager {
             }
         }
 
-        // create a fresh session
-        let (sid, res) = self.session_new_impl(&conn, context).await?;
+        let sid = self.create_and_bind_session(&conn, context, agent_type, emit_ready).await?;
+        Ok((conn, sid))
+    }
+
+    /// For an explicit DeepSeek New Session: keep the old binding until session/new
+    /// succeeds. A disposed bridge must not erase the user's current session.
+    pub async fn create_fresh_deepseek_session(&self, context: &Context) -> Result<String, String> {
+        let conn = self.ensure_connected("deepseek").await?;
+        self.create_and_bind_session(&conn, context, "deepseek", true).await
+    }
+
+    async fn create_and_bind_session(
+        &self, conn: &AcpConnection, context: &Context, agent_type: &str, emit_ready: bool,
+    ) -> Result<String, String> {
+        let (sid, res) = self.session_new_impl(conn, context).await?;
         if sid.is_empty() {
             return Err("适配器未返回 sessionId".into());
         }
+        let cwd = self.project_root_for(context);
         conn.mark_loaded(&sid);
-        let title = res.get("title").and_then(|t| t.as_str()).map(|s| s.to_string());
+        let title = res.get("title").and_then(Value::as_str).map(|s| s.to_string())
+            .or_else(|| (agent_type == "deepseek").then(|| "新会话".to_string()));
         conn.cache_caps(&res);
         self.db.set_binding_session(&context.id, agent_type, Some(&sid), title.as_deref(), Some(&cwd))?;
-        let _ = self.app.emit(
-            "acp://session-ready",
-            json!({ "agentType": agent_type, "contextId": context.id, "sessionId": sid, "title": title, "response": res }),
-        );
-        Ok((conn, sid))
+        if emit_ready {
+            let _ = self.app.emit(
+                "acp://session-ready",
+                json!({ "agentType": agent_type, "contextId": context.id, "sessionId": sid, "title": title, "response": res }),
+            );
+        }
+        Ok(sid)
     }
 
     /// session/load with replay capture. Returns the transcript rows on success.
@@ -460,6 +580,10 @@ impl AgentManager {
         title: Option<&str>,
         silent: bool,
     ) -> Result<Vec<ReplayRow>, String> {
+        // 串行化同 agent 的绑定（独立锁：connection_lock 在内部的
+        // ensure_connected/disconnect 里还会获取，同锁重入会自死锁）
+        let lock = self.bind_lock(agent_type);
+        let _guard = lock.lock().await;
         let _ = silent;
         let cwd = self.project_root_for(context);
         let mut conn = self.ensure_connected(agent_type).await?;
@@ -624,7 +748,7 @@ impl AgentManager {
         let Some(context) = self.db.get_context_row(context_id) else {
             return Ok(());
         };
-        let (_conn, sid) = self.ensure_session(&context, agent_type).await?;
+        let (_conn, sid) = self.ensure_session_inner(&context, agent_type, false).await?;
         self.ensure_connected(agent_type)
             .await?
             .request("session/set_mode", json!({ "sessionId": sid, "modeId": mode_id }), Some(Duration::from_secs(15)))
@@ -638,8 +762,10 @@ impl AgentManager {
         };
         // 走 ensure_session 而非裸绑定 id：适配器重启后内存中无旧会话，
         // 直接发请求会得到 "Session ... not found"（-32603）；装载/恢复失败时
-        // ensure_session 会解绑并新建，再对返回的活跃 id 应用配置
-        let (conn, sid) = self.ensure_session(&context, agent_type).await?;
+        // ensure_session 会解绑并新建，再对返回的活跃 id 应用配置。
+        // quiet（不发 session-ready）：否则前端「配置记忆」effect 重套配置再触发
+        // 本函数，形成 IPC 风暴直至 Win32 消息队列耗尽
+        let (conn, sid) = self.ensure_session_inner(&context, agent_type, false).await?;
         conn.request(
             "session/set_config_option",
             // codex-acp expects `configId`; zed-style adapters use `configOptionId` — send both
@@ -705,6 +831,24 @@ impl AgentManager {
 }
 
 /// Convert captured session/load replay updates into (role, content) chat rows.
+/// 单条内容上限（字节）。超限保留头 48KB + 尾 16KB 并插入截断标记：
+/// 巨型会话（含大量工具输出/图鉴类内容）整份转录灌进前端会造成
+/// 数倍的内存放大（rows → items → 深代理 → persist stringify → IPC 副本），
+/// 渲染只需摘要即可；完整数据仍在适配器会话里。
+fn cap_str(s: String) -> String {
+    const LIMIT: usize = 64 * 1024;
+    if s.len() <= LIMIT {
+        return s;
+    }
+    let head = &s[..s.floor_char_boundary(48 * 1024).min(s.len())];
+    let tail_from = s.floor_char_boundary(s.len().saturating_sub(16 * 1024));
+    let tail = &s[tail_from..];
+    format!(
+        "{head}\n\n…[已截断 {}KB：查看完整内容请参考原始会话]\n\n{tail}",
+        (s.len() - head.len() - tail.len()) / 1024
+    )
+}
+
 fn replay_to_messages(updates: &[Value]) -> Vec<(String, String)> {
     fn text_of(content: &Value) -> String {
         match content {
@@ -726,17 +870,17 @@ fn replay_to_messages(updates: &[Value]) -> Vec<(String, String)> {
     macro_rules! flush {
         ($out:expr, $user:expr, $thought:expr, $assistant:expr, $tools:expr) => {
             if !$user.is_empty() {
-                $out.push(("user".to_string(), std::mem::take(&mut $user)));
+                $out.push(("user".to_string(), cap_str(std::mem::take(&mut $user))));
             }
             if !$thought.is_empty() {
-                $out.push(("thought".to_string(), std::mem::take(&mut $thought)));
+                $out.push(("thought".to_string(), cap_str(std::mem::take(&mut $thought))));
             }
             if !$tools.is_empty() {
-                $out.push(("tools".to_string(), serde_json::to_string(&$tools).unwrap_or_else(|_| "[]".into())));
+                $out.push(("tools".to_string(), cap_str(serde_json::to_string(&$tools).unwrap_or_else(|_| "[]".into()))));
                 $tools.clear();
             }
             if !$assistant.is_empty() {
-                $out.push(("assistant".to_string(), std::mem::take(&mut $assistant)));
+                $out.push(("assistant".to_string(), cap_str(std::mem::take(&mut $assistant))));
             }
         };
     }

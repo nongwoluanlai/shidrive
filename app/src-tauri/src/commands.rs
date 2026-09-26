@@ -172,10 +172,15 @@ pub async fn acp_disconnect(agents: AgentsState<'_>, agent_type: String) -> Resu
 #[tauri::command]
 pub async fn acp_session_new(agents: AgentsState<'_>, context: Context, agent_type: String) -> Result<String, String> {
     // ensure_session reuses the bound session (resuming it when needed);
-    // for a brand-new session the frontend unbinds first.
+    // for a brand-new session the frontend unbinds first (except DeepSeek below).
     let (conn, sid) = agents.ensure_session(&context, &agent_type).await?;
     let _ = conn;
     Ok(sid)
+}
+
+#[tauri::command]
+pub async fn acp_deepseek_new(agents: AgentsState<'_>, context: Context) -> Result<String, String> {
+    agents.create_fresh_deepseek_session(&context).await
 }
 
 #[tauri::command]
@@ -494,7 +499,25 @@ pub async fn agents_bootstrap(agents: AgentsState<'_>, db: DbState<'_>, id: Stri
         .flatten()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    crate::agents::bootstrap_adapter(&agents.tools, pkg, proxy.as_deref())
+    let deepseek = id == "deepseek";
+    if deepseek {
+        // 旧 ACP 桥可能已 disposed；修复前先结束连接，避免继续复用或安装时占用文件。
+        agents.disconnect("deepseek").await;
+    }
+    let tools = agents.tools.clone();
+    let pkg = pkg.as_str().to_owned();
+    let installed = tauri::async_runtime::spawn_blocking(move || {
+        crate::agents::bootstrap_adapter(&tools, &pkg, proxy.as_deref())
+    }).await.map_err(|e| format!("安装任务失败: {e}"))??;
+    if deepseek {
+        let script = crate::agents::deepseek_install_candidate()
+            .ok_or("DeepSeek npm 安装后找不到 dsh 入口，未标记就绪")?;
+        agents.probe_deepseek_adapter(&script).await.map_err(|e| {
+            format!("DeepSeek 安装未通过 ACP 建会话自检，未标记就绪：{e}。请检查 npm 输出、原生依赖和数据目录权限。")
+        })?;
+        crate::agents::mark_deepseek_verified()?;
+    }
+    Ok(installed)
 }
 
 #[tauri::command]
@@ -914,6 +937,9 @@ pub async fn fs_open_vscode(agents: AgentsState<'_>, path: String) -> Result<(),
 pub async fn agents_uninstall(agents: AgentsState<'_>, db: DbState<'_>, id: String) -> Result<String, String> {
     let sp = crate::agents::spec(&id).ok_or_else(|| format!("未知的 Agent：{id}"))?;
     let pkg = sp.npm.as_ref().ok_or_else(|| format!("{} 为二进制发行，无需卸载适配器。", sp.name))?;
+    if id == "deepseek" {
+        agents.disconnect("deepseek").await;
+    }
     let proxy = db
         .get_setting("network.proxy")
         .ok()

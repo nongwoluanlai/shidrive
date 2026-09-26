@@ -14,8 +14,10 @@ pub struct NodeStatus {
     pub path: String,
     pub version: String,
     pub major: u32,
-    /// major >= 22
+    /// major >= 22（通用适配器）
     pub ok: bool,
+    /// DeepSeek 的 import.meta.main / 当前依赖均满足最低版本
+    pub deepseek_ok: bool,
     /// 自定义 / 用户数据 node22 / 随包 .tools/node22 / 系统 PATH / 未找到
     pub source: String,
 }
@@ -43,45 +45,80 @@ fn user_node22() -> Option<PathBuf> {
         .map(|a| PathBuf::from(a).join("com.shidrive.desktop").join("tools").join("node22").join("node.exe"))
 }
 
-/// 按优先级探测可用 Node：手动指定 → 用户数据 node22 → 随包 .tools/node22 → 系统 PATH。
-/// 全部低于 22 时返回探测到的那个（ok=false），由界面提示指定路径或下载。
+/// 显示真正用于启动适配器的 Node，而不是在自定义 Node 不可用时
+/// 又找出另一份「看起来可用」的 Node（Tools::node_exe 仍会使用自定义路径）。
 pub fn node_status(tools: &Tools) -> NodeStatus {
-    let mut candidates: Vec<(&str, PathBuf)> = vec![];
-    if let Some(o) = tools.node_override() {
-        candidates.push(("自定义", o.clone()));
-    }
-    candidates.push(("用户数据 node22", user_node22().unwrap_or_default()));
-    candidates.push(("随包 .tools/node22", tools.tools_dir.join("node22").join("node.exe")));
-    candidates.push(("系统 PATH", PathBuf::from("node")));
-    let mut fallback: Option<NodeStatus> = None;
-    for (source, p) in candidates {
-        let is_path = p.as_os_str() == "node";
-        if !is_path && !p.exists() {
-            continue;
-        }
-        if let Some((version, major)) = detect_version(&p) {
-            let st = NodeStatus {
-                path: if is_path { "node（PATH）".into() } else { p.to_string_lossy().to_string() },
+    let node = tools.node_exe();
+    let source = if tools.node_override().is_some() {
+        "自定义"
+    } else if user_node22().as_ref() == Some(&node) {
+        "用户数据 node22"
+    } else if node == tools.tools_dir.join("node22").join("node.exe") {
+        "随包 .tools/node22"
+    } else {
+        "系统 PATH"
+    };
+    match detect_version(&node) {
+        Some((version, major)) => {
+            let deepseek_ok = supports_deepseek_node(&version);
+            NodeStatus {
+                path: node.to_string_lossy().to_string(),
                 version,
                 major,
                 ok: major >= 22,
+                deepseek_ok,
                 source: source.into(),
-            };
-            if st.ok {
-                return st;
             }
-            if fallback.is_none() {
-                fallback = Some(st);
-            }
-        }
+        },
+        None => NodeStatus {
+            path: node.to_string_lossy().to_string(),
+            version: String::new(),
+            major: 0,
+            ok: false,
+            deepseek_ok: false,
+            source: if node.is_file() { source } else { "未找到" }.into(),
+        },
     }
-    fallback.unwrap_or(NodeStatus {
-        path: String::new(),
-        version: String::new(),
-        major: 0,
-        ok: false,
-        source: "未找到".into(),
-    })
+}
+
+/// dsh 使用 import.meta.main（Node 22.18 才可用），当前依赖还要求
+/// >=22.19。Node 23 和过旧的 Node 24 同样不能仅凭 major>=22 放行。
+fn supports_deepseek_node(version: &str) -> bool {
+    let mut fields = version.trim_start_matches('v').split('.');
+    let (Some(major), Some(minor)) = (fields.next().and_then(|s| s.parse::<u32>().ok()),
+                                       fields.next().and_then(|s| s.parse::<u32>().ok())) else {
+        return false;
+    };
+    (major == 22 && minor >= 19) || (major == 24 && minor >= 2) || major >= 25
+}
+
+/// 检查实际启动路径；下载 Node22 后若自定义路径仍指向旧版，明确提示切换并重启。
+pub fn require_deepseek_node(tools: &Tools) -> Result<PathBuf, String> {
+    let node = tools.node_exe();
+    let version = detect_version(&node).map(|(v, _)| v).unwrap_or_else(|| "无法运行".into());
+    if supports_deepseek_node(&version) {
+        return Ok(node);
+    }
+    Err(format!(
+        "DeepSeek 需要可用的 Node 22.19+（推荐内置 Node 22）；实际使用 {}，版本 {}。请到「设置 → 环境与路径」下载 Node22；若已下载但配置了旧版自定义 Node，请清除自定义 Node 路径、保存并重启使驾。",
+        node.display(), version
+    ))
+}
+
+#[cfg(test)]
+mod deepseek_tests {
+    use super::supports_deepseek_node;
+
+    #[test]
+    fn version_requires_real_deepseek_runtime() {
+        assert!(!supports_deepseek_node("v22.17.0"));
+        assert!(!supports_deepseek_node("v22.18.0"));
+        assert!(supports_deepseek_node("v22.21.1"));
+        assert!(!supports_deepseek_node("v23.0.0"));
+        assert!(!supports_deepseek_node("v24.1.0"));
+        assert!(supports_deepseek_node("v24.2.0"));
+        assert!(!supports_deepseek_node("oops"));
+    }
 }
 
 /// 下载 node22 zip 并解压到用户数据目录 tools/node22（zip 内无顶层目录，直接落位）。

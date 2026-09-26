@@ -139,6 +139,47 @@ pub fn managed_acp_dir() -> Option<PathBuf> {
         .map(|a| PathBuf::from(a).join("com.shidrive.desktop").join("tools").join("acp"))
 }
 
+const DEEPSEEK_PKG: &str = "@deepseek-ai/dsh";
+const DEEPSEEK_VERIFIED: &str = ".shidrive-verified-version";
+
+/// dsh 的 Windows 原生依赖（Koffi）不能 --omit=optional；独立 npm 根
+/// 防止 --include=optional 顺便下载共享 acp 根下 Codex 的大型平台包。
+pub fn managed_deepseek_dir() -> Option<PathBuf> {
+    managed_acp_dir().map(|dir| dir.with_file_name("deepseek-acp"))
+}
+
+fn deepseek_package_version(dir: &std::path::Path) -> Option<String> {
+    let pkg = dir.join("node_modules").join("@deepseek-ai").join("dsh").join("package.json");
+    let raw = std::fs::read_to_string(pkg).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    parsed.get("version")?.as_str().map(|v| v.to_string())
+}
+
+/// 安装完成后须通过 ACP initialize + session/new + session/close，
+/// 再写入标记。一个仅包含 bin.js 的残缺安装不再显示「适配器就绪」。
+pub fn deepseek_install_candidate() -> Option<PathBuf> {
+    let dir = managed_deepseek_dir()?;
+    adapter_script_in(&dir.join("node_modules"), DEEPSEEK_PKG)
+}
+
+pub fn mark_deepseek_verified() -> Result<(), String> {
+    let dir = managed_deepseek_dir().ok_or("无法确定 DeepSeek 安装目录")?;
+    let version = deepseek_package_version(&dir).ok_or("DeepSeek 包缺少有效版本")?;
+    std::fs::write(dir.join(DEEPSEEK_VERIFIED), version).map_err(|e| format!("记录 DeepSeek 验证结果失败: {e}"))
+}
+
+fn verified_deepseek_script_in(dir: &std::path::Path) -> Option<PathBuf> {
+    let version = deepseek_package_version(dir)?;
+    if std::fs::read_to_string(dir.join(DEEPSEEK_VERIFIED)).ok()?.trim() != version {
+        return None;
+    }
+    adapter_script_in(&dir.join("node_modules"), DEEPSEEK_PKG)
+}
+
+fn verified_deepseek_script() -> Option<PathBuf> {
+    verified_deepseek_script_in(&managed_deepseek_dir()?)
+}
+
 /// 适配器查找根：.tools/acp（用户自建 / 老安装）优先，其次托管安装目录。
 pub fn acp_roots(tools: &Tools) -> Vec<PathBuf> {
     let mut v = vec![tools.acp_node_modules()];
@@ -184,8 +225,12 @@ fn adapter_script_in(nm: &std::path::Path, npm_pkg: &str) -> Option<PathBuf> {
     }
 }
 
-/// 解析 npm 适配器脚本路径：.tools/acp 优先，其次打包释放目录。
+/// DeepSeek 只启动独立目录中经 ACP 建会话验证的版本，避免旧版
+/// .tools/acp 中的残缺 dsh 抢占新安装。手动命令覆盖仍由 manager 单独处理。
 pub fn adapter_script(tools: &Tools, npm_pkg: &str) -> Option<PathBuf> {
+    if npm_pkg == DEEPSEEK_PKG {
+        return verified_deepseek_script();
+    }
     acp_roots(tools).iter().find_map(|root| adapter_script_in(root, npm_pkg))
 }
 
@@ -215,6 +260,33 @@ mod audit_tests {
         assert_eq!(adapter_script_in(&root, "@scope/cli"), Some(package.join("right.js")));
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn deepseek_is_not_ready_until_session_probe_marks_its_version() {
+        let root = std::env::temp_dir().join(format!("deepseek-bin-test-{}", uuid::Uuid::new_v4()));
+        let pkg = root.join("node_modules/@deepseek-ai/dsh");
+        std::fs::create_dir_all(pkg.join("lib")).unwrap();
+        std::fs::write(pkg.join("package.json"), r#"{"version":"0.1.5","bin":{"dsh":"lib/bin.js"}}"#).unwrap();
+        std::fs::write(pkg.join("lib/bin.js"), "").unwrap();
+        assert_eq!(verified_deepseek_script_in(&root), None);
+        std::fs::write(root.join(DEEPSEEK_VERIFIED), "0.1.5").unwrap();
+        assert_eq!(verified_deepseek_script_in(&root), Some(pkg.join("lib/bin.js")));
+        std::fs::write(root.join(DEEPSEEK_VERIFIED), "0.1.4").unwrap();
+        assert_eq!(verified_deepseek_script_in(&root), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deepseek_mirror_retry_keeps_native_packages_and_scripts() {
+        for mirror_retry in [false, true] {
+            let args = install_flags(true, mirror_retry);
+            assert!(args.contains(&"--include=optional"));
+            assert!(args.contains(&"--ignore-scripts=false"));
+            assert!(!args.contains(&"--omit=optional"));
+            assert!(!args.contains(&"--ignore-scripts"));
+        }
+        assert!(install_flags(false, true).contains(&"--omit=optional"));
+    }
 }
 
 /// 后台 npm 不弹控制台窗。
@@ -228,18 +300,38 @@ fn hide_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
     cmd
 }
 
-/// 安装 npm 适配器到托管目录（幂等）。--omit=optional 跳过平台二进制（如
-/// @openai/codex-win32-x64，381MB）——适配器优先用 PATH 里的 CLI，无需自带。
-/// proxy（如 http://127.0.0.1:10809）仅作用于本次 npm 子进程，不影响其它网络。
-/// 默认 registry 失败后自动改用 npmmirror 镜像重试一次。返回可读结果。
+fn install_flags(deepseek: bool, ignore_scripts: bool) -> Vec<&'static str> {
+    let mut args = vec!["install"];
+    if deepseek {
+        args.extend(["--include=optional", "--ignore-scripts=false"]);
+    } else {
+        args.push("--omit=optional");
+        if ignore_scripts { args.push("--ignore-scripts"); }
+    }
+    args.extend(["--no-audit", "--no-fund"]);
+    args
+}
+
+/// 其他适配器仍按旧策略 --omit=optional；DeepSeek 独立安装且包含平台原生包，
+/// 因为 session/new 在 Windows 必须使用 Koffi。镜像重试不得跳过安装脚本。
+/// 返回 npm 结果后，还须由调用者完成 ACP 建会话探针才能标记「已就绪」。
 pub fn bootstrap_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> Result<String, String> {
-    let Some(acp_dir) = managed_acp_dir() else {
-        return Err("无法确定用户数据目录（APPDATA）".into());
-    };
+    let deepseek = npm_pkg == DEEPSEEK_PKG;
+    if deepseek {
+        crate::node_rt::require_deepseek_node(tools)?;
+    }
+    let acp_dir = if deepseek { managed_deepseek_dir() } else { managed_acp_dir() }
+        .ok_or("无法确定用户数据目录（APPDATA）")?;
     std::fs::create_dir_all(&acp_dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    if deepseek {
+        // 重装过程中即使 npm 返回 0，旧验证标记也不代表新安装可用。
+        let _ = std::fs::remove_file(acp_dir.join(DEEPSEEK_VERIFIED));
+    }
     let pj = acp_dir.join("package.json");
     if !pj.exists() {
-        std::fs::write(&pj, "{\"name\":\"shidrive-acp\",\"private\":true}\n").map_err(|e| e.to_string())?;
+        let name = if deepseek { "shidrive-deepseek-acp" } else { "shidrive-acp" };
+        std::fs::write(&pj, format!("{{\"name\":\"{name}\",\"private\":true}}\n"))
+            .map_err(|e| e.to_string())?;
     }
     let node = tools.node_exe();
     let npm_cli = tools.npm_cli();
@@ -256,11 +348,8 @@ pub fn bootstrap_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> R
         let mut c = std::process::Command::new(&node);
         let out = hide_console(&mut c)
             .arg(npm_cli.to_string_lossy().to_string())
-            .args(["install", "--omit=optional", "--no-audit", "--no-fund"]);
-        if ignore_scripts {
-            // 跳过依赖包的 postinstall（如 zcode 依赖的联网升级检查脚本）
-            out.arg("--ignore-scripts");
-        }
+            // 其他适配器保留原镜像回退；DeepSeek 的镜像回退不能跳脚本。
+            .args(install_flags(deepseek, ignore_scripts));
         if let Some(p) = proxy {
             out.args(["--proxy", p, "--https-proxy", p]);
         }
@@ -272,7 +361,7 @@ pub fn bootstrap_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> R
         out.arg(format!("{npm_pkg}@latest")).current_dir(&acp_dir).output()
     };
     let out = run(None, false).map_err(|e| format!("npm 启动失败: {e}"))?;
-    // 常规安装失败 → 跳过 postinstall 脚本重试一次（镜像源）
+    // 镜像源重试；DeepSeek 保持原生依赖和 postinstall，否则可能成功安装却无法建会话。
     let out = if out.status.success() {
         out
     } else {
@@ -300,6 +389,12 @@ pub fn uninstall_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> R
     let mut targets: Vec<PathBuf> = vec![tools.acp_dir()];
     if let Some(m) = managed_acp_dir() {
         targets.push(m);
+    }
+    if npm_pkg == DEEPSEEK_PKG {
+        if let Some(dir) = managed_deepseek_dir() {
+            let _ = std::fs::remove_file(dir.join(DEEPSEEK_VERIFIED));
+            targets.push(dir);
+        }
     }
     let mut removed = 0usize;
     let mut last_err = String::new();

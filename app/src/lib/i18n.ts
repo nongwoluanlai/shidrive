@@ -183,7 +183,7 @@ const en: Record<string, string> = {
   "备注": "Notes",
   "已导出到 {p0}": "Exported to {p0}",
   "导出失败: ": "Export failed: ",
-  "默认全部停用。启用后会话页顶部出现对应 Agent 标签；顺序即标签顺序（用 ↑↓ 调整）。npm 类工具：展开该行点「安装适配器」自动下载到用户数据目录（跳过大体积平台二进制，可配代理）；二进制类（Cursor/OpenCode）手动填命令路径。": "All agents are disabled by default. Enable an agent to show its tab in the chat view; use ↑↓ to change the tab order. For npm tools, expand the row and choose Install adapter to download to your user data folder (large platform binaries are skipped; proxy settings are supported). For binary tools such as Cursor/OpenCode, enter the executable path manually.",
+  "默认全部停用。启用后会话页顶部出现对应 Agent 标签；顺序即标签顺序（用 ↑↓ 调整）。npm 类工具：展开该行点「安装适配器」自动下载到用户数据目录（DeepSeek 会安装运行必需的原生依赖，可配代理）；二进制类（Cursor/OpenCode）手动填命令路径。": "All agents are disabled by default. Enable an agent to show its tab in the chat view; use ↑↓ to change the tab order. For npm tools, expand the row and choose Install adapter to download to your user data folder (DeepSeek includes required native dependencies; proxy settings are supported). For binary tools such as Cursor/OpenCode, enter the executable path manually.",
   "停用": "Disable",
   "启用": "Enable",
   "已配置命令": "Command configured",

@@ -61,6 +61,7 @@ export const api = {
   acpConnect: (agent_type: string) => invoke<unknown>("acp_connect", { agentType: agent_type }),
   acpDisconnect: (agent_type: string) => invoke<void>("acp_disconnect", { agentType: agent_type }),
   acpSessionNew: (context: Context, agent_type: string) => invoke<string>("acp_session_new", { context, agentType: agent_type }),
+  acpDeepseekNew: (context: Context) => invoke<string>("acp_deepseek_new", { context }),
   acpPrompt: (context: Context, agent_type: string, text: string, images?: { data: string; mime: string }[]) =>
     invoke<{ stopReason?: string }>("acp_prompt", { context, agentType: agent_type, text, images: images ?? [] }),
   acpCancel: (context_id: string, agent_type: string) => invoke<void>("acp_cancel", { contextId: context_id, agentType: agent_type }),

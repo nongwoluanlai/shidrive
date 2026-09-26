@@ -362,5 +362,6 @@ export interface NodeStat {
   version: string;
   major: number;
   ok: boolean;
+  deepseek_ok: boolean;
   source: string;
 }
