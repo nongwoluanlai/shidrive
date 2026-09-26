@@ -725,7 +725,9 @@ import type { DisplayItem } from "../state.svelte";
   // 重新套用，避免被适配器默认值刷掉。无记忆时，给支持"完全访问"类档位的
   // 配置项一次性套默认完全访问（用户随后可改，改动即被记住）。
   let cfgAppliedKey = "";
-  let cfgApplying = false;
+  // 正在飞行的自动回放请求数（v0.3.9 用布尔值：当某个会话无需回放任何项时没有
+  // 请求去把它复位，之后所有会话的配置记忆都被永久跳过）
+  let cfgInflight = $state(0);
   let cfgAppliedSession = "";
   $effect(() => {
     const info = sessionInfo;
@@ -734,11 +736,11 @@ import type { DisplayItem } from "../state.svelte";
     const sig = JSON.stringify(info.response.configOptions ?? []) + JSON.stringify(info.response.models ?? {});
     if (sig === cfgAppliedKey) return;
     // 同一会话只自动回放一次；正在回放时跳过——防止「回放→session-ready 刷新→
-    // 再回放」的 IPC 风暴（曾把 Win32 消息队列灌爆导致整个应用假死）
-    if (cfgApplying || cfgAppliedSession === sid) return;
+    // 再回放」的 IPC 风暴（曾把 Win32 消息队列灌爆导致整个应用假死）。
+    // cfgInflight 是 $state：请求飞完归零会重跑本 effect，期间被跳过的新会话得以补做
+    if (cfgInflight > 0 || cfgAppliedSession === sid) return;
     cfgAppliedKey = sig;
     cfgAppliedSession = sid;
-    cfgApplying = true;
     for (const item of cfgItems) {
       const remembered = app.cfgPref[`${app.agent}:${item.id}`];
       const desired = remembered ?? (item.id === "model" ? undefined : fullAccessDefault(item.id, item.options.map((o) => o.value)));
@@ -749,11 +751,12 @@ import type { DisplayItem } from "../state.svelte";
       const opt = info.response.configOptions?.find((o) => o.id === item.id);
       if (opt) opt.currentValue = desired;
       saveCfgPref(app.agent, item.id, desired);
+      cfgInflight++;
       void api
         .acpSetConfigOption(ctx.id, app.agent, item.id, desired)
         .catch(() => {})
         .finally(() => {
-          if (cfgAppliedSession === sid) cfgApplying = false;
+          cfgInflight = Math.max(0, cfgInflight - 1);
         });
     }
   });

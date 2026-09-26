@@ -554,6 +554,40 @@ impl AcpConnection {
         self.caps_cache.lock().unwrap().clone()
     }
 
+    /// set_config_option 成功后同步能力缓存：适配器若在响应里给出新的 configOptions
+    ///（codex-acp 会）就整体采纳，否则只把该项的 currentValue（以及 model 对应的
+    /// currentModelId）改成刚设置的值。session-ready 事件原样携带 cached_caps，
+    /// 不同步的话前端刚改的选项会被旧值刷回。
+    pub fn note_config_option(&self, option_id: &str, value: &Value, res: &Value) {
+        if res.get("configOptions").is_some_and(|v| v.is_array()) {
+            self.cache_caps(res);
+            return;
+        }
+        let mut cur = self.caps_cache.lock().unwrap();
+        if let Some(opts) = cur.get_mut("configOptions").and_then(|v| v.as_array_mut()) {
+            for o in opts.iter_mut() {
+                if o.get("id").and_then(|i| i.as_str()) == Some(option_id) {
+                    if let Some(obj) = o.as_object_mut() {
+                        obj.insert("currentValue".into(), value.clone());
+                    }
+                }
+            }
+        }
+        if option_id == "model" {
+            if let Some(m) = cur.get_mut("models").and_then(|v| v.as_object_mut()) {
+                m.insert("currentModelId".into(), value.clone());
+            }
+        }
+    }
+
+    /// set_mode 成功后同步缓存里的当前模式（理由同上）。
+    pub fn note_mode(&self, mode_id: &str) {
+        let mut cur = self.caps_cache.lock().unwrap();
+        if let Some(m) = cur.get_mut("modes").and_then(|v| v.as_object_mut()) {
+            m.insert("currentModeId".into(), Value::String(mode_id.to_string()));
+        }
+    }
+
     /// Start capturing session updates for a session (history replay on bind).
     pub fn begin_capture(&self, session_id: &str) {
         self.capturing.lock().unwrap().insert(session_id.to_string());
@@ -748,6 +782,72 @@ impl AcpConnection {
     }
 }
 
+/// 发往 WebView 的工具输出（rawOutput）上限（字节）：MessageItem 展开详情时最多显示
+/// 4000 字符输出，再长的部分前端本来就截断不显示。
+pub const TOOL_OUTPUT_MAX_BYTES: usize = 16 * 1024;
+/// 工具输入（rawInput）上限（字节）：详情里完整展示，放宽到 64 KB（整文件写入之类
+/// 的超大入参之外都不受影响）。
+pub const TOOL_INPUT_MAX_BYTES: usize = 64 * 1024;
+/// 每个工具调用最多带几个定位（前端只显示前 2 个）。
+const TOOL_LOCATIONS_MAX: usize = 8;
+
+/// 把 tool_call / tool_call_update 压成前端渲染所需的最小负载。
+///
+/// 长历史一次 session/load 重放里，命令输出、整文件 diff、MCP 结果会以 content /
+/// rawOutput / rawInput 三份原样进入 WebView：先是 IPC 字符串、再 JSON.parse、再进
+/// `$state` 代理（Svelte 5 每读一个属性就生成一个 signal 常驻）、随后整份 JSON.stringify
+/// 落本地快照——几十 MB 的历史在 WebView 里放大好几倍，且随聊天一直驻留。
+/// 前端从不读取 `content`（MessageItem 只用 toolCallId/title/kind/status/locations/
+/// rawInput/rawOutput），rawInput/rawOutput 超过上限的部分也永远不会展示。
+/// 输出始终是合法 JSON 对象——这一点是 v0.3.9 用 cap_str 掐断工具行字符串时丢失的。
+pub fn compact_tool_update(update: &Value) -> Value {
+    let Some(obj) = update.as_object() else { return update.clone() };
+    let mut out = serde_json::Map::with_capacity(obj.len());
+    for (k, v) in obj {
+        match k.as_str() {
+            "content" => continue,
+            "rawInput" => {
+                out.insert(k.clone(), cap_json_value(v, TOOL_INPUT_MAX_BYTES));
+            }
+            "rawOutput" => {
+                out.insert(k.clone(), cap_json_value(v, TOOL_OUTPUT_MAX_BYTES));
+            }
+            "locations" => {
+                let v = match v.as_array() {
+                    Some(a) if a.len() > TOOL_LOCATIONS_MAX => Value::Array(a[..TOOL_LOCATIONS_MAX].to_vec()),
+                    _ => v.clone(),
+                };
+                out.insert(k.clone(), v);
+            }
+            _ => {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+/// 字符串超限截断；结构化值按紧凑 JSON 长度判断，超限时降级为截断后的字符串
+/// （前端 toolDetail 对字符串/对象两种形态都能显示）。
+fn cap_json_value(v: &Value, max: usize) -> Value {
+    fn truncate(s: &str, max: usize) -> String {
+        let mut end = max.min(s.len());
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n…(截断，共 {} 字节)", &s[..end], s.len())
+    }
+    match v {
+        Value::String(s) if s.len() <= max => v.clone(),
+        Value::String(s) => Value::String(truncate(s, max)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => v.clone(),
+        other => {
+            let s = other.to_string();
+            if s.len() <= max { v.clone() } else { Value::String(truncate(&s, max)) }
+        }
+    }
+}
+
 fn chunk_text(update: &Value) -> Option<String> {
     let content = update.get("content")?;
     match content {
@@ -802,6 +902,52 @@ fn read_text_file_range(path: &str, line: Option<u64>, limit: Option<u64>) -> Re
 #[cfg(test)]
 mod audit_tests {
     use super::*;
+
+    #[test]
+    fn compact_tool_update_drops_content_and_caps_raw_fields() {
+        let big = "x".repeat(TOOL_INPUT_MAX_BYTES * 2);
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t1",
+            "title": "cat big.log",
+            "kind": "read",
+            "status": "completed",
+            "content": [{ "type": "content", "content": { "type": "text", "text": big } }],
+            "rawInput": { "command": ["cat", "big.log"] },
+            "rawOutput": big,
+            "locations": (0..20).map(|i| json!({ "path": format!("f{i}.rs") })).collect::<Vec<_>>(),
+        });
+        let c = compact_tool_update(&update);
+        assert!(c.get("content").is_none(), "content is never rendered by the webview");
+        for k in ["sessionUpdate", "toolCallId", "title", "kind", "status"] {
+            assert_eq!(c.get(k), update.get(k), "{k} must survive untouched");
+        }
+        assert_eq!(c["rawInput"], update["rawInput"], "small structured input is kept as-is");
+        let out = c["rawOutput"].as_str().unwrap();
+        assert!(out.len() < TOOL_OUTPUT_MAX_BYTES + 64, "rawOutput capped: {}", out.len());
+        assert!(out.ends_with("字节)"), "truncation marker appended");
+        // rawInput gets the larger budget but is still bounded
+        let c2 = compact_tool_update(&json!({ "toolCallId": "w", "rawInput": { "path": "a.txt", "content": big } }));
+        let inp = c2["rawInput"].as_str().expect("oversized input degraded to string");
+        assert!(inp.len() > TOOL_OUTPUT_MAX_BYTES && inp.len() < TOOL_INPUT_MAX_BYTES + 64, "rawInput capped at 64K: {}", inp.len());
+        assert_eq!(c["locations"].as_array().unwrap().len(), TOOL_LOCATIONS_MAX);
+    }
+
+    #[test]
+    fn compact_tool_update_caps_structured_output_and_respects_utf8() {
+        // structured rawOutput above the cap degrades to a truncated string,
+        // never splitting a multi-byte char
+        let rows: Vec<Value> = (0..4000).map(|i| json!({ "i": i, "s": "多字节字符串" })).collect();
+        let update = json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t2", "rawOutput": rows });
+        let c = compact_tool_update(&update);
+        let out = c["rawOutput"].as_str().expect("degraded to string");
+        assert!(out.len() < TOOL_OUTPUT_MAX_BYTES + 64);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        // untouched when the payload is small, non-object updates pass through
+        let small = json!({ "sessionUpdate": "tool_call", "toolCallId": "t3", "rawOutput": { "ok": true } });
+        assert_eq!(compact_tool_update(&small), small);
+        assert_eq!(compact_tool_update(&Value::Null), Value::Null);
+    }
 
     #[test]
     fn dropped_request_removes_pending_sender() {

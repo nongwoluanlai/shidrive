@@ -61,6 +61,47 @@ mod audit_tests {
         let disposed = deepseek_new_error("Internal error: the ACP bridge has been disposed (code -32603)");
         assert!(disposed.contains("bridge has been disposed"));
     }
+
+    /// v0.3.9 把 cap_str 也套在 tools 行上：JSON 数组字符串被从中间掐断后前端
+    /// JSON.parse 失败 → 整个工具块从聊天里消失。工具行必须始终是合法 JSON，
+    /// 体量靠逐条瘦身（acp::compact_tool_update）而不是掐断字符串来控制。
+    #[test]
+    fn replay_tool_rows_stay_valid_json_and_bounded() {
+        let big = "y".repeat(crate::acp::TOOL_OUTPUT_MAX_BYTES * 4);
+        let mut updates = vec![json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": "跑一下测试" } })];
+        for i in 0..6 {
+            updates.push(json!({ "sessionUpdate": "tool_call", "toolCallId": format!("c{i}"), "title": "cargo test", "kind": "execute", "status": "pending",
+                                 "rawInput": { "command": ["cargo", "test"] } }));
+            updates.push(json!({ "sessionUpdate": "tool_call_update", "toolCallId": format!("c{i}"), "status": "completed",
+                                 "content": [{ "type": "content", "content": { "type": "text", "text": big } }], "rawOutput": big }));
+        }
+        updates.push(json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "全部通过" } }));
+        let rows = replay_to_messages(&updates);
+        assert_eq!(rows.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(), vec!["user", "tools", "assistant"]);
+        let (_, tools_json) = &rows[1];
+        let tools: Vec<Value> = serde_json::from_str(tools_json).expect("tools row must be valid JSON");
+        assert_eq!(tools.len(), 6, "tool_call + tool_call_update merged by toolCallId, nothing dropped");
+        assert!(tools_json.len() < 6 * (crate::acp::TOOL_OUTPUT_MAX_BYTES + 512), "tools row bounded: {}", tools_json.len());
+        for t in &tools {
+            assert_eq!(t["title"], "cargo test");
+            assert_eq!(t["status"], "completed");
+            assert_eq!(t["rawInput"]["command"][0], "cargo");
+            assert!(t.get("content").is_none(), "content is never rendered by the webview");
+            assert!(t["rawOutput"].as_str().unwrap().len() <= crate::acp::TOOL_OUTPUT_MAX_BYTES + 64);
+        }
+    }
+
+    /// 文本行仍按头尾截断，且不会切在多字节字符中间（不依赖 1.91 才稳定的 floor_char_boundary）。
+    #[test]
+    fn text_rows_are_capped_on_char_boundaries() {
+        let s: String = std::iter::repeat("多字节字符串。").take(20_000).collect();
+        assert!(s.len() > 64 * 1024);
+        let capped = cap_str(s.clone());
+        assert!(capped.len() < 66 * 1024);
+        assert!(capped.contains("已截断"));
+        assert!(capped.starts_with("多字节") && capped.ends_with("字符串。"));
+        assert_eq!(cap_str("short".into()), "short");
+    }
 }
 
 /// Cancelling the future must cancel the session it actually prompted (including temp sessions).
@@ -505,17 +546,24 @@ impl AgentManager {
                         return Ok((conn, sid));
                     }
                 } else {
-                    let caps = conn.cached_caps();
-                    let _ = self.app.emit(
-                        "acp://session-ready",
-                        json!({ "agentType": agent_type, "contextId": context.id, "sessionId": sid, "title": self.db.get_binding(&context.id, agent_type).ok().flatten().and_then(|b| b.title), "response": caps }),
-                    );
+                    // 已装载（最常见的路径）：同样受 emit_ready 约束——v0.3.9 的 quiet 模式漏掉了
+                    // 这一支，set_config_option/set_mode 每次仍会广播 session-ready，
+                    // 前端刚改的选项被 cached_caps 里的旧值刷回
+                    if emit_ready {
+                        let caps = conn.cached_caps();
+                        let _ = self.app.emit(
+                            "acp://session-ready",
+                            json!({ "agentType": agent_type, "contextId": context.id, "sessionId": sid, "title": self.db.get_binding(&context.id, agent_type).ok().flatten().and_then(|b| b.title), "response": caps }),
+                        );
+                    }
                     return Ok((conn, sid));
                 }
             }
         }
 
-        let sid = self.create_and_bind_session(&conn, context, agent_type, emit_ready).await?;
+        // 全新会话必须广播：前端要据此更新 bindingSession/标题/配置栏；它不会成环
+        //（配置回放随后的 set_config_option 走上面的已装载分支，quiet）
+        let sid = self.create_and_bind_session(&conn, context, agent_type).await?;
         Ok((conn, sid))
     }
 
@@ -523,11 +571,11 @@ impl AgentManager {
     /// succeeds. A disposed bridge must not erase the user's current session.
     pub async fn create_fresh_deepseek_session(&self, context: &Context) -> Result<String, String> {
         let conn = self.ensure_connected("deepseek").await?;
-        self.create_and_bind_session(&conn, context, "deepseek", true).await
+        self.create_and_bind_session(&conn, context, "deepseek").await
     }
 
     async fn create_and_bind_session(
-        &self, conn: &AcpConnection, context: &Context, agent_type: &str, emit_ready: bool,
+        &self, conn: &AcpConnection, context: &Context, agent_type: &str,
     ) -> Result<String, String> {
         let (sid, res) = self.session_new_impl(conn, context).await?;
         if sid.is_empty() {
@@ -539,12 +587,10 @@ impl AgentManager {
             .or_else(|| (agent_type == "deepseek").then(|| "新会话".to_string()));
         conn.cache_caps(&res);
         self.db.set_binding_session(&context.id, agent_type, Some(&sid), title.as_deref(), Some(&cwd))?;
-        if emit_ready {
-            let _ = self.app.emit(
-                "acp://session-ready",
-                json!({ "agentType": agent_type, "contextId": context.id, "sessionId": sid, "title": title, "response": res }),
-            );
-        }
+        let _ = self.app.emit(
+            "acp://session-ready",
+            json!({ "agentType": agent_type, "contextId": context.id, "sessionId": sid, "title": title, "response": res }),
+        );
         Ok(sid)
     }
 
@@ -748,11 +794,11 @@ impl AgentManager {
         let Some(context) = self.db.get_context_row(context_id) else {
             return Ok(());
         };
-        let (_conn, sid) = self.ensure_session_inner(&context, agent_type, false).await?;
-        self.ensure_connected(agent_type)
-            .await?
-            .request("session/set_mode", json!({ "sessionId": sid, "modeId": mode_id }), Some(Duration::from_secs(15)))
+        let (conn, sid) = self.ensure_session_inner(&context, agent_type, false).await?;
+        conn.request("session/set_mode", json!({ "sessionId": sid, "modeId": mode_id }), Some(Duration::from_secs(15)))
             .await?;
+        // 之后任何 session-ready 都会把 cached_caps 发给前端：同步缓存，避免刷回旧模式
+        conn.note_mode(mode_id);
         Ok(())
     }
 
@@ -766,13 +812,16 @@ impl AgentManager {
         // quiet（不发 session-ready）：否则前端「配置记忆」effect 重套配置再触发
         // 本函数，形成 IPC 风暴直至 Win32 消息队列耗尽
         let (conn, sid) = self.ensure_session_inner(&context, agent_type, false).await?;
-        conn.request(
+        let res = conn.request(
             "session/set_config_option",
             // codex-acp expects `configId`; zed-style adapters use `configOptionId` — send both
             json!({ "sessionId": sid, "configOptionId": option_id, "configId": option_id, "value": value }),
             Some(Duration::from_secs(15)),
         )
         .await?;
+        // 同步能力缓存（适配器返回新的 configOptions 就整体采纳，否则只改这一项）：
+        // 之后的 session-ready 携带 cached_caps，不同步会把前端刚改的值刷回旧值
+        conn.note_config_option(option_id, &value, &res);
         // 记住模型选择（会话恢复时也能看到）
         if option_id == "model" {
             if let Some(m) = value.as_str() {
@@ -840,8 +889,16 @@ fn cap_str(s: String) -> String {
     if s.len() <= LIMIT {
         return s;
     }
-    let head = &s[..s.floor_char_boundary(48 * 1024).min(s.len())];
-    let tail_from = s.floor_char_boundary(s.len().saturating_sub(16 * 1024));
+    // str::floor_char_boundary 在 Rust 1.91 才稳定，README 承诺 1.88+：手写等价逻辑
+    fn floor_boundary(s: &str, mut i: usize) -> usize {
+        i = i.min(s.len());
+        while i > 0 && !s.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    }
+    let head = &s[..floor_boundary(&s, 48 * 1024)];
+    let tail_from = floor_boundary(&s, s.len().saturating_sub(16 * 1024));
     let tail = &s[tail_from..];
     format!(
         "{head}\n\n…[已截断 {}KB：查看完整内容请参考原始会话]\n\n{tail}",
@@ -876,7 +933,9 @@ fn replay_to_messages(updates: &[Value]) -> Vec<(String, String)> {
                 $out.push(("thought".to_string(), cap_str(std::mem::take(&mut $thought))));
             }
             if !$tools.is_empty() {
-                $out.push(("tools".to_string(), cap_str(serde_json::to_string(&$tools).unwrap_or_else(|_| "[]".into()))));
+                // 工具行是 JSON 数组：不能用 cap_str 掐断（前端 JSON.parse 失败会把整个
+                // 工具块丢掉），体量由 compact_tool_update 逐条控制
+                $out.push(("tools".to_string(), serde_json::to_string(&$tools).unwrap_or_else(|_| "[]".into())));
                 $tools.clear();
             }
             if !$assistant.is_empty() {
@@ -913,6 +972,9 @@ fn replay_to_messages(updates: &[Value]) -> Vec<(String, String)> {
                 thought.push_str(&text_of(u.get("content").unwrap_or(&Value::Null)));
             }
             "tool_call" | "tool_call_update" => {
+                // 只保留前端会渲染的字段并限长（见 acp::compact_tool_update）：
+                // 命令输出 / 整文件 diff / MCP 结果原样进 WebView 是绑定长历史时内存暴涨的大头
+                let u = crate::acp::compact_tool_update(u);
                 let tid = u.get("toolCallId").cloned().unwrap_or(Value::Null);
                 if let Some(existing) = tools.iter_mut().find(|x| x.get("toolCallId") == Some(&tid)) {
                     if let (Some(obj), Some(newobj)) = (existing.as_object_mut(), u.as_object()) {
@@ -921,7 +983,7 @@ fn replay_to_messages(updates: &[Value]) -> Vec<(String, String)> {
                         }
                     }
                 } else {
-                    tools.push(u.clone());
+                    tools.push(u);
                 }
             }
             _ => {}
