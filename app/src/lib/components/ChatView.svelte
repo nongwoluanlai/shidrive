@@ -235,14 +235,38 @@ import type { DisplayItem } from "../state.svelte";
     if (endIdx - startIdx > MAX_RENDER) endIdx = startIdx + MAX_RENDER;
   }
 
-  // 上翻自动扩窗：进入顶部占位区即触发（不再等滚到 60px——占位区若有偏差，
-  // 等到 60px 意味着要先滚过一大段空白）。触发后连续扩窗直到脱离占位区或到顶，
-  // 每轮以首条消息锚定视线，避免跳动。
+  // 首条 / 末条已渲染消息相对视口顶部的位置（null = 没有渲染任何消息）
+  function firstRenderedTop(): number | null {
+    if (!listEl) return null;
+    const first = listEl.querySelector('.msgs-inner > div[id^="msg-"]') as HTMLElement | null;
+    return first ? first.getBoundingClientRect().top - listEl.getBoundingClientRect().top : null;
+  }
+  // 注意不能用 `div[id^="msg-"]:last-of-type`：:last-of-type 看的是「最后一个 div」，
+  // 窗口下面还有底部占位 <div class="win-pad"> 时它永远匹配不到消息（原 extendBottomIfNeeded
+  // 就是这样失效的，只是此前尾巴总被整段渲染、没有底部占位，问题被盖住了）
+  function lastRenderedEl(): HTMLElement | null {
+    if (!listEl) return null;
+    const all = listEl.querySelectorAll<HTMLElement>('.msgs-inner > div[id^="msg-"]');
+    return all.length ? all[all.length - 1] : null;
+  }
+  function lastRenderedBottom(): number | null {
+    const last = lastRenderedEl();
+    return last && listEl ? last.getBoundingClientRect().bottom - listEl.getBoundingClientRect().top : null;
+  }
+  // 距窗口边缘多近就顺序扩窗（像素）；再远就是「深入占位区」，按比例重开窗
+  const EDGE_ZONE = 480;
+
+  // 上翻自动扩窗：视口接近已渲染窗口的顶边即触发，每轮以首条消息锚定视线，避免跳动。
+  // 判据是「距首条已渲染消息的距离」而不是 scrollTop 的绝对值：顶部占位随历史长度可达
+  // 几万像素，按 scrollTop<480 判断意味着要先滚过整段空白才会加载。
   let loadingOlder = false;
   async function onListScrollTop() {
     if (loadingOlder || startIdx === 0 || !listEl) return;
-    const padZone = Math.min(480, topPad + 120);
-    if (listEl.scrollTop > padZone) return;
+    const near = () => {
+      const t = firstRenderedTop();
+      return t !== null && t > -EDGE_ZONE;
+    };
+    if (!near()) return;
     loadingOlder = true;
     try {
       for (let round = 0; round < 5; round++) {
@@ -252,27 +276,47 @@ import type { DisplayItem } from "../state.svelte";
         startIdx = Math.max(0, startIdx - CHUNK);
         if (endIdx - startIdx > MAX_RENDER) endIdx = startIdx + MAX_RENDER;
         await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-        if (first) listEl.scrollTop += first.getBoundingClientRect().top - anchorTop;
+        if (!listEl) break;
+        if (first) {
+          lastProgScrollAt = performance.now();
+          listEl.scrollTop += first.getBoundingClientRect().top - anchorTop;
+          prevScrollTop = listEl.scrollTop;
+        }
         measureRendered(true);
         if (startIdx === 0 || startIdx === prevStart) break;
-        // 仍在占位区深处才继续扩；已离开则停
-        if (listEl.scrollTop > Math.min(480, topPad + 120)) break;
+        // 仍贴着窗口顶边才继续扩；已离开则停
+        if (!near()) break;
       }
     } finally {
       loadingOlder = false;
     }
   }
 
-  // 下探扩窗：跳转到中部历史后继续向下读，接近底部时把窗口滑向下
-  function extendBottomIfNeeded(distToBottom: number) {
-    if (newerHidden === 0 || distToBottom > 200 || !listEl) return;
-    const anchor = listEl.querySelector('.msgs-inner > div[id^="msg-"]:last-of-type') as HTMLElement | null;
+  // 下探扩窗：跳转到中部历史后继续向下读，视口接近窗口底边时把窗口滑向下。
+  // 判据同样是「距末条已渲染消息的距离」：scrollHeight-scrollTop-clientHeight 把底部
+  // 占位也算进去了，只要窗口下面还有几百条未渲染，它就永远大于阈值，窗口永远不会下滑。
+  let extendingBottom = false;
+  function extendBottomIfNeeded() {
+    if (extendingBottom || newerHidden === 0 || !listEl) return;
+    const bottom = lastRenderedBottom();
+    if (bottom === null || bottom - listEl.clientHeight > EDGE_ZONE) return;
+    const anchor = lastRenderedEl();
     const anchorBottom = anchor?.getBoundingClientRect().bottom ?? 0;
+    extendingBottom = true;
     endIdx = Math.min(items.length, endIdx + CHUNK);
     if (endIdx - startIdx > MAX_RENDER) startIdx = endIdx - MAX_RENDER;
     requestAnimationFrame(() => {
-      const a2 = listEl?.querySelector('.msgs-inner > div[id^="msg-"]:last-of-type') as HTMLElement | null;
-      if (anchor && a2 && listEl) listEl.scrollTop += a2.getBoundingClientRect().bottom - anchorBottom;
+      extendingBottom = false;
+      const a2 = lastRenderedEl();
+      if (anchor && a2 && listEl && anchor !== a2) {
+        // 顶部被回收时末条锚点会上移：把差值补回去，视线不动
+        const delta = anchor.isConnected ? anchor.getBoundingClientRect().bottom - anchorBottom : 0;
+        if (delta) {
+          lastProgScrollAt = performance.now();
+          listEl.scrollTop += delta;
+          prevScrollTop = listEl.scrollTop;
+        }
+      }
       measureRendered(true);
     });
   }
@@ -426,16 +470,16 @@ import type { DisplayItem } from "../state.svelte";
       // 导致贴底后首个滚动事件被误判为"用户上滚"而脱离贴底）
     });
   }
-  let prevScrollH = 0;
   let prevClientH = 0;
   function onScroll() {
     if (!listEl) return;
     const now = performance.now();
-    // 几何变化（缩放/内容重排/图片加载撑高）引发的滚动事件：只更新基准，
-    // 不做扩窗/导航——否则「重排→滚动→重开窗→测量→占位高度变→再重排」
-    // 正反馈循环会在拖拽缩放时把主线程打满（长会话尤甚）
-    const geometryChanged = listEl.scrollHeight !== prevScrollH || listEl.clientHeight !== prevClientH;
-    prevScrollH = listEl.scrollHeight;
+    // 视口尺寸变化（缩放/拖拽窗口边）引发的滚动事件：只更新基准，不做扩窗/导航——
+    // 否则「重排→滚动→重开窗→测量→占位高度变→再重排」的正反馈会在拖拽缩放时把主线程打满。
+    // 注意不能把 scrollHeight 变化也当作几何变化：content-visibility:auto 下每滚一段就有
+    // 条目被真正排版，长会话里几乎每个 scroll 事件 scrollHeight 都在变——v0.3.9 以此早退，
+    // 结果上翻进入占位区后再也不扩窗，视口停在大片空白里。
+    const viewportChanged = listEl.clientHeight !== prevClientH;
     prevClientH = listEl.clientHeight;
     // 1) 我们自己的程序滚动 echo（含 rAF 校准）一律忽略
     if (now - lastProgScrollAt < 300) return;
@@ -443,20 +487,22 @@ import type { DisplayItem } from "../state.svelte";
     const scrolledUp = listEl.scrollTop < prevScrollTop - 2;
     prevScrollTop = listEl.scrollTop;
     if (scrolledUp) stickToBottom = false;
-    if (geometryChanged) return;
+    if (viewportChanged) return;
     if (scrolledUp) {
-      // 上滚同样要做顶部检查——此前此处直接 return，进入占位区永远不扩窗
-      if (startIdx > 0 && listEl.scrollTop < Math.min(480, topPad + 120)) {
-        void onListScrollTop();
-      } else if (startIdx > 0 && topPad > 0) {
-        void navigatePadIfNeeded();
+      if (startIdx > 0) {
+        const t = firstRenderedTop();
+        if (t !== null && t > 240) void navigatePadIfNeeded(); // 已深入顶部占位区：按比例重开窗
+        else if (t !== null && t > -EDGE_ZONE) void onListScrollTop(); // 贴近窗口顶边：顺序扩窗
       }
       return;
     }
     const dist = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight;
     if (dist < 60) stickToBottom = true;
-    if (startIdx > 0 && listEl.scrollTop < Math.min(480, topPad + 120)) void onListScrollTop();
-    extendBottomIfNeeded(dist);
+    if (newerHidden > 0) {
+      const b = lastRenderedBottom();
+      if (b !== null && b < listEl.clientHeight - 240) void navigateBottomPadIfNeeded(); // 已深入底部占位区
+      else extendBottomIfNeeded();
+    }
   }
 
   // 拖动滚动条直接跳进顶部占位区深处：按滚动比例换算目标索引，整窗重开到该处，
@@ -466,28 +512,30 @@ import type { DisplayItem } from "../state.svelte";
     if (!listEl || startIdx === 0 || topPad <= 0) return;
     if (performance.now() - lastNavAt < 400) return; // 防重排风暴下连环重开窗
     lastNavAt = performance.now();
-    const first = listEl.querySelector('.msgs-inner > div[id^="msg-"]') as HTMLElement | null;
-    if (!first) return;
-    const listRect = listEl.getBoundingClientRect();
-    const firstTop = first.getBoundingClientRect().top - listRect.top;
-    if (firstTop < 240) return; // 首条已接近视口顶部，走正常分块扩窗路径
+    const firstTop = firstRenderedTop();
+    if (firstTop === null || firstTop < 240) return; // 首条已接近视口顶部，走正常分块扩窗路径
     const frac = Math.min(0.999, Math.max(0, listEl.scrollTop / Math.max(1, topPad)));
     const target = Math.max(0, Math.min(startIdx - 1, Math.round(frac * startIdx)));
     const targetId = items[target]?.id;
     if (!targetId) return;
-    ensureRendered(target);
-    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    const el = document.getElementById("msg-" + targetId);
-    if (el && listEl) {
-      lastProgScrollAt = performance.now();
-      const r2 = listEl.getBoundingClientRect();
-      listEl.scrollTop += el.getBoundingClientRect().top - r2.top - 24;
-      prevScrollTop = listEl.scrollTop;
-      el.classList.remove("flash");
-      void el.offsetWidth;
-      el.classList.add("flash");
-    }
-    measureRendered(true);
+    // 交给统一定位原语：开窗 + 逐帧收敛（占位条目补排版会移动目标）
+    await scrollToItem(targetId, "start");
+  }
+
+  // 对称：拖动滚动条跳进底部占位区深处（搜索/时间轴跳到中部历史后再往下拖）
+  async function navigateBottomPadIfNeeded() {
+    if (!listEl || newerHidden === 0 || botPad <= 0) return;
+    if (performance.now() - lastNavAt < 400) return;
+    lastNavAt = performance.now();
+    const bottom = lastRenderedBottom();
+    if (bottom === null || bottom > listEl.clientHeight - 240) return;
+    // 视口顶部落在底部占位里的比例 → 换算成 [endIdx, items.length) 里的目标索引
+    const padStart = listEl.scrollTop + bottom; // 占位区在滚动坐标系里的起点
+    const frac = Math.min(0.999, Math.max(0, (listEl.scrollTop - padStart) / Math.max(1, botPad)));
+    const target = Math.min(items.length - 1, endIdx + Math.floor(frac * newerHidden));
+    const targetId = items[target]?.id;
+    if (!targetId) return;
+    await scrollToItem(targetId, "start");
   }
 
   // 内容高度一变（历史重放渲染完成、流式追加、图片/字体加载）即贴底：
