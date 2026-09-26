@@ -863,25 +863,50 @@ pub struct OAuthTokenRow {
     pub revoked_at: Option<String>,
 }
 
-/// 自动清理：删除已吊销的令牌行，以及再无任何有效令牌的客户端注册行。
-/// 已授权的照常展示；吊销的无需在设置页留痕。
+/// 吊销记录保留天数：客户端（Claude Code / Cursor / Inspector 等）会缓存动态注册得到的
+/// client_id，吊销后再次授权仍会带着旧 id 来 /authorize；注册行若被清掉，它们只会收到
+/// 「未知的 client_id」而不会自动重新注册。保留期内注册行不动，过期再一并回收。
+const REVOKED_KEEP_DAYS: i64 = 90;
+/// 从未完成过任何授权的注册行多久后视为垃圾（动态注册后中途放弃的客户端）。
+/// 必须留足窗口：/register → /authorize → 用户在使驾里点同意 → /token 之间可能过去
+/// 好几分钟，而设置页开着时每 4 秒就会调一次 tokens_list。
+const UNUSED_CLIENT_KEEP_HOURS: i64 = 24;
+
+/// 自动清理（v0.3.10 起）：v0.3.10 的版本会立刻删除所有吊销令牌以及「当前没有令牌」的
+/// 全部客户端注册行——这把两类正常状态也一起删了：① 刚 /register 完、还没拿到令牌的
+/// 客户端（设置页 4 秒一轮询，用户点同意前注册行就没了，/authorize 报「未知的
+/// client_id」）；② 被吊销后想重新授权的客户端（缓存的 client_id 失效）。
+/// 现在只回收：吊销超过 90 天的令牌行；注册超过 24 小时且从未产生过令牌的注册行。
+/// 设置页展示只看 revoked_at IS NULL，吊销的照样不留痕。
 pub fn cleanup_revoked(db: &Arc<Db>) -> Result<(), String> {
+    let revoked_cutoff = (chrono::Local::now() - chrono::Duration::days(REVOKED_KEEP_DAYS))
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
+    let client_cutoff = (chrono::Local::now() - chrono::Duration::hours(UNUSED_CLIENT_KEEP_HOURS))
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
     db.with(|c| {
-        c.execute("DELETE FROM remote_oauth_tokens WHERE revoked_at IS NOT NULL", [])?;
         c.execute(
-            "DELETE FROM remote_oauth_clients WHERE client_id NOT IN (SELECT DISTINCT client_id FROM remote_oauth_tokens)",
-            [],
+            "DELETE FROM remote_oauth_tokens WHERE revoked_at IS NOT NULL AND revoked_at < ?1",
+            rusqlite::params![revoked_cutoff],
+        )?;
+        c.execute(
+            "DELETE FROM remote_oauth_clients WHERE created_at < ?1
+               AND client_id NOT IN (SELECT DISTINCT client_id FROM remote_oauth_tokens)",
+            rusqlite::params![client_cutoff],
         )?;
         Ok(())
     })
 }
 
+/// 设置页列表：只展示有效授权。
 pub fn tokens_list(db: &Arc<Db>) -> Result<Vec<OAuthTokenRow>, String> {
     let _ = cleanup_revoked(db);
     db.with(|c| {
         let mut st = c.prepare(
             "SELECT t.id, t.client_id, COALESCE(c.client_name,''), t.scopes, t.last_used_at, t.revoked_at
              FROM remote_oauth_tokens t LEFT JOIN remote_oauth_clients c ON c.client_id = t.client_id
+             WHERE t.revoked_at IS NULL
              ORDER BY t.created_at DESC",
         )?;
         let rows = st.query_map([], |r| {

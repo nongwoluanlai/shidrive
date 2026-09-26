@@ -198,3 +198,62 @@ fn explicit_scope_is_never_broadened() {
     );
     assert_eq!(normalize_scope("unknown"), None);
 }
+
+/// v0.3.10 的 cleanup_revoked 在 tokens_list（设置页每 4 秒轮询）里删除所有「没有令牌」的
+/// 客户端注册：刚 /register 完、等用户点同意的客户端会在 /authorize 前消失；吊销后想重新
+/// 授权的客户端也因注册行被删而失败。注册行必须在授权流程窗口与吊销保留期内存活，
+/// 列表则只展示有效授权。
+#[test]
+fn listing_tokens_never_deletes_live_or_recently_revoked_client_registrations() {
+    let (db, dir) = test_db();
+    let _grant = add_grant(&db, &dir, "one");
+    let oauth = OAuthState::new();
+    // ① 刚注册、尚未授权的客户端：设置页轮询多次后 /authorize 仍必须认识它
+    let fresh = client_register(&db, "fresh client", &["http://localhost:4000/cb".into()]).unwrap();
+    let fresh_id = fresh["client_id"].as_str().unwrap().to_string();
+    for _ in 0..3 {
+        let _ = tokens_list(&db).unwrap();
+    }
+    assert!(client_get(&db, &fresh_id).is_some(), "in-flight registration must survive the settings-page poll");
+
+    // ② 授权过再吊销：列表里不再显示，但注册行仍在（客户端缓存的 client_id 可重新授权）
+    let reg = client_register(&db, "revoked client", &["http://localhost:3000/callback".into()]).unwrap();
+    let client_id = reg["client_id"].as_str().unwrap().to_string();
+    let verifier = "b".repeat(50);
+    oauth.txns.lock().unwrap().insert(
+        "request-9".into(),
+        pending(&client_id, "http://localhost:3000/callback", &sha256_b64url(&verifier)),
+    );
+    oauth_decide(&db, &oauth, "request-9", true).unwrap();
+    let code = oauth.codes.lock().unwrap().keys().next().unwrap().clone();
+    let form = format!("grant_type=authorization_code&client_id={client_id}&code={code}&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&code_verifier={verifier}");
+    assert_eq!(token_call(&db, &oauth, &form).0, 200);
+    let rows = tokens_list(&db).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].client_name, "revoked client");
+    token_revoke(&db, &rows[0].id).unwrap();
+    assert!(tokens_list(&db).unwrap().is_empty(), "revoked tokens are hidden from the list");
+    assert!(client_get(&db, &client_id).is_some(), "registration survives revocation");
+    assert!(client_get(&db, &fresh_id).is_some());
+
+    // ③ 真正的垃圾才回收：吊销超过 90 天的令牌行；注册超过 24h 且已无任何令牌的客户端
+    db.with(|c| {
+        c.execute("UPDATE remote_oauth_tokens SET revoked_at='2000-01-01T00:00:00'", [])?;
+        Ok(())
+    })
+    .unwrap();
+    let _ = tokens_list(&db).unwrap();
+    let token_rows: i64 = db.with(|c| c.query_row("SELECT COUNT(*) FROM remote_oauth_tokens", [], |r| r.get(0))).unwrap();
+    assert_eq!(token_rows, 0, "revoked token past retention is purged");
+    assert!(client_get(&db, &client_id).is_some(), "a recently registered client is kept even with no tokens left");
+    db.with(|c| {
+        c.execute("UPDATE remote_oauth_clients SET created_at='2000-01-01T00:00:00'", [])?;
+        Ok(())
+    })
+    .unwrap();
+    let _ = tokens_list(&db).unwrap();
+    assert!(client_get(&db, &fresh_id).is_none(), "stale never-authorized registration is garbage-collected");
+    assert!(client_get(&db, &client_id).is_none(), "stale registration without tokens is garbage-collected");
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
+}
