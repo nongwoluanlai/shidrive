@@ -1,6 +1,6 @@
 // Wire backend events to global state. Called once from App.svelte on mount.
 import { listen } from "@tauri-apps/api/event";
-import { app, applySessionUpdate, finishTurn, toast, chatKey } from "./state.svelte";
+import { app, applySessionUpdate, finishTurn, markTurn, toast, chatKey } from "./state.svelte";
 import type { AgentType, ElicitationRequest, PermissionRequest, SessionReadyInfo } from "./types";
 import { api } from "./ipc";
 
@@ -51,6 +51,9 @@ export async function wireEvents() {
     }
     if (p.update) {
       const ctxId = p.contextId ?? findContextBySession(p.agentType, p.sessionId);
+      // 找不到所属上下文的更新以前会写进 "-:agent" 这个没有任何界面展示、也永远
+      // 不会被清理的幽灵聊天里（只增不减）；现在直接丢弃
+      if (!ctxId) return;
       applySessionUpdate(p.agentType, ctxId, p.sessionId ?? "", p.update);
     }
   });
@@ -111,6 +114,8 @@ export async function wireEvents() {
   // 随后自增目录树版本号 → FileTree 自动刷新，及时看到 Agent 产出的文件
   await listen<{ contextId: string; agentType: string; status: string }>("acp://binding-status", (e) => {
     const { contextId, agentType, status } = e.payload;
+    // 回合进行中的会话不能被内存 LRU 淘汰（否则回合结束落库时只剩半截）
+    markTurn(chatKey(contextId, agentType), status === "running");
     if (status === "completed" || status === "interrupted") {
       finishTurn(agentType as AgentType, contextId);
       app.treeRev++;

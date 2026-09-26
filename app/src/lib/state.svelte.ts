@@ -144,6 +144,44 @@ function ensureChat(key: string): DisplayItem[] {
   return app.chat[key];
 }
 
+// ---------- 工具调用负载瘦身 ----------
+// 聊天条目整体放在 `$state` 里：Svelte 5 的深代理会为每个被读到的属性生成一个常驻
+// signal，persistChat 的 JSON.stringify 又会把整棵树读一遍——工具调用的命令输出 /
+// 整文件 diff / MCP 结果（content、rawInput、rawOutput 三份）一旦进来，WebView 内存
+// 就按历史体量成倍放大并随聊天一直驻留。MessageItem 只用 toolCallId/title/kind/
+// status/locations/rawInput/rawOutput，展开详情最多显示 4000 字符，因此这里与后端
+// (acp::compact_tool_update) 同口径：丢弃 content、超限字段截断。后端已瘦身过的负载
+// 再过一遍是常数开销；实时 acp://update 与旧版本落库的本地快照则靠这里兜底。
+const TOOL_OUTPUT_MAX_CHARS = 16 * 1024;
+const TOOL_INPUT_MAX_CHARS = 64 * 1024;
+const TOOL_LOCATIONS_MAX = 8;
+function capToolField(v: unknown, max: number): unknown {
+  if (v == null || typeof v === "boolean" || typeof v === "number") return v;
+  if (typeof v === "string") return v.length <= max ? v : v.slice(0, max) + `\n…(截断，共 ${v.length} 字符)`;
+  let s: string;
+  try {
+    s = JSON.stringify(v) ?? "";
+  } catch {
+    return undefined;
+  }
+  return s.length <= max ? v : s.slice(0, max) + `\n…(截断，共 ${s.length} 字符)`;
+}
+export function compactTool<T extends Partial<ToolCallUpdate>>(t: T): T {
+  if (!t || typeof t !== "object") return t;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(t)) {
+    if (k === "content") continue;
+    if (k === "rawInput") out[k] = capToolField(v, TOOL_INPUT_MAX_CHARS);
+    else if (k === "rawOutput") out[k] = capToolField(v, TOOL_OUTPUT_MAX_CHARS);
+    else if (k === "locations") out[k] = Array.isArray(v) ? v.slice(0, TOOL_LOCATIONS_MAX) : v;
+    else out[k] = v;
+  }
+  return out as T;
+}
+function compactItem(it: DisplayItem): DisplayItem {
+  return Array.isArray(it.tools) ? { ...it, tools: it.tools.map((t) => compactTool(t)) } : it;
+}
+
 export function historyToItems(rows: TranscriptRow[]): DisplayItem[] {
   const items: DisplayItem[] = [];
   const pushToolRow = (raw: string, time?: string) => {
@@ -155,10 +193,15 @@ export function historyToItems(rows: TranscriptRow[]): DisplayItem[] {
     }
     // merge tool_call + later tool_call_update entries that share a toolCallId
     const merged: ToolCallUpdate[] = [];
-    for (const t of tools) {
-      const existing = merged.find((m) => m.toolCallId === t.toolCallId);
+    const byId = new Map<string, ToolCallUpdate>();
+    for (const raw of tools) {
+      const t = compactTool(raw);
+      const existing = byId.get(t.toolCallId);
       if (existing) Object.assign(existing, t);
-      else merged.push(t);
+      else {
+        merged.push(t);
+        byId.set(t.toolCallId, t);
+      }
     }
     if (merged.length) items.push({ id: nextId(), kind: "tools", text: "", tools: merged, time });
   };
@@ -194,45 +237,98 @@ export function clearChat(key: string) {
 // ---------- 会话本地持久化 ----------
 // 每回合结束（finishTurn）或历史装载（setChatRows）时把整份条目快照到 SQLite，
 // 打开聊天页先读本地立即渲染；适配器 session/load 全量重放只在本地为空时兜底。
+const SNAPSHOT_MAX_CHARS = 8 * 1024 * 1024;
 let persistTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+function persistNow(key: string) {
+  clearTimeout(persistTimers[key]);
+  delete persistTimers[key];
+  const list = app.chat[key];
+  // 定时器触发时条目可能已被清空/淘汰：不要用空数组覆盖本地快照（清空走 clearChat）
+  if (!list || !list.length) return;
+  let snapshot = list.map((it) => ({ ...it, streaming: false }));
+  let json: string;
+  try {
+    json = JSON.stringify(snapshot);
+    // 超大快照：巨型会话整份 stringify+IPC 会造成数倍内存放大。工具负载已瘦身，正常
+    // 会话远达不到上限；真到了也只丢最旧的一段而不是整份不落库（不支持重放的适配器
+    // ——如 DeepSeek——本地快照就是唯一的历史）
+    while (json.length > SNAPSHOT_MAX_CHARS && snapshot.length > 20) {
+      snapshot = snapshot.slice(Math.ceil(snapshot.length / 4));
+      json = JSON.stringify(snapshot);
+    }
+  } catch {
+    return;
+  }
+  if (json.length > SNAPSHOT_MAX_CHARS) {
+    console.info("[chat] snapshot too large, skip persist");
+    return;
+  }
+  void api.chatStoreSet(key, json).catch(() => {});
+}
 export function persistChat(key: string) {
   const list = app.chat[key];
   if (!list || !list.length) return;
   clearTimeout(persistTimers[key]);
-  persistTimers[key] = setTimeout(() => {
-    const snapshot = (app.chat[key] ?? []).map((it) => ({ ...it, streaming: false }));
-    let json: string;
-    try {
-      json = JSON.stringify(snapshot);
-    } catch {
-      return;
-    }
-    // 超大快照不落库：巨型会话整份 stringify+IPC 会造成数倍内存放大
-    // （配合后端重放截断，正常会话远达不到该上限）
-    if (json.length > 8 * 1024 * 1024) {
-      console.info("[chat] snapshot too large, skip persist");
-      return;
-    }
-    void api.chatStoreSet(key, json).catch(() => {});
-  }, 400);
+  persistTimers[key] = setTimeout(() => persistNow(key), 400);
 }
 
 /** 从本地库载入某会话的历史（无记录返回 null）。
- * 超大快照（历史版本可能在截断策略前落库）不载入并删除该行：
- * 全量载入会造成与绑定重放同样的内存放大；下次打开走适配器重放（已截断）。 */
+ * 旧版本快照可能带着完整工具负载：进内存前先瘦身；瘦身后仍超限的（极少）才丢弃，
+ * 否则把瘦身结果写回，下次秒开。 */
 export async function loadChatLocal(key: string): Promise<DisplayItem[] | null> {
   try {
     const raw = await api.chatStoreGet(key);
     if (!raw) return null;
-    if (raw.length > 8 * 1024 * 1024) {
-      void api.chatStoreDelete(key).catch(() => {});
-      console.info("[chat] local snapshot too large, dropped");
-      return null;
-    }
     const rows = JSON.parse(raw) as DisplayItem[];
-    return Array.isArray(rows) && rows.length ? rows : null;
+    if (!Array.isArray(rows) || !rows.length) return null;
+    const items = rows.map(compactItem);
+    if (raw.length > SNAPSHOT_MAX_CHARS) {
+      const json = JSON.stringify(items);
+      if (json.length > SNAPSHOT_MAX_CHARS) {
+        void api.chatStoreDelete(key).catch(() => {});
+        console.info("[chat] local snapshot too large even after compaction, dropped");
+        return null;
+      }
+      void api.chatStoreSet(key, json).catch(() => {});
+    }
+    return items;
   } catch {
     return null;
+  }
+}
+
+// ---------- 内存中聊天条目的数量上限（LRU） ----------
+// app.chat 以 context:agent 为键，从不释放：每打开一个会话就多驻留一份完整历史，
+// 用得越久 WebView 越大。本地库里有全量快照（persistChat），切回来时秒开，因此内存中
+// 只保留最近看过的若干份；正在流式输出 / 正在装载 / 后端回合进行中的会话不淘汰，
+// 淘汰前先把待写入的快照落库。
+const CHAT_LRU_MAX = 6;
+const chatLru: string[] = [];
+const activeTurns = new Set<string>();
+/** 后端 acp://binding-status 的 running/completed 状态：回合进行中的会话不能淘汰。 */
+export function markTurn(key: string, running: boolean) {
+  if (running) activeTurns.add(key);
+  else activeTurns.delete(key);
+}
+/** 记录 key 刚被查看；超出上限时淘汰最久未看的其它会话。 */
+export function touchChat(key: string) {
+  const i = chatLru.indexOf(key);
+  if (i >= 0) chatLru.splice(i, 1);
+  chatLru.push(key);
+  for (let j = 0; j < chatLru.length && chatLru.length > CHAT_LRU_MAX; ) {
+    const k = chatLru[j];
+    if (k !== key && !app.chat[k]?.length) {
+      // 已被 clearChat/淘汰等释放：只从 LRU 名单里去掉
+      chatLru.splice(j, 1);
+      continue;
+    }
+    if (k === key || app.streaming[k] || app.chatLoading[k] || activeTurns.has(k)) {
+      j++;
+      continue;
+    }
+    if (persistTimers[k]) persistNow(k);
+    delete app.chat[k];
+    chatLru.splice(j, 1);
   }
 }
 
@@ -268,7 +364,8 @@ export function fullAccessDefault(cfgId: string, optionValues: string[]): string
   return undefined;
 }
 
-function upsertTool(list: DisplayItem[], update: ToolCallUpdate) {
+function upsertTool(list: DisplayItem[], raw: ToolCallUpdate) {
+  const update = compactTool(raw);
   for (let i = list.length - 1; i >= 0; i--) {
     const it = list[i];
     if (it.kind !== "tools" || !it.tools) continue;

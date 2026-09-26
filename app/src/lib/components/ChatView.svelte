@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import { app, chatKey, currentContext, finishTurn, setChatRows, pushLocal, toast, clearChat, sharedContextPrompt, switchAgent, loadChatLocal, saveCfgPref, fullAccessDefault } from "../state.svelte";
+  import { app, chatKey, currentContext, finishTurn, setChatRows, pushLocal, toast, clearChat, sharedContextPrompt, switchAgent, loadChatLocal, saveCfgPref, fullAccessDefault, touchChat } from "../state.svelte";
 import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { api } from "../ipc";
   import MessageItem from "./MessageItem.svelte";
@@ -308,6 +308,8 @@ import type { DisplayItem } from "../state.svelte";
     void (async () => {
       try {
         const k = chatKey(ctxId, agent);
+        // 记录“正在查看”，并把久未查看的其它会话从内存中释放（本地库仍有快照）
+        untrack(() => touchChat(k));
         // 先读本地快照，立即渲染（不等适配器）；本地为空时保持旧行为
         const local = await loadChatLocal(k);
         if (local && !app.chat[k]?.length && app.contextId === ctxId && app.agent === agent) {

@@ -416,11 +416,32 @@ impl AcpConnection {
         let update = params.get("update").cloned().unwrap_or(Value::Null);
         let utype = update.get("sessionUpdate").and_then(|t| t.as_str()).unwrap_or_default();
 
-        // accumulate transcript
+        // accumulate transcript —— 只对有进行中回合（begin_turn 登记过）的会话。
+        // 没有回合却收到正文/工具块的，只能是 session/load 重放在捕获窗口
+        // (end_capture) / 静默窗口 (finish_load) 之后才姗姗来迟的尾巴，或 cancel 之后
+        // 的残余 chunk。以前这里 entry().or_default() 兜住后照样 emit 给前端：WebView
+        // 把整段历史当成实时流再追加一遍（永不结束的 streaming 条目、逐 chunk 重渲染），
+        // 同时 Rust 侧 TurnBuffer 无人 end_turn 也一直涨——这是绑定长历史时 WebView
+        // 内存持续上涨的一条路径。现在直接丢弃，非正文类通知（模式/命令/配置更新）照常透传。
+        let is_transcript = matches!(
+            utype,
+            "agent_message_chunk" | "agent_thought_chunk" | "user_message_chunk" | "tool_call" | "tool_call_update" | "plan"
+        );
         let mut flush_ctx: Option<String> = None;
         {
             let mut buffers = self.buffers.lock().unwrap();
-            let buf = buffers.entry(session_id.clone()).or_default();
+            let Some(buf) = buffers.get_mut(&session_id) else {
+                if is_transcript {
+                    log::debug!("[{}] drop stray {utype} for session {session_id} (no active turn)", self.agent_type);
+                    return;
+                }
+                drop(buffers);
+                let _ = self.app.emit(
+                    EVT_UPDATE,
+                    json!({ "agentType": self.agent_type, "sessionId": session_id, "contextId": Value::Null, "update": update }),
+                );
+                return;
+            };
             match utype {
                 "agent_message_chunk" => {
                     if let Some(t) = chunk_text(&update) {
@@ -458,6 +479,9 @@ impl AcpConnection {
             }
         }
 
+        // 工具调用负载只发前端真正渲染的部分（见 compact_tool_update）——实时回合里的
+        // 命令输出 / diff / MCP 结果与绑定重放一样会在 WebView 里成倍放大并把本地快照撑爆
+        let update = if matches!(utype, "tool_call" | "tool_call_update") { compact_tool_update(&update) } else { update };
         let _ = self.app.emit(
             EVT_UPDATE,
             json!({
