@@ -165,7 +165,12 @@ export const api = {
   dataExport: () => invoke<string>("data_export"),
   dataImport: (path: string) => invoke<string>("data_import", { path }),
   skinImport: (path: string) => invoke<Record<string, unknown>>("skin_import", { path }),
+  /** zip 内容以二进制请求体发送（文件选择器 / HTML5 拖放拿不到路径，只有字节） */
+  skinImportBytes: (bytes: Uint8Array) => invoke<Record<string, unknown>>("skin_import_bytes", bytes),
+  skinDelete: (id: string) => invoke<void>("skin_delete", { id }),
   skinsList: () => invoke<Record<string, unknown>[]>("skins_list"),
+  /** 图片原始字节（前端转 blob: URL；data: URL 超过 2 MiB 会被 Chromium 视为非法而静默不显示） */
+  skinAssetRead: (skinDir: string, file: string) => invoke<ArrayBuffer>("skin_asset_read", { skinDir, file }),
   skinAssetData: (skinDir: string, file: string) => invoke<string>("skin_asset_data", { skinDir, file }),
   clipboardWriteText: (text: string) => invoke<void>("clipboard_write_text", { text }),
   clipboardReadText: () => invoke<string>("clipboard_read_text"),

@@ -41,13 +41,31 @@ export async function listSkins(): Promise<SkinManifest[]> {
     .map((v) => ({ ...v, id: String(v.id), name: String(v.name || v.id), dir: String(v.dir || v.id) }) as SkinManifest);
 }
 
+/** blob: URLs created for the active custom skin; revoked on every switch so the bitmaps are freed. */
+const objectUrls: string[] = [];
 function clearSkin() {
   for (const key of managed) document.body.style.removeProperty(key);
   managed.clear();
   document.getElementById("skin-custom-css")?.remove();
   delete document.body.dataset.skin;
   delete document.body.dataset.skinCharacter;
+  for (const url of objectUrls.splice(0)) URL.revokeObjectURL(url);
   // Keep --skin-opacity: the user preference outlives skin switches.
+}
+
+const IMAGE_MIME: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", gif: "image/gif" };
+/**
+ * Load a declared skin image as a `blob:` URL. The previous implementation inlined the file as a
+ * base64 `data:` URL inside a CSS custom property; Chromium (WebView2 included) treats any URL longer
+ * than 2 MiB (`url::kMaxURLChars`) as invalid, so every image above ~1.5 MB imported successfully but
+ * never rendered. Raw bytes + object URLs have no such limit and skip the base64 blow-up.
+ */
+async function assetUrl(dir: string, file: string): Promise<string> {
+  const bytes = await api.skinAssetRead(dir, file);
+  const type = IMAGE_MIME[file.split(".").pop()?.toLowerCase() ?? ""] ?? "application/octet-stream";
+  const url = URL.createObjectURL(new Blob([bytes], { type }));
+  objectUrls.push(url);
+  return url;
 }
 function setToken(key: string, value: string) {
   document.body.style.setProperty(key, value);
@@ -90,10 +108,19 @@ export function activateSkin(id: string, onError: (message: string) => void): ()
         if (!manifest) throw new Error("Skin is no longer installed");
         const css = manifest.css ? scopeSkinCss(manifest.css, id) : "";
         const [background, character] = await Promise.all([
-          manifest.background ? api.skinAssetData(manifest.dir, manifest.background) : "",
-          manifest.character ? api.skinAssetData(manifest.dir, manifest.character) : "",
+          manifest.background ? assetUrl(manifest.dir, manifest.background) : "",
+          manifest.character ? assetUrl(manifest.dir, manifest.character) : "",
         ]);
-        if (version !== generation) return;
+        if (version !== generation) {
+          // a newer activation won: free the bitmaps we just created
+          for (const url of [background, character]) {
+            if (!url) continue;
+            URL.revokeObjectURL(url);
+            const i = objectUrls.indexOf(url);
+            if (i >= 0) objectUrls.splice(i, 1);
+          }
+          return;
+        }
         for (const [key, value] of Object.entries(manifest.vars ?? {})) {
           if (typeof value !== "string") continue;
           if (colorVars.has(key) && /^#[\da-f]{3}([\da-f]{3})?$/i.test(value)) setToken(key, value);

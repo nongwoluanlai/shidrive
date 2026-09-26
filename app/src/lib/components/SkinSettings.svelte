@@ -3,11 +3,17 @@
   import { app, toast } from "../state.svelte";
   import { api } from "../ipc";
   import { t } from "../i18n";
+  import { confirmDialog } from "../dialog.svelte";
   import { builtinSkins, listSkins, skinOpacity, setSkinOpacity, type SkinManifest } from "../skins.svelte";
+
+  const MAX_PACKAGE = 32 * 1024 * 1024; // 与 skins.rs 的 MAX_TOTAL 一致
 
   let custom = $state<SkinManifest[]>([]);
   let lastSkin = $state("steins-gate");
   let busy = $state(false);
+  /** 正在往窗口里拖 zip（Tauri 拖放事件或 HTML5 dragover） */
+  let dragging = $state(false);
+  let fileInput = $state<HTMLInputElement | null>(null);
   // Serialize writes so quick toggles cannot persist a stale selection.
   let saving: Promise<unknown> = Promise.resolve();
   async function choose(id: string) {
@@ -20,23 +26,110 @@
     await saving;
   }
   async function refresh() { custom = await listSkins(); }
+
   onMount(() => {
     void Promise.all([refresh(), api.settingsGet("ui.skin.last")]).then(([, last]) => {
       if (app.skin) lastSkin = app.skin;
       else if (last && (builtinSkins.some((s) => s.id === last) || custom.some((s) => s.id === last))) lastSkin = last;
     }).catch((error) => toast("error", String(error)));
+
+    // Tauri 默认接管了窗口的文件拖放（dragDropEnabled）：文件落到 WebView 上时 DOM 收不到 HTML5
+    // drop 事件，只会收到 tauri://drag-* 事件并带上真实路径——这里在皮肤设置打开期间监听它们，
+    // 落下的 .zip 直接走按路径导入。HTML5 的 dragover/drop 作为浏览器/关闭 dragDrop 时的后备。
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    void import("@tauri-apps/api/webview")
+      .then(({ getCurrentWebview }) => getCurrentWebview().onDragDropEvent((event) => {
+        const payload = event.payload;
+        if (payload.type === "enter") dragging = payload.paths.some(isZipPath);
+        else if (payload.type === "leave") dragging = false;
+        else if (payload.type === "drop") {
+          dragging = false;
+          const zips = payload.paths.filter(isZipPath);
+          if (zips.length) void importPaths(zips);
+        }
+      }))
+      .then((fn) => { if (disposed) fn(); else unlisten = fn; })
+      .catch(() => { /* 非 Tauri 环境（如浏览器预览）没有拖放事件 */ });
+    return () => { disposed = true; unlisten?.(); };
   });
-  async function importSkin() {
-    const path = await import("../dialog.svelte").then((m) => m.promptDialog({ title: t("导入皮肤包"), label: t("皮肤 zip 路径"), initial: "" }));
-    if (!path?.trim()) return;
+
+  const isZipPath = (p: string) => /\.zip$/i.test(p);
+  const isZipFile = (f: File) => isZipPath(f.name) || /zip/i.test(f.type);
+
+  async function finishImport(manifest: Record<string, unknown>) {
+    await refresh();
+    await choose(String(manifest.id));
+  }
+  /** 拖放（Tauri 事件给的是路径） */
+  async function importPaths(paths: string[]) {
+    if (busy) return;
     busy = true;
+    let imported = 0;
     try {
-      const manifest = await api.skinImport(path.trim());
+      for (const path of paths) {
+        try {
+          await finishImport(await api.skinImport(path));
+          imported++;
+        } catch (error) { toast("error", `${path.split(/[\\/]/).pop()}: ${String(error)}`); }
+      }
+      if (imported) toast("ok", imported === 1 ? t("皮肤已导入并启用") : t("已导入 {count} 个皮肤", { count: imported }));
+    } finally { busy = false; }
+  }
+  /** 文件选择器 / HTML5 拖放（只有字节没有路径）：整包作为二进制请求体发给后端 */
+  async function importFiles(files: FileList | File[]) {
+    if (busy) return;
+    const list = Array.from(files);
+    if (!list.some(isZipFile)) { toast("warn", t("仅支持 .zip 皮肤包")); return; }
+    busy = true;
+    let imported = 0;
+    try {
+      for (const file of list.filter(isZipFile)) {
+        if (file.size > MAX_PACKAGE) { toast("error", `${file.name}: ${t("皮肤包超过 32 MiB")}`); continue; }
+        try {
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          await finishImport(await api.skinImportBytes(bytes));
+          imported++;
+        } catch (error) { toast("error", `${file.name}: ${String(error)}`); }
+      }
+      if (imported) toast("ok", imported === 1 ? t("皮肤已导入并启用") : t("已导入 {count} 个皮肤", { count: imported }));
+    } finally { busy = false; }
+  }
+  function onFilePicked(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    if (input.files?.length) void importFiles(input.files);
+    input.value = ""; // 同一个文件可再次选择
+  }
+  function onDragOver(e: DragEvent) {
+    if (!e.dataTransfer?.types.includes("Files")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    dragging = true;
+  }
+  function onDrop(e: DragEvent) {
+    e.preventDefault();
+    dragging = false;
+    if (e.dataTransfer?.files.length) void importFiles(e.dataTransfer.files);
+  }
+
+  async function removeSkin(skin: SkinManifest) {
+    const ok = await confirmDialog({
+      title: t("删除皮肤"),
+      message: t("删除皮肤「{name}」？其文件将从本机移除，重新导入即可恢复。", { name: skin.name }),
+      danger: true,
+      confirmText: t("删除"),
+    });
+    if (!ok) return;
+    try {
+      await api.skinDelete(skin.id);
+      if (app.skin === skin.id) await choose("");
+      if (lastSkin === skin.id) lastSkin = builtinSkins[0].id;
       await refresh();
-      await choose(String(manifest.id));
-      toast("ok", t("皮肤已导入并启用"));
+      toast("ok", t("皮肤已删除"));
     } catch (error) { toast("error", String(error)); }
-    finally { busy = false; }
+  }
+  function cardKey(e: KeyboardEvent, id: string) {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); void choose(id); }
   }
 </script>
 
@@ -52,13 +145,21 @@
       </button>
     {/each}
     {#each custom as skin (skin.id)}
-      <button class="skin-card custom" class:on={app.skin === skin.id} aria-pressed={app.skin === skin.id} onclick={() => choose(skin.id)}>
+      <!-- 自定义皮肤卡片带删除按钮，button 不能嵌套 button，所以卡片本身用 role=button -->
+      <div class="skin-card custom" class:on={app.skin === skin.id} role="button" tabindex="0" aria-pressed={app.skin === skin.id} onclick={() => choose(skin.id)} onkeydown={(e) => cardKey(e, skin.id)}>
         <span class="skin-swatch" aria-hidden="true"></span><strong>{skin.name}</strong><span>{t("自定义皮肤")}</span>
-      </button>
+        <button class="skin-del" title={t("删除皮肤")} aria-label={t("删除皮肤")} onclick={(e) => { e.stopPropagation(); void removeSkin(skin); }}>✕</button>
+      </div>
     {/each}
   </div>
+  <div class="skin-drop" class:active={dragging} class:busy role="region" aria-label={t("导入皮肤包（zip）")} ondragover={onDragOver} ondragenter={onDragOver} ondragleave={() => (dragging = false)} ondrop={onDrop}>
+    <span>{dragging ? t("松开即可导入皮肤包") : busy ? t("正在导入…") : t("把皮肤 zip 拖到这里，或")}</span>
+    {#if !dragging}
+      <button class="btn sm" disabled={busy} onclick={() => fileInput?.click()}>{t("选择 zip 文件")}</button>
+    {/if}
+    <input bind:this={fileInput} type="file" accept=".zip,application/zip,application/x-zip-compressed" multiple hidden onchange={onFilePicked} />
+  </div>
   <div class="skin-actions">
-    <button class="btn sm" disabled={busy} onclick={importSkin}>{busy ? t("正在导入…") : t("导入皮肤包（zip）")}</button>
     <button class="linklike" onclick={() => void api.fsOpenDefault("https://github.com/nongwoluanlai/shidrive/blob/main/docs/skin-guide.md").catch((e) => toast("error", String(e)))}>{t("皮肤开发指南")}</button>
     <button class="linklike" onclick={() => void api.fsOpenDefault("https://shidrive.nwll.top/skinstore").catch((e) => toast("error", String(e)))}>{t("皮肤商店 ↗")}</button>
   </div>
@@ -85,7 +186,14 @@
   .skin-card.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
   .skin-card:hover { border-color: var(--text-dim); }
   .skin-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
-  .skin-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 12px; }
+  .skin-card.custom { position: relative; cursor: pointer; }
+  .skin-del { position: absolute; top: 6px; right: 6px; width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--border); background: color-mix(in srgb, var(--bg-panel) 85%, transparent); color: var(--text-dim); font-size: .8em; line-height: 1; cursor: pointer; opacity: 0; transition: opacity .12s; }
+  .skin-card.custom:hover .skin-del, .skin-card.custom:focus-within .skin-del { opacity: 1; }
+  .skin-del:hover { color: var(--danger); border-color: var(--danger); }
+  .skin-drop { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 10px; margin-top: 12px; padding: 14px; border: 1.5px dashed var(--border); border-radius: var(--radius); color: var(--text-dim); font-size: .88em; background: color-mix(in srgb, var(--bg-elev) 60%, transparent); transition: border-color .15s, background .15s; }
+  .skin-drop.active { border-color: var(--accent); border-style: solid; background: var(--accent-soft, var(--bg-elev2)); color: var(--text); }
+  .skin-drop.busy { opacity: .7; }
+  .skin-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 10px; }
   .skin-opacity-row { display: flex; align-items: center; gap: 8px; font-size: .86em; color: var(--text-dim); margin-top: 12px; }
   .skin-opacity-row input { flex: 1; max-width: 220px; accent-color: var(--accent); }
   .skin-opacity-row b { min-width: 38px; text-align: right; color: var(--text); }

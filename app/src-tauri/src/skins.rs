@@ -186,7 +186,18 @@ fn contained_file(dir: &Path, name: &str) -> Result<PathBuf, String> {
 
 pub fn import(root: &Path, path: &Path) -> Result<Value, String> {
     let input = fs::File::open(path).map_err(|e| format!("打开皮肤包失败: {e}"))?;
-    if input.metadata().map_err(|e| e.to_string())?.len() > MAX_TOTAL {
+    let len = input.metadata().map_err(|e| e.to_string())?.len();
+    import_reader(root, input, len)
+}
+
+/// Import a package that already sits in memory (the file picker in WebView2 only hands
+/// the frontend the bytes, never a path). Same bounds and validation as `import`.
+pub fn import_bytes(root: &Path, bytes: &[u8]) -> Result<Value, String> {
+    import_reader(root, std::io::Cursor::new(bytes), bytes.len() as u64)
+}
+
+fn import_reader<R: Read + std::io::Seek>(root: &Path, input: R, len: u64) -> Result<Value, String> {
+    if len > MAX_TOTAL {
         return Err("皮肤包超过 32 MiB".into());
     }
     let mut archive = zip::ZipArchive::new(input).map_err(|e| e.to_string())?;
@@ -293,7 +304,7 @@ pub fn import(root: &Path, path: &Path) -> Result<Value, String> {
     let root = fs::canonicalize(root).map_err(|e| e.to_string())?;
     let dest = root.join(id);
     if dest.try_exists().map_err(|e| e.to_string())? {
-        return Err("该皮肤 id 已安装，请使用不同 id".into());
+        return Err("该皮肤 id 已安装：请先在皮肤列表中删除它，或改用不同的 id".into());
     }
     let stage = root.join(format!(".import-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&stage).map_err(|e| e.to_string())?;
@@ -354,7 +365,10 @@ pub fn list(root: &Path) -> Result<Vec<Value>, String> {
     Ok(result)
 }
 
-pub fn asset(root: &Path, requested: &str, file: &str) -> Result<String, String> {
+/// Raw bytes + mime of a declared skin image. The frontend turns them into a `blob:` URL:
+/// a base64 `data:` URL breaks past Chromium's 2 MiB URL limit (`url::kMaxURLChars`), so
+/// any image above ~1.5 MB imported fine but silently never rendered.
+pub fn asset_bytes(root: &Path, requested: &str, file: &str) -> Result<(&'static str, Vec<u8>), String> {
     let dir = installed_dir(root, requested)?;
     let manifest = parse_manifest(&bounded_read(&dir.join("skin.json"), MAX_MANIFEST)?)?;
     if manifest["id"].as_str() != dir.file_name().and_then(|s| s.to_str()) {
@@ -369,7 +383,25 @@ pub fn asset(root: &Path, requested: &str, file: &str) -> Result<String, String>
     let path = contained_file(&dir, file)?;
     let bytes = bounded_read(&path, MAX_ASSET)?;
     let mime = image_mime(&path, &bytes)?;
+    Ok((mime, bytes))
+}
+
+pub fn asset(root: &Path, requested: &str, file: &str) -> Result<String, String> {
+    let (mime, bytes) = asset_bytes(root, requested, file)?;
     Ok(format!("data:{mime};base64,{}", base64(&bytes)))
+}
+
+/// Remove an installed custom skin. Only ids are accepted (never paths), built-in ids are
+/// not valid ids, and the directory must still resolve to a direct child of the skin root.
+pub fn delete(root: &Path, id: &str) -> Result<(), String> {
+    if !valid_id(id) {
+        return Err("皮肤 id 无效或为内置皮肤".into());
+    }
+    let dir = installed_dir(root, id)?;
+    if !dir.join("skin.json").is_file() {
+        return Err("该目录不是已安装的皮肤".into());
+    }
+    fs::remove_dir_all(&dir).map_err(|e| format!("删除皮肤失败: {e}"))
 }
 fn base64(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -421,6 +453,38 @@ mod tests {
         }
         zip.finish().unwrap();
         path
+    }
+    #[test]
+    fn import_bytes_matches_path_import_and_delete_only_removes_installed_custom_skins() {
+        let tmp = Temp::new();
+        let root = tmp.0.join("skins");
+        let png = b"\x89PNG\r\n\x1a\nexample";
+        let zip = package(&tmp.0, &[("skin.json", br##"{"id":"frommem","background":"bg.png"}"##), ("bg.png", png)]);
+        let bytes = fs::read(&zip).unwrap();
+        let manifest = import_bytes(&root, &bytes).unwrap();
+        assert_eq!(manifest["id"], "frommem");
+        assert_eq!(list(&root).unwrap()[0]["dir"], "frommem");
+        // same bounds as the path importer
+        assert!(import_bytes(&root, &vec![0u8; MAX_TOTAL as usize + 1]).unwrap_err().contains("32 MiB"));
+        assert!(import_bytes(&root, b"not a zip").is_err());
+        // a second import of the same id is refused and points at deletion
+        assert!(import_bytes(&root, &bytes).unwrap_err().contains("删除"));
+        // raw asset access
+        let (mime, data) = asset_bytes(&root, "frommem", "bg.png").unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(data, png);
+        assert!(asset_bytes(&root, "frommem", "skin.json").is_err());
+        // delete: only valid custom ids, only installed dirs, never paths
+        for bad in ["hell", "steins-gate", "none", "../frommem", tmp.0.to_str().unwrap(), "missing"] {
+            assert!(delete(&root, bad).is_err(), "{bad}");
+        }
+        fs::create_dir_all(root.join("notaskin")).unwrap();
+        assert!(delete(&root, "notaskin").is_err(), "a directory without skin.json is not a skin");
+        delete(&root, "frommem").unwrap();
+        assert!(!root.join("frommem").exists());
+        assert!(list(&root).unwrap().is_empty());
+        // after deletion the same package can be imported again
+        import_bytes(&root, &bytes).unwrap();
     }
     #[test]
     fn rejects_unsafe_names_and_reserved_ids() {

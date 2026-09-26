@@ -540,6 +540,38 @@ pub async fn skins_list() -> Result<Vec<serde_json::Value>, String> {
         .await.map_err(|e| e.to_string())?
 }
 
+/// Import a skin package the frontend already holds in memory (file picker / HTML5 drop:
+/// WebView2 never exposes the picked file's path). The zip travels as the raw request body.
+#[tauri::command]
+pub async fn skin_import_bytes(request: tauri::ipc::Request<'_>) -> Result<serde_json::Value, String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("皮肤包必须以二进制请求体发送".into());
+    };
+    let bytes = bytes.clone();
+    let root = crate::skins::root()?;
+    tauri::async_runtime::spawn_blocking(move || crate::skins::import_bytes(&root, &bytes))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn skin_delete(id: String) -> Result<(), String> {
+    let root = crate::skins::root()?;
+    tauri::async_runtime::spawn_blocking(move || crate::skins::delete(&root, &id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Raw image bytes of a declared skin asset (the frontend builds a blob: URL from them).
+#[tauri::command]
+pub async fn skin_asset_read(skin_dir: String, file: String) -> Result<tauri::ipc::Response, String> {
+    let root = crate::skins::root()?;
+    let (_mime, bytes) = tauri::async_runtime::spawn_blocking(move || crate::skins::asset_bytes(&root, &skin_dir, &file))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 #[tauri::command]
 pub async fn skin_asset_data(skin_dir: String, file: String) -> Result<String, String> {
     let root = crate::skins::root()?;
