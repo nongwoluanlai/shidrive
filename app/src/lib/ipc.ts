@@ -12,6 +12,7 @@ import type {
   DirEntryInfo,
   Edge,
   Project,
+  ProjectCleanup,
   ScCommit,
   ScheduleConfig,
   SessionInfo,
@@ -31,7 +32,8 @@ export const api = {
     invoke<Project>("projects_create", { name, rootPath: root_path, description }),
   projectsUpdate: (id: string, name: string, root_path: string, description: string) =>
     invoke<void>("projects_update", { id, name, rootPath: root_path, description }),
-  projectsDelete: (id: string) => invoke<void>("projects_delete", { id }),
+  /** Deletes the project and everything under it (contexts, bindings, chat, workflows, runs, remote grants). */
+  projectsDelete: (id: string) => invoke<ProjectCleanup>("projects_delete", { id }),
 
   // contexts
   contextsList: (project_id: string) => invoke<Context[]>("contexts_list", { projectId: project_id }),
@@ -124,7 +126,8 @@ export const api = {
       env: w.env ?? {},
       edges: w.edges ?? [],
     }),
-  workflowUpdate: (workflow: Workflow) => invoke<void>("workflow_update", { workflow }),
+  /** Saves editable fields only; the returned row carries the server-owned last_run_at/next_run_at. */
+  workflowUpdate: (workflow: Workflow) => invoke<Workflow>("workflow_update", { workflow }),
   workflowDelete: (id: string) => invoke<void>("workflow_delete", { id }),
   workflowRun: (id: string) => invoke<void>("workflow_run", { id }),
   workflowStop: (run_id: string) => invoke<void>("workflow_stop", { runId: run_id }),

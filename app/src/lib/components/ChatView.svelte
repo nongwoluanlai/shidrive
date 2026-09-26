@@ -11,7 +11,6 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
 import type { DisplayItem } from "../state.svelte";
 
   let input = $state("");
-  let sending = $state(false);
   let listEl: HTMLDivElement | undefined = $state();
   let msgsInnerEl: HTMLDivElement | undefined = $state();
   let stickToBottom = $state(true);
@@ -20,6 +19,8 @@ import type { DisplayItem } from "../state.svelte";
 
   const ctx = $derived(currentContext());
   const key = $derived(chatKey(ctx?.id ?? null, app.agent));
+  // 按会话记录“正在发送”，而不是整个组件一个开关：某个会话的回合进行中不应锁住其他会话。
+  const sending = $derived(app.streaming[key] ?? false);
   const items = $derived(app.chat[key] ?? []);
   // ============ 有界滑窗渲染：内存/卡顿与定位能力兼得 ============
   // 设计：消息数据全量在内存（供搜索/时间轴索引），DOM 只渲染 [startIdx, endIdx)
@@ -400,29 +401,32 @@ import type { DisplayItem } from "../state.svelte";
     if (!ctx || sending) return;
     const text = input.trim();
     if (!text && !pendingImages.length) return;
+    // 固定本回合的会话身份：await 期间用户可能切换 agent/上下文，之后 ctx/key/app.agent
+    // 都会指向别的会话，回合结束的状态必须写回发起时的那一份。
+    const turnCtx = ctx;
+    const turnAgent = app.agent;
+    const turnKey = key;
     const imgs = pendingImages.map((p) => ({ data: p.data, mime: p.mime }));
     input = "";
-    app.drafts[key] = "";
+    app.drafts[turnKey] = "";
     pendingImages = [];
     stickToBottom = true;
-    pushLocal(key, { kind: "user", text: text + (imgs.length ? `\n\n[图片 ×${imgs.length}]` : "") });
-    sending = true;
-    app.streaming[key] = true;
+    pushLocal(turnKey, { kind: "user", text: text + (imgs.length ? `\n\n[图片 ×${imgs.length}]` : "") });
+    app.streaming[turnKey] = true;
     try {
-      const res = await api.acpPrompt(ctx, app.agent, text, imgs);
+      const res = await api.acpPrompt(turnCtx, turnAgent, text, imgs);
       const stop = res?.stopReason ?? "end_turn";
-      if (stop !== "end_turn") toast("info", t("回合结束（{reason}）", { reason: String(stop) }));
+      if (stop !== "end_turn" && key === turnKey) toast("info", t("回合结束（{reason}）", { reason: String(stop) }));
     } catch (e) {
-      pushLocal(key, { kind: "error", text: String(e) });
+      pushLocal(turnKey, { kind: "error", text: String(e) });
     } finally {
-      finishTurn(app.agent, ctx.id);
-      sending = false;
+      finishTurn(turnAgent, turnCtx.id);
       // refresh binding (session id may have just been created)
       api
-        .bindingGet(ctx.id, app.agent)
+        .bindingGet(turnCtx.id, turnAgent)
         .then((b) => {
-          app.bindingSession[key] = b?.session_id ?? null;
-          bindingTitle = b?.title ?? null;
+          app.bindingSession[turnKey] = b?.session_id ?? null;
+          if (key === turnKey) bindingTitle = b?.title ?? null;
         })
         .catch(() => {});
     }

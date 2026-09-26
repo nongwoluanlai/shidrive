@@ -1,10 +1,11 @@
 <script lang="ts">
   // 图形化工作流：SVG 节点画布（并行分支、自由连线）+ 触发按钮 + {t("运行历史")}右列。
-  import { onMount, untrack } from "svelte";
+  import { onDestroy, onMount, untrack } from "svelte";
   import { app, currentProject, refreshWorkflows, toast } from "../state.svelte";
   import { api } from "../ipc";
   import type { Edge, ScheduleConfig, Workflow, WorkflowRun, WorkflowStep } from "../types";
-  import { scheduleText } from "./wf-shared";
+  import { onceFromInput, onceToInput, scheduleText } from "./wf-shared";
+  import { flushWorkflowSaves, forgetWorkflow, isDirty, trackWorkflowEdit } from "./wf-autosave.svelte";
   import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { firstLineOf } from "./wf-firstline";
   import ContextMenu from "./ContextMenu.svelte";
@@ -40,58 +41,48 @@
     }
   });
 
-  // 选中变化时重载{t("运行历史")} + 重置自动保存基线
-  let savedSnap = $state("");
-  function snapOf(w: Workflow | null): string {
-    if (!w) return "";
-    return JSON.stringify({ n: w.name, d: w.description, en: w.enabled, t: w.trigger_type, s: w.schedule, st: w.steps, ed: w.edges, env: w.env });
-  }
+  // 选中变化时：先把上一个工作流的未保存修改落库，再重载{t("运行历史")}。
+  // 只以“选中 id”为依赖，不追踪工作流深层内容。
+  let runsFor = "";
   $effect(() => {
     const id = app.workflowSelected;
     openRun = null;
     selectedStep = null;
     propsOpen = false;
+    untrack(() => void flushWorkflowSaves());
     if (!id) {
       runs = [];
-      savedSnap = "";
+      runsFor = "";
       return;
     }
-    // 只以“选中 id”为依赖：基线快照与历史拉取都不追踪工作流深层内容，
-    // 否则步骤一变更基线就被改写，自动保存永远看不到差异。
-    savedSnap = untrack(() => {
-      const w = app.workflows.find((x) => x.id === id);
-      return snapOf(w ?? null);
-    });
     untrack(() => {
+      runsFor = id;
       void (async () => {
         try {
-          runs = await api.runsList(id);
+          const list = await api.runsList(id);
+          if (runsFor === id) runs = list; // 忽略切换后才返回的旧结果
         } catch (e) {
-          toast("error", String(e));
+          if (runsFor === id) toast("error", String(e));
         }
       })();
     });
   });
 
-  // 自动保存：内容与基线不一致时 800ms 防抖保存
-  let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  // 自动保存（见 wf-autosave.svelte.ts）：深层内容与“已成功保存的基线”不一致时防抖落库；
+  // 基线只在保存成功后前移，切换/离开时立即 flush，绝不在 cleanup 里丢弃计时器。
+  let saveProblem = $state<string | null>(null);
+  const unsaved = $derived(selected ? isDirty(selected.id) : false);
   $effect(() => {
     const w = selected;
-    if (!w || !savedSnap) return;
-    const snap = snapOf(w);
-    if (snap === savedSnap) return;
-    if (saveTimer) clearTimeout(saveTimer);
-    saveTimer = setTimeout(async () => {
-      try {
-        await api.workflowUpdate(w);
-        savedSnap = snapOf(w);
-      } catch (e) {
-        toast("error", t("自动保存失败：{error}", { error: String(e) }));
-      }
-    }, 800);
-    return () => {
-      if (saveTimer) clearTimeout(saveTimer);
-    };
+    if (!w) {
+      saveProblem = null;
+      return;
+    }
+    const problem = trackWorkflowEdit(w);
+    untrack(() => (saveProblem = problem));
+  });
+  onDestroy(() => {
+    void flushWorkflowSaves();
   });
 
   $effect(() => {
@@ -99,10 +90,13 @@
   });
 
   async function refresh() {
-    if (!project) return;
+    const p = project;
+    if (!p) return;
     try {
       await refreshWorkflows();
-      contexts = (await api.contextsList(project.id)).map((c) => ({ id: c.id, name: c.name }));
+      const list = await api.contextsList(p.id);
+      if (project?.id !== p.id) return; // 项目已切换，丢弃过期结果
+      contexts = list.map((c) => ({ id: c.id, name: c.name }));
       if (app.workflowSelected && !app.workflows.find((w) => w.id === app.workflowSelected)) app.workflowSelected = null;
       if (!app.workflowSelected && app.workflows.length) app.workflowSelected = app.workflows[0].id;
     } catch (e) {
@@ -131,21 +125,19 @@
     }
   }
 
+  /** 立即保存：跳过防抖，等待落库完成后再提示（失败原因由自动保存模块提示）。 */
   async function save() {
     if (!selected) return;
-    try {
-      await api.workflowUpdate(selected);
-      await refreshWorkflows();
-      toast("ok", t("已保存"));
-    } catch (e) {
-      toast("error", String(e));
-    }
+    trackWorkflowEdit(selected);
+    if (await flushWorkflowSaves()) toast("ok", t("已保存"));
   }
 
   async function del() {
     if (!selected || !(await confirmDialog({ title: t("删除工作流"), message: t("删除工作流「{name}」？运行历史将一并删除。", { name: selected.name }), danger: true, confirmText: t("删除") }))) return;
+    const id = selected.id;
     try {
-      await api.workflowDelete(selected.id);
+      forgetWorkflow(id);
+      await api.workflowDelete(id);
       app.workflowSelected = null;
       await refresh();
     } catch (e) {
@@ -621,6 +613,11 @@
           {:else}
             <span class="badge">{t("手动")}</span>
           {/if}
+          {#if saveProblem}
+            <span class="badge warn" title={saveProblem}>⚠ {t("未保存")}</span>
+          {:else if unsaved}
+            <span class="badge" title={t("修改将在停止输入后自动保存")}>{t("保存中…")}</span>
+          {/if}
           <div class="trigger-wrap">
             <button class="btn" onclick={() => (triggerOpen = !triggerOpen)}>
               ⚡ {t("触发：{schedule}", { schedule: selected.trigger_type === "schedule" ? (selected.enabled ? scheduleText(selected.schedule) : t("已停用")) : t("手动") })}
@@ -663,10 +660,19 @@
                       {/each}
                       <input class="time" type="time" bind:value={(selected.schedule as any).time} />
                     {:else if selected.schedule?.kind === "once"}
-                      <input class="time" type="datetime-local" bind:value={(selected.schedule as any).at} />
+                      <!-- datetime-local 只认 YYYY-MM-DDTHH:MM；存储/后端使用 YYYY-MM-DD HH:MM，这里双向转换 -->
+                      <input
+                        class="time"
+                        type="datetime-local"
+                        bind:value={() => onceToInput((selected!.schedule as { at: string }).at), (v: string) => ((selected!.schedule as { at: string }).at = onceFromInput(v))}
+                      />
                     {/if}
                   </div>
-                  <p class="next">{t("下次运行：{time}", { time: selected.next_run_at ?? "—" })}</p>
+                  {#if saveProblem}
+                    <p class="next warn">⚠ {t("尚未保存：{reason}", { reason: saveProblem })}</p>
+                  {:else}
+                    <p class="next">{t("下次运行：{time}", { time: selected.next_run_at ?? "—" })}{#if unsaved} · {t("保存中…")}{/if}</p>
+                  {/if}
                 {/if}
                 <button class="btn sm primary" onclick={() => { triggerOpen = false; void save(); }}>{t("应用")}</button>
               </div>
@@ -1046,6 +1052,9 @@
   .next {
     font-size: 0.85em;
     color: var(--text-faint);
+  }
+  .next.warn {
+    color: var(--warn);
   }
   .canvas-row {
     display: grid;

@@ -1,31 +1,34 @@
 <script lang="ts">
   import { t, localeTag } from "../i18n";
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
-  import { app, currentContext, toast } from "../state.svelte";
+  import { app, currentContext, refreshContexts, toast } from "../state.svelte";
   import { api } from "../ipc";
   import { promptDialog } from "../dialog.svelte";
   import type { ContextEntry, ScCommit } from "../types";
 
   const ctx = $derived(currentContext());
+  // 原始值派生：列表刷新换了对象引用但 id 未变时，下面按 id 触发的 effect 不会重跑
+  const ctxId = $derived(ctx?.id ?? null);
   let entries = $state<ContextEntry[]>([]);
   let overview = $state("");
   let constraints = $state("");
+  // 概述/约束的本地修改尚未落库时为 true：此时不允许外部提交（Agent 经 MCP）覆盖正在编辑的文本
+  let dirty = $state(false);
+  let editSeq = 0;
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingSave: { id: string; overview: string; constraints: string; seq: number } | null = null;
 
   const inputs = $state<Record<string, string>>({ todo: "", progress: "", decision: "", note: "" });
   let commits = $state<ScCommit[]>([]);
   let openCommit = $state<number | null>(null);
 
-  async function refreshCommits() {
-    if (!ctx) {
-      commits = [];
-      return;
-    }
+  async function refreshCommits(id: string) {
     try {
-      commits = await api.contextCommits(ctx.id);
+      const list = await api.contextCommits(id);
+      if (ctx?.id === id) commits = list; // 切换后才返回的旧结果直接丢弃
     } catch (e) {
-      toast("error", t("加载提交历史失败: ") + String(e));
+      if (ctx?.id === id) toast("error", t("加载提交历史失败: ") + String(e));
     }
   }
 
@@ -112,80 +115,134 @@
     }
   }
 
-  // load when context changes
+  // 切换上下文：只依赖 id（列表刷新产生的新对象不会重置正在编辑的文本）。
+  // 先把上一个上下文的待保存修改立即落库，再清空旧内容并加载新内容。
   $effect(() => {
-    const c = ctx;
-    if (!c) return;
+    const id = ctxId;
+    untrack(() => {
+      void flushPending();
+      openCommit = null;
+      entries = [];
+      commits = [];
+      dirty = false;
+      editSeq++;
+      if (!id) {
+        overview = "";
+        constraints = "";
+        return;
+      }
+      const c = app.contexts.find((x) => x.id === id);
+      overview = c?.overview ?? "";
+      constraints = c?.constraints ?? "";
+      void refresh(id);
+      void refreshCommits(id);
+    });
+  });
+
+  /** 从后端重新读取当前上下文的概述/约束（仅在没有未保存修改时覆盖文本框）。 */
+  async function reloadHead(id: string) {
+    await refreshContexts();
+    const c = app.contexts.find((x) => x.id === id);
+    if (!c || ctx?.id !== id || dirty) return;
     overview = c.overview;
     constraints = c.constraints;
-    openCommit = null;
-    void refresh();
-    void refreshCommits();
-  });
+  }
 
   let unlistenCommit: (() => void) | null = null;
   onMount(() => {
-    // Agent 通过 MCP 提交后实时刷新条目与提交历史
-    void listen<{ contextId: string }>("sc://commit", (e) => {
-      void refresh();
-      void refreshCommits();
+    // 任何一方（Agent 经 MCP / 本界面）提交后实时刷新条目、概述与提交历史；只处理当前上下文的事件
+    void listen<{ contextId: string; seq: number; summary: string; agent: string }>("sc://commit", (e) => {
+      const id = e.payload.contextId;
+      if (!id || ctx?.id !== id) return;
+      void refresh(id);
+      void refreshCommits(id);
+      if (e.payload.agent !== "user") void reloadHead(id);
     }).then((f) => (unlistenCommit = f));
     return () => {
       unlistenCommit?.();
+      void flushPending();
     };
   });
 
-  async function refresh() {
-    if (!ctx) return;
+  async function refresh(id: string) {
     try {
-      entries = await api.entriesList(ctx.id);
+      const list = await api.entriesList(id);
+      if (ctx?.id === id) entries = list;
     } catch (e) {
-      toast("error", String(e));
+      if (ctx?.id === id) toast("error", String(e));
     }
   }
 
   function queueSave() {
     const target = ctx;
     if (!target) return;
-    if (saveTimer) clearTimeout(saveTimer);
+    dirty = true;
+    const seq = ++editSeq;
     // snapshot at queue time: the timer must never write this context's
     // edits into whichever context is selected when it fires
-    const snap = { id: target.id, name: target.name, overview, constraints };
-    saveTimer = setTimeout(async () => {
-      try {
-        await api.contextsUpdate(snap.id, snap.name, snap.overview, snap.constraints);
-      } catch (e) {
-        toast("error", String(e));
-      }
+    pendingSave = { id: target.id, overview, constraints, seq };
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      void flushPending();
     }, 600);
   }
 
+  /** 立即写入待保存的概述/约束（切换上下文、离开页面时调用，不再等待防抖）。 */
+  async function flushPending() {
+    const snap = pendingSave;
+    pendingSave = null;
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+    if (!snap) return;
+    // 名称以当前列表为准：期间可能已在侧栏重命名，不能用排队时的旧名字覆盖回去
+    const row = app.contexts.find((x) => x.id === snap.id);
+    if (!row) return; // 上下文已被删除
+    try {
+      await api.contextsUpdate(snap.id, row.name, snap.overview, snap.constraints);
+      // 让全局列表与后端一致（侧栏重命名等操作会读取这里的概述/约束）
+      const live = app.contexts.find((x) => x.id === snap.id);
+      if (live) {
+        live.overview = snap.overview;
+        live.constraints = snap.constraints;
+      }
+      if (ctx?.id === snap.id && editSeq === snap.seq) dirty = false;
+    } catch (e) {
+      toast("error", t("保存失败：{error}", { error: String(e) }));
+    }
+  }
+
   async function add(kind: keyof typeof inputs) {
-    if (!ctx) return;
+    const id = ctx?.id;
+    if (!id) return;
     const content = inputs[kind].trim();
     if (!content) return;
     try {
-      await api.entryAdd(ctx.id, kind, content);
-      inputs[kind] = "";
-      await refresh();
+      await api.entryAdd(id, kind, content);
+      if (ctx?.id === id) inputs[kind] = "";
+      await refresh(id);
     } catch (e) {
       toast("error", String(e));
     }
   }
 
   async function toggle(e: ContextEntry) {
+    const id = e.context_id;
     try {
       await api.entryUpdate(e.id, e.content, e.status === "done" ? "open" : "done");
-      await refresh();
+      await refresh(id);
     } catch (err) {
       toast("error", String(err));
     }
   }
 
   async function remove(e: ContextEntry) {
+    const id = e.context_id;
     try {
       await api.entryDelete(e.id);
-      await refresh();
+      await refresh(id);
     } catch (err) {
       toast("error", String(err));
     }
@@ -277,7 +334,7 @@
       </div>
 
       <section class="card commits">
-        <h3>{t("🕘 提交历史")} <span class="ver">{t("当前版本 v{version}", { version: commits[0]?.seq ?? 0 })}</span><span class="spacer"></span><button class="btn ghost sm" title={t("导出全部版本为 Markdown（保存到桌面）")} onclick={exportMarkdown}>{t("导出 MD")}</button><button class="btn ghost sm" title={t("刷新")} onclick={refreshCommits}>⟳</button></h3>
+        <h3>{t("🕘 提交历史")} <span class="ver">{t("当前版本 v{version}", { version: commits[0]?.seq ?? 0 })}</span><span class="spacer"></span><button class="btn ghost sm" title={t("导出全部版本为 Markdown（保存到桌面）")} onclick={exportMarkdown}>{t("导出 MD")}</button><button class="btn ghost sm" title={t("刷新")} onclick={() => { if (ctx) void refreshCommits(ctx.id); }}>⟳</button></h3>
         <div class="commit-list">
           {#each commits as c (c.seq)}
             <div class="commit">

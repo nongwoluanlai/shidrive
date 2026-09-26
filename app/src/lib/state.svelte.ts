@@ -349,17 +349,58 @@ export async function loadProjects(selectFirst = false) {
   }
 }
 
+// Every project switch gets a generation number; responses that arrive after a
+// newer switch started are dropped so a slow request cannot resurrect stale
+// contexts/workflows (or re-select a context) for a project that is no longer
+// the current one.
+let projectGen = 0;
+
+// Hooks that run before `app.workflows` is replaced from the backend. The workflow
+// editor registers its pending-save flush here, so a reload can never discard
+// edits that are still waiting for the autosave debounce.
+const beforeWorkflowsReload: Array<() => Promise<unknown>> = [];
+export function onBeforeWorkflowsReload(fn: () => Promise<unknown>) {
+  beforeWorkflowsReload.push(fn);
+}
+async function flushWorkflowEdits() {
+  await Promise.all(beforeWorkflowsReload.map((fn) => fn().catch(() => {})));
+}
+
 export async function selectProject(id: string | null) {
+  const gen = ++projectGen;
+  await flushWorkflowEdits();
+  if (gen !== projectGen) return;
   app.projectId = id;
   app.contextId = null;
-  app.contexts = id ? await api.contextsList(id) : [];
-  await refreshWorkflows();
-  if (app.contexts.length) await selectContext(app.contexts[0].id);
-  else app.contextId = null;
+  app.contexts = [];
+  app.workflows = [];
+  if (!id) return;
+  const [contexts, workflows] = await Promise.all([
+    api.contextsList(id),
+    api.workflowsList(id).catch(() => [] as Workflow[]),
+  ]);
+  if (gen !== projectGen || app.projectId !== id) return;
+  app.contexts = contexts;
+  app.workflows = workflows;
+  if (contexts.length) await selectContext(contexts[0].id);
+}
+
+export async function refreshContexts() {
+  const id = app.projectId;
+  const gen = projectGen;
+  const list = id ? await api.contextsList(id).catch(() => [] as Context[]) : [];
+  if (gen !== projectGen || app.projectId !== id) return;
+  app.contexts = list;
 }
 
 export async function refreshWorkflows() {
-  app.workflows = app.projectId ? await api.workflowsList(app.projectId).catch(() => []) : [];
+  const id = app.projectId;
+  const gen = projectGen;
+  await flushWorkflowEdits();
+  const list = id ? await api.workflowsList(id).catch(() => [] as Workflow[]) : [];
+  // Ignore the result if the user switched projects while the request was in flight.
+  if (gen !== projectGen || app.projectId !== id) return;
+  app.workflows = list;
 }
 
 export async function loadPrompts() {

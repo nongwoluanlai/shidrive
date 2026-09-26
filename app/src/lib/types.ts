@@ -196,6 +196,14 @@ export interface Edge {
   to: number;
 }
 
+/** Counts returned by projects_delete describing what was removed together with the project. */
+export interface ProjectCleanup {
+  contexts: number;
+  workflows: number;
+  grants: number;
+  tokens_revoked: number;
+}
+
 export interface Workflow {
   id: string;
   project_id: string;

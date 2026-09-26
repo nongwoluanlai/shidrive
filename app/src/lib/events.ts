@@ -1,6 +1,6 @@
 // Wire backend events to global state. Called once from App.svelte on mount.
 import { listen } from "@tauri-apps/api/event";
-import { app, applySessionUpdate, toast, chatKey } from "./state.svelte";
+import { app, applySessionUpdate, finishTurn, toast, chatKey } from "./state.svelte";
 import type { AgentType, ElicitationRequest, PermissionRequest, SessionReadyInfo } from "./types";
 import { api } from "./ipc";
 
@@ -106,9 +106,13 @@ export async function wireEvents() {
     }
   });
 
-  // 回合结束（完成/中断）后自增目录树版本号 → FileTree 自动刷新，及时看到 Agent 产出的文件
+  // 回合结束（完成/中断）：按事件里的 (context, agent) 收尾对应会话的流式状态——与当前
+  // 正在查看的会话无关，保证切换 agent/上下文后结束状态仍写回发起回合的那一份；
+  // 随后自增目录树版本号 → FileTree 自动刷新，及时看到 Agent 产出的文件
   await listen<{ contextId: string; agentType: string; status: string }>("acp://binding-status", (e) => {
-    if (e.payload.status === "completed" || e.payload.status === "interrupted") {
+    const { contextId, agentType, status } = e.payload;
+    if (status === "completed" || status === "interrupted") {
+      finishTurn(agentType as AgentType, contextId);
       app.treeRev++;
       fireAfterAction();
     }

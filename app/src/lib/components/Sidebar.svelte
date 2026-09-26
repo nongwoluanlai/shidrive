@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { app, selectProject, selectContext, refreshWorkflows, toast, isNoProject } from "../state.svelte";
+  import { app, selectProject, selectContext, refreshContexts, refreshWorkflows, toast, isNoProject } from "../state.svelte";
 import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { api } from "../ipc";
   import ContextMenu from "./ContextMenu.svelte";
   import Icon from "./Icon.svelte";
   import type { MenuItem } from "./menu-item";
+  import type { Edge, Workflow, WorkflowStep } from "../types";
   import { scheduleText } from "./wf-shared";
   import { t } from "../i18n";
 
@@ -45,13 +46,14 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   }
 
   async function deleteProject() {
-    if (!(await confirmDialog({ title: t("删除项目"), message: t("删除该项目？其下上下文、会话绑定与工作流记录将一并删除（项目目录文件不受影响）。"), danger: true, confirmText: t("删除") }))) return;
+    if (!(await confirmDialog({ title: t("删除项目"), message: t("删除该项目？其下上下文、会话绑定、工作流（含运行记录）与远程授权将一并删除，正在运行的工作流会被停止（项目目录文件不受影响）。"), danger: true, confirmText: t("删除") }))) return;
     try {
-      await api.projectsDelete(editProjectId);
+      const id = editProjectId;
+      const cleanup = await api.projectsDelete(id);
       showEditProject = false;
-      await selectProject(null);
+      if (app.projectId === id) await selectProject(null);
       app.projects = await api.projectsList();
-      toast("ok", t("项目已删除"));
+      toast("ok", t("项目已删除（清理 {p0} 个上下文、{p1} 个工作流、{p2} 项远程授权）", { p0: cleanup.contexts, p1: cleanup.workflows, p2: cleanup.grants }));
     } catch (e) {
       toast("error", String(e));
     }
@@ -59,24 +61,11 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
 
   let showNewProject = $state(false);
 
-  let desktopDir = $state("");
-  let pathTouched = $state(false);
-
-  async function openNewProject() {
+  function openNewProject() {
     projectName = "";
     projectDesc = "";
-    pathTouched = false;
-    if (!desktopDir) {
-      desktopDir = await api.fsDesktopDir().catch(() => "");
-    }
     projectPath = "";
     showNewProject = true;
-  }
-
-  function onNameInput() {
-    if (!pathTouched && projectName.trim() && desktopDir) {
-      projectPath = desktopDir + "\\" + projectName.trim();
-    }
   }
 
   async function createProject() {
@@ -105,8 +94,8 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       const c = await api.contextsCreate(app.projectId, contextName);
       showNewContext = false;
       contextName = "";
-      app.contexts = await api.contextsList(app.projectId);
-      await selectContext(c.id);
+      await refreshContexts();
+      if (app.projectId === c.project_id) await selectContext(c.id);
     } catch (e) {
       toast("error", String(e));
     }
@@ -116,8 +105,8 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     if (!(await confirmDialog({ title: t("删除上下文"), message: t("删除该上下文？会话绑定与本地聊天记录将一并删除（AI 端会话不受影响）。"), danger: true, confirmText: t("删除") }))) return;
     try {
       await api.contextsDelete(id);
-      if (app.projectId) app.contexts = await api.contextsList(app.projectId);
       if (app.contextId === id) app.contextId = null;
+      await refreshContexts();
       toast("ok", t("上下文已删除"));
     } catch (e) {
       toast("error", String(e));
@@ -131,7 +120,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     if (name === null || !name.trim() || name.trim() === c.name) return;
     try {
       await api.contextsUpdate(id, name.trim(), c.overview, c.constraints);
-      if (app.projectId) app.contexts = await api.contextsList(app.projectId);
+      await refreshContexts();
       toast("ok", t("上下文已更新"));
     } catch (e) {
       toast("error", String(e));
@@ -154,25 +143,45 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     };
   }
 
-  let wfClipboard: { name: string; steps: unknown; edges: unknown; env: unknown; description: string } | null = null;
+  // Clipboard for "copy / paste as duplicate". Only the workflow body is copied:
+  // the pasted copy is always a manual, non-scheduled workflow so a paste can
+  // never silently arm a second schedule.
+  let wfClipboard: { name: string; steps: WorkflowStep[]; edges: Edge[]; env: Record<string, string>; description: string } | null = null;
 
-  async function duplicateWorkflow(id: string) {
-    if (!app.projectId) return;
-    const w = app.workflows.find((x) => x.id === id);
-    if (!w) return;
+  function copyWorkflow(w: Workflow) {
+    wfClipboard = {
+      name: w.name,
+      description: w.description,
+      steps: structuredClone($state.snapshot(w.steps)) as WorkflowStep[],
+      edges: structuredClone($state.snapshot(w.edges ?? [])) as Edge[],
+      env: structuredClone($state.snapshot(w.env ?? {})) as Record<string, string>,
+    };
+    toast("ok", t("工作流已复制"));
+  }
+
+  /** Paste the clipboard as a new workflow of the *current* project (not of the right-clicked row). */
+  async function pasteWorkflow() {
+    const projectId = app.projectId;
+    if (!projectId) return;
+    if (!wfClipboard) {
+      toast("info", t("剪贴板中没有工作流，请先复制"));
+      return;
+    }
+    const src = wfClipboard;
     try {
       const copy = await api.workflowCreate({
-        project_id: w.project_id,
-        name: w.name + t(" 副本"),
-        description: w.description,
-        enabled: w.enabled,
-        trigger_type: w.trigger_type,
-        schedule: w.schedule,
-        steps: JSON.parse(JSON.stringify(w.steps)),
-        env: JSON.parse(JSON.stringify(w.env ?? {})),
-        edges: JSON.parse(JSON.stringify(w.edges ?? [])),
+        project_id: projectId,
+        name: src.name + t(" 副本"),
+        description: src.description,
+        enabled: true,
+        trigger_type: "manual",
+        schedule: null,
+        steps: structuredClone(src.steps),
+        env: structuredClone(src.env),
+        edges: structuredClone(src.edges),
       });
       await refreshWorkflows();
+      if (app.projectId !== projectId) return;
       app.tab = "workflows";
       app.workflowSelected = copy.id;
       toast("ok", t("已创建副本"));
@@ -224,11 +233,8 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       "sep",
       { label: t("↑ 上移"), run: () => api.workflowMove(id, -1).then(refreshWorkflows).catch((err) => toast("error", String(err))) },
       { label: t("↓ 下移"), run: () => api.workflowMove(id, 1).then(refreshWorkflows).catch((err) => toast("error", String(err))) },
-      { label: t("⧉ 复制"), run: () => {
-          wfClipboard = { name: w.name, steps: JSON.parse(JSON.stringify(w.steps)), edges: JSON.parse(JSON.stringify(w.edges ?? [])), env: JSON.parse(JSON.stringify(w.env ?? {})), description: w.description };
-          toast("ok", t("工作流已复制"));
-      } },
-      { label: t("📋 粘贴为副本"), run: () => { if (wfClipboard) void duplicateWorkflow(id); }, },
+      { label: t("⧉ 复制"), run: () => copyWorkflow(w) },
+      { label: t("📋 粘贴为副本"), run: () => void pasteWorkflow() },
       "sep",
       { label: t("🗑 删除工作流"), danger: true, run: () => {
           void (async () => {
