@@ -76,8 +76,11 @@ import type { DisplayItem } from "../state.svelte";
       for (let i = 0; i < startIdx; i++) sum += hOf(items[i]);
       padCache.top = sum; padCache.start = startIdx;
     } else if (padCache.start < startIdx) {
-      // 窗口前滑：离场项从前缀扣除（每项只消费一次，摊还 O(1)）
-      for (let i = padCache.start; i < startIdx; i++) padCache.top -= hOf(items[i]);
+      // 窗口下滑（贴底流式回收顶部 / 向下跳转 / 下探扩窗）：从窗口顶端离场的条目
+      // 并入顶部占位，高度要「加」上去。v0.3.9 这里写成了减——长会话流式一段时间后
+      // 顶部占位被扣成负数、钳到 0：上方明明还有成百上千条，滚动条却显示已到顶，
+      // 上翻立刻撞到 scrollTop=0，搜索/时间轴按占位算出的落点也随之失真。
+      for (let i = padCache.start; i < startIdx; i++) padCache.top += hOf(items[i]);
       padCache.start = startIdx;
     }
     return Math.max(0, padCache.top);
@@ -123,12 +126,20 @@ import type { DisplayItem } from "../state.svelte";
       doMeasure();
     });
   }
+  // content-visibility:auto 下离屏条目被跳过排版，getBoundingClientRect 给出的是
+  // contain-intrinsic-size 占位（未渲染过的一律 120px）——记进 hMap 会用 120 覆盖更准的
+  // 估算值，占位高度随之失真。只记真正排过版的条目。
+  function isSkipped(el: HTMLElement): boolean {
+    const cv = (el as HTMLElement & { checkVisibility?: (o: { contentVisibilityAuto: boolean }) => boolean }).checkVisibility;
+    return typeof cv === "function" && !cv.call(el, { contentVisibilityAuto: true });
+  }
   function doMeasure() {
     if (!listEl) return;
     lastMeasureWidth = listEl.clientWidth;
     const wrappers = listEl.querySelectorAll<HTMLDivElement>('.msgs-inner > div[id^="msg-"]');
     let changed = false;
     for (const el of wrappers) {
+      if (isSkipped(el)) continue;
       const id = el.id.slice(4);
       const h = Math.round(el.getBoundingClientRect().height);
       if (h > 0 && hMap.get(id) !== h) { hMap.set(id, h); changed = true; }
@@ -156,31 +167,52 @@ import type { DisplayItem } from "../state.svelte";
   }
 
   // ============ 统一定位原语：确保渲染 → 精准滚动 → 闪烁提示 ============
+  // 目标与当前视口之间隔着的条目多半处于 content-visibility:auto 的「跳过」态，
+  // 它们的盒子只是 120px 占位；按这些占位算出的 scrollTop 落地后，浏览器把新视口
+  // 附近的条目真正排版（普遍高于 120px），目标随即被顶出视口——单次校准只能追上
+  // 第一波变化，每按一次「上一个」目标就再偏一截（搜索向上跳、看着没动，手动一滚
+  // 才出现）。所以改成逐帧收敛：连续两帧不需要修正才算落定，上限 12 帧。
+  let scrollToItemSeq = 0;
   async function scrollToItem(id: string, align: "center" | "start" = "center") {
     const idx = idToIndex.get(id);
     if (idx === undefined || !listEl) return;
+    const seq = ++scrollToItemSeq;
     stickToBottom = false;
     ensureRendered(idx);
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    if (seq !== scrollToItemSeq) return; // 已有更新的定位请求
     const el = document.getElementById("msg-" + id) as HTMLElement | null;
     if (!el || !listEl) return;
-    lastProgScrollAt = performance.now();
-    const listRect = listEl.getBoundingClientRect();
-    const rel = el.getBoundingClientRect().top - listRect.top;
-    listEl.scrollTop = Math.max(0, listEl.scrollTop + rel - (align === "center" ? listEl.clientHeight / 2 - el.offsetHeight / 2 : 24));
+    const place = (target: HTMLElement): boolean => {
+      if (!listEl) return true;
+      const listRect = listEl.getBoundingClientRect();
+      const rel = target.getBoundingClientRect().top - listRect.top;
+      // 比视口还高的条目「居中」等于把开头顶出视口：这种情况按顶部对齐
+      const fits = target.offsetHeight < listEl.clientHeight - 48;
+      const want = align === "center" && fits ? listEl.clientHeight / 2 - target.offsetHeight / 2 : 24;
+      const delta = rel - want;
+      if (Math.abs(delta) <= 1) return true;
+      lastProgScrollAt = performance.now();
+      const before = listEl.scrollTop;
+      listEl.scrollTop = Math.max(0, before + delta);
+      prevScrollTop = listEl.scrollTop;
+      // 已顶到边界（scrollTop 没变）也视为落定，避免空转
+      return listEl.scrollTop === before;
+    };
+    place(el);
     el.classList.remove("flash");
     void el.offsetWidth;
     el.classList.add("flash");
-    // markdown/图片异步撑高后二次校准 + 补测高度
-    requestAnimationFrame(() => {
-      const el2 = document.getElementById("msg-" + id) as HTMLElement | null;
-      if (el2 && listEl) {
-        const r2 = listEl.getBoundingClientRect();
-        const rel2 = el2.getBoundingClientRect().top - r2.top;
-        listEl.scrollTop = Math.max(0, listEl.scrollTop + rel2 - (align === "center" ? listEl.clientHeight / 2 - el2.offsetHeight / 2 : 24));
-      }
-      measureRendered(true);
-    });
+    // 逐帧收敛：markdown/图片异步撑高、跳过态条目补排版都会移动目标
+    let stable = 0;
+    for (let frame = 0; frame < 12 && stable < 2; frame++) {
+      await new Promise((r) => requestAnimationFrame(r));
+      if (seq !== scrollToItemSeq || !listEl) return;
+      const cur = document.getElementById("msg-" + id) as HTMLElement | null;
+      if (!cur) return;
+      stable = place(cur) ? stable + 1 : 0;
+    }
+    measureRendered(true);
   }
 
   const chatRev = () => app.chatRev[key] ?? 0;
@@ -341,10 +373,17 @@ import type { DisplayItem } from "../state.svelte";
     const n = items.length;
     const tailLen = items[n - 1]?.text.length ?? 0;
     const rev = app.chatRev[k] ?? 0;
-    // 流式追加：窗口尾随到最新（仅贴底时回收顶部，阅读中途不跳动）
+    // 流式追加：贴底时窗口尾随到最新并回收顶部；阅读中途（未贴底）只在窗口未满时
+    // 顺延——此前无条件 endIdx = n，任何一次搜索/时间轴跳转之后整段尾巴（可达数千条）
+    // 都被塞进 DOM：ensureRendered 的有界窗口形同虚设，「加载更新的 N 条」按钮永远
+    // 不会出现，跳转后每一步都在成百上千个 content-visibility 占位上折腾。
     if (n > endIdx) {
-      endIdx = n;
-      if (stickToBottom && endIdx - startIdx > MAX_RENDER) startIdx = endIdx - MAX_RENDER;
+      if (stickToBottom) {
+        endIdx = n;
+        if (endIdx - startIdx > MAX_RENDER) startIdx = endIdx - MAX_RENDER;
+      } else if (endIdx - startIdx < MAX_RENDER) {
+        endIdx = Math.min(n, startIdx + MAX_RENDER);
+      }
     }
     if (k !== lastKeyScrolled) {
       lastKeyScrolled = k;
