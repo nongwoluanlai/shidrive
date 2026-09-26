@@ -525,16 +525,12 @@
         </thead>
         <tbody>
           {#each oauthTokens as tk (tk.id)}
-            <tr class:revoked={!!tk.revoked_at}>
+            <tr>
               <td>{tk.client_name || tk.client_id}{#if tk.client_name}<br /><span class="dim mono">{tk.client_id}</span>{/if}</td>
               <td><span class="mono">{tk.scopes}</span></td>
               <td>{tk.last_used_at ?? "—"}</td>
               <td class="op">
-                {#if tk.revoked_at}
-                  {t("已吊销")}
-                {:else}
-                  <button class="btn ghost sm" onclick={() => void oauthRevoke(tk.id)}>{t("吊销")}</button>
-                {/if}
+                <button class="btn ghost sm" onclick={() => void oauthRevoke(tk.id)}>{t("吊销")}</button>
               </td>
             </tr>
           {:else}

@@ -190,6 +190,57 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     }
   }
 
+  async function newWorkflow() {
+    if (!app.projectId) return;
+    const name = await promptDialog({ title: t("新建工作流"), label: t("工作流名称 *") });
+    if (name === null || !name.trim()) return;
+    try {
+      const w = await api.workflowCreate({
+        project_id: app.projectId,
+        name: name.trim(),
+        description: "",
+        enabled: true,
+        trigger_type: "manual",
+        schedule: null,
+        steps: [{ type: "start", name: "", x: 60, y: 40 }],
+      });
+      await refreshWorkflows();
+      app.tab = "workflows";
+      app.workflowSelected = w.id;
+      toast("ok", t("工作流已创建"));
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
+  // 空白区右键：上下文区（新建/刷新）
+  function ctxBlankMenu(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!app.projectId) return;
+    menu = {
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        { label: t("＋ 新建上下文"), run: () => (showNewContext = true) },
+        { label: t("⟳ 刷新列表"), run: () => void refreshContexts() },
+      ],
+    };
+  }
+
+  // 空白区右键：工作流区（新建/粘贴/刷新）
+  function wfBlankMenu(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!app.projectId) return;
+    const items = [
+      { label: t("＋ 新建工作流"), run: () => void newWorkflow() },
+      { label: t("⟳ 刷新列表"), run: () => void refreshWorkflows() },
+    ];
+    if (wfClipboard) items.push({ label: t("📋 粘贴为副本"), run: () => void pasteWorkflow() });
+    menu = { x: e.clientX, y: e.clientY, items };
+  }
+
   function wfMenu(e: MouseEvent, id: string) {
     e.preventDefault();
     e.stopPropagation();
@@ -288,7 +339,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       <Icon name="context" size={13} /> {t("上下文")} <span class="spacer"></span>
       <button class="btn ghost sm" title={t("新建上下文")} disabled={!app.projectId} onclick={() => (showNewContext = true)}><Icon name="plus" size={13} /></button>
     </div>
-    <div class="list ctx-list">
+    <div class="list ctx-list" oncontextmenu={ctxBlankMenu}>
       {#each app.contexts as c (c.id)}
         <div
           class="item"
@@ -319,31 +370,10 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
         class="btn ghost sm"
         title={t("新建工作流")}
         disabled={!app.projectId}
-        onclick={async () => {
-          if (!app.projectId) return;
-          const name = await promptDialog({ title: t("新建工作流"), label: t("工作流名称 *") });
-          if (name === null || !name.trim()) return;
-          try {
-            const w = await api.workflowCreate({
-              project_id: app.projectId,
-              name: name.trim(),
-              description: "",
-              enabled: true,
-              trigger_type: "manual",
-              schedule: null,
-              steps: [{ type: "start", name: "", x: 60, y: 40 }],
-            });
-            await refreshWorkflows();
-            app.tab = "workflows";
-            app.workflowSelected = w.id;
-            toast("ok", t("工作流已创建"));
-          } catch (e) {
-            toast("error", String(e));
-          }
-        }}><Icon name="plus" size={13} /></button
+        onclick={() => void newWorkflow()}><Icon name="plus" size={13} /></button
       >
     </div>
-    <div class="list wf-list">
+    <div class="list wf-list" oncontextmenu={wfBlankMenu}>
       {#each app.workflows as w (w.id)}
         <div
           class="item"

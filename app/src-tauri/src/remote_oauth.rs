@@ -863,7 +863,21 @@ pub struct OAuthTokenRow {
     pub revoked_at: Option<String>,
 }
 
+/// 自动清理：删除已吊销的令牌行，以及再无任何有效令牌的客户端注册行。
+/// 已授权的照常展示；吊销的无需在设置页留痕。
+pub fn cleanup_revoked(db: &Arc<Db>) -> Result<(), String> {
+    db.with(|c| {
+        c.execute("DELETE FROM remote_oauth_tokens WHERE revoked_at IS NOT NULL", [])?;
+        c.execute(
+            "DELETE FROM remote_oauth_clients WHERE client_id NOT IN (SELECT DISTINCT client_id FROM remote_oauth_tokens)",
+            [],
+        )?;
+        Ok(())
+    })
+}
+
 pub fn tokens_list(db: &Arc<Db>) -> Result<Vec<OAuthTokenRow>, String> {
+    let _ = cleanup_revoked(db);
     db.with(|c| {
         let mut st = c.prepare(
             "SELECT t.id, t.client_id, COALESCE(c.client_name,''), t.scopes, t.last_used_at, t.revoked_at

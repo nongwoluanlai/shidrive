@@ -1,6 +1,6 @@
 [package]
 name = "shidrive"
-version = "0.3.9"
+version = "0.3.10"
 edition = "2021"
 description = "使驾 ShiDrive — AI 开发工作台"
 default-run = "shidrive"
