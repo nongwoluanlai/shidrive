@@ -13,6 +13,7 @@ mod models;
 mod child_job;
 mod remote_mcp;
 mod remote_oauth;
+mod schedule;
 mod node_rt;
 mod setup;
 mod skins;

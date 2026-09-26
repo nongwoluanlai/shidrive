@@ -4,7 +4,7 @@ use serde_json::Value;
 use tauri::State;
 
 use crate::db::Db;
-use crate::engine::{self as workflow_time, Engine};
+use crate::engine::Engine;
 use crate::manager::AgentManager;
 use crate::models::*;
 use crate::fsops;
@@ -40,12 +40,23 @@ pub async fn projects_update(db: DbState<'_>, id: String, name: String, root_pat
     db.update_project(&id, &name, &root_path, &description).map_err(err)
 }
 
+/// Delete a project. Policy: in-flight runs of its workflows are stopped first
+/// (best effort, same as the ■ button), then contexts / bindings / chat history /
+/// shared-context commits / workflows / run history / remote authorizations are
+/// removed in one transaction — matching what the confirmation dialog promises.
 #[tauri::command]
-pub async fn projects_delete(db: DbState<'_>, id: String) -> Result<(), String> {
+pub async fn projects_delete(engine: EngineState<'_>, id: String) -> Result<crate::db::ProjectCleanup, String> {
     if id == crate::models::NO_PROJECT_ID {
         return Err("「无项目」为内置项目，不可删除".into());
     }
-    db.delete_project(&id).map_err(err)
+    let workflow_ids = engine.db.project_workflow_ids(&id)?;
+    let stopped = engine.stop_workflows(&workflow_ids);
+    let cleanup = engine.db.delete_project(&id).map_err(err)?;
+    log::info!(
+        "project {id} deleted: {} contexts, {} workflows ({stopped} running stopped), {} remote grants removed, {} oauth tokens revoked",
+        cleanup.contexts, cleanup.workflows, cleanup.grants, cleanup.tokens_revoked
+    );
+    Ok(cleanup)
 }
 
 // ---------- contexts ----------
@@ -63,9 +74,15 @@ pub async fn contexts_create(db: DbState<'_>, project_id: String, name: String) 
     db.create_context(&project_id, name.trim()).map_err(err)
 }
 
+/// UI edits of overview / constraints are shared-context versions too, so an
+/// agent that read an older version is told to re-read instead of silently
+/// replacing what the user typed.
 #[tauri::command]
-pub async fn contexts_update(db: DbState<'_>, id: String, name: String, overview: String, constraints: String) -> Result<(), String> {
-    db.update_context(&id, &name, &overview, &constraints).map_err(err)
+pub async fn contexts_update(app: tauri::AppHandle, db: DbState<'_>, id: String, name: String, overview: String, constraints: String) -> Result<(), String> {
+    if let Some(commit) = db.update_context_committed(&id, &name, &overview, &constraints).map_err(err)? {
+        emit_sc_commit(&app, &commit);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -81,21 +98,37 @@ pub async fn context_entries_list(db: DbState<'_>, context_id: String) -> Result
 }
 
 #[tauri::command]
-pub async fn context_entry_add(db: DbState<'_>, context_id: String, kind: String, content: String) -> Result<ContextEntry, String> {
+pub async fn context_entry_add(app: tauri::AppHandle, db: DbState<'_>, context_id: String, kind: String, content: String) -> Result<ContextEntry, String> {
     if !["todo", "progress", "decision", "note"].contains(&kind.as_str()) {
         return Err(format!("未知的条目类型：{kind}"));
     }
-    db.add_entry(&context_id, &kind, &content).map_err(err)
+    let (entry, commit) = db.add_entry_committed(&context_id, &kind, &content).map_err(err)?;
+    emit_sc_commit(&app, &commit);
+    Ok(entry)
 }
 
 #[tauri::command]
-pub async fn context_entry_update(db: DbState<'_>, id: String, content: String, status: String) -> Result<(), String> {
-    db.update_entry(&id, &content, &status).map_err(err)
+pub async fn context_entry_update(app: tauri::AppHandle, db: DbState<'_>, id: String, content: String, status: String) -> Result<(), String> {
+    if let Some(commit) = db.update_entry_committed(&id, &content, &status).map_err(err)? {
+        emit_sc_commit(&app, &commit);
+    }
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn context_entry_delete(db: DbState<'_>, id: String) -> Result<(), String> {
-    db.delete_entry(&id).map_err(err)
+pub async fn context_entry_delete(app: tauri::AppHandle, db: DbState<'_>, id: String) -> Result<(), String> {
+    if let Some(commit) = db.delete_entry_committed(&id).map_err(err)? {
+        emit_sc_commit(&app, &commit);
+    }
+    Ok(())
+}
+
+fn emit_sc_commit(app: &tauri::AppHandle, commit: &ScCommit) {
+    use tauri::Emitter;
+    let _ = app.emit(
+        "sc://commit",
+        serde_json::json!({ "contextId": commit.context_id, "seq": commit.seq, "summary": commit.summary, "agent": commit.agent_type }),
+    );
 }
 
 /// 共享上下文提交历史（版本列表，含快照与涉及文件）。
@@ -363,9 +396,7 @@ pub async fn workflow_create(
     if name.trim().is_empty() {
         return Err("工作流名称不能为空".into());
     }
-    if trigger_type == "schedule" && schedule.is_none() {
-        return Err("请配置定时规则".into());
-    }
+    // schedule validation (format, completeness, future occurrence) lives in Db::create_workflow
     db.create_workflow(
         &project_id,
         name.trim(),
@@ -380,19 +411,16 @@ pub async fn workflow_create(
     .map_err(err)
 }
 
+/// Save user-editable fields. Runtime fields in the payload (`last_run_at` /
+/// `next_run_at`) are ignored; the scheduler owns them and `Db::update_workflow`
+/// re-arms `next_run_at` only when the trigger configuration changed. The stored
+/// row is returned so the editor can display the new slot without a full reload.
 #[tauri::command]
-pub async fn workflow_update(engine: EngineState<'_>, workflow: Workflow) -> Result<(), String> {
-    let next = if workflow.enabled && workflow.trigger_type == "schedule" {
-        workflow
-            .schedule
-            .as_ref()
-            .map(|s| workflow_time::fmt_time(workflow_time::compute_next(s, chrono::Local::now())))
-    } else {
-        None
-    };
-    let mut w = workflow;
-    w.next_run_at = next;
-    engine.db.update_workflow(&w).map_err(err)
+pub async fn workflow_update(engine: EngineState<'_>, workflow: Workflow) -> Result<Workflow, String> {
+    if workflow.name.trim().is_empty() {
+        return Err("工作流名称不能为空".into());
+    }
+    engine.db.update_workflow(&workflow).map_err(err)
 }
 
 #[tauri::command]

@@ -440,16 +440,45 @@ fn safe_path(cfg: &Cfg, raw: &str) -> Result<PathBuf, String> {
 }
 
 /// 原子写入（字节版）：同目录临时文件 + flush + rename；失败清理临时文件。
+///
+/// 安全：临时文件名随机且以 `create_new`（O_EXCL）独占创建——固定名字的临时文件
+/// 可被预先放置的符号链接/重解析点劫持，`File::create` 会跟随链接把内容写到授权
+/// 目录之外。最终路径本身已由 `safe_path_parent` 校验不是链接；rename 替换的是
+/// 目录项而不会跟随目标链接。
 fn atomic_write_bytes(full: &Path, bytes: &[u8]) -> Result<usize, String> {
     use std::io::Write;
-    let tmp = full.with_extension("tmp-shidrive");
-    {
-        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {e}"))?;
-        f.write_all(bytes).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("写入失败: {e}") })?;
-        f.flush().map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("flush 失败: {e}") })?;
+    let dir = full.parent().ok_or("路径缺少父目录")?;
+    let stem = full.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+    let mut tmp = None;
+    let mut file = None;
+    for _ in 0..8 {
+        let candidate = dir.join(format!(".{stem}.{}.tmp-shidrive", &uuid::Uuid::new_v4().simple().to_string()[..12]));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(f) => {
+                file = Some(f);
+                tmp = Some(candidate);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("创建临时文件失败: {e}")),
+        }
     }
-    std::fs::rename(&tmp, full).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("替换失败: {e}") })?;
+    let (Some(tmp), Some(mut f)) = (tmp, file) else { return Err("创建临时文件失败：名字冲突".into()) };
+    let cleanup = |e: String| { let _ = std::fs::remove_file(&tmp); e };
+    f.write_all(bytes).map_err(|e| cleanup(format!("写入失败: {e}")))?;
+    f.flush().map_err(|e| cleanup(format!("flush 失败: {e}")))?;
+    drop(f);
+    // 最终目标在校验后又变成了链接（竞态/预置）：拒绝，不替换链接目标之外的任何东西
+    if is_symlink(full) {
+        return Err(cleanup(format!("目标是符号链接，已拒绝：{}", full.display())));
+    }
+    std::fs::rename(&tmp, full).map_err(|e| cleanup(format!("替换失败: {e}")))?;
     Ok(bytes.len())
+}
+
+/// 符号链接 / Windows 重解析点判定（不跟随）。
+fn is_symlink(p: &Path) -> bool {
+    p.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false)
 }
 
 fn b64_val(c: u8) -> Option<u32> {
@@ -639,12 +668,16 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                 return Err("拒绝操作根目录本身。".into());
             }
             let to = safe_path_parent(cfg, dst)?;
-            // dst 为已存在目录时移入该目录（保留原文件名）
+            // dst 为已存在目录时移入该目录（保留原文件名）。此时真正被写的是拼接后的
+            // 路径，必须对它（而不只是用户给的 dst）再做一次链接检查。
             let target = if to.is_dir() {
                 to.join(from.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default())
             } else {
                 to
             };
+            if is_symlink(&target) {
+                return Err(format!("目标是符号链接，已拒绝：{}", target.display()));
+            }
             if name == "pc.fs.move" {
                 std::fs::rename(&from, &target).map_err(|e| format!("移动失败（跨盘符或目标占用时会失败，可改用 copy+delete）: {e}"))?;
                 Ok(json!({ "moved": true, "src": from.to_string_lossy(), "dst": target.to_string_lossy() }))
@@ -802,7 +835,9 @@ fn decode_text(data: &[u8]) -> String {
     }
 }
 
-/// 递归复制 src → dst：文件直接复制；目录递归；符号链接跳过（防逃出授权根）。
+/// 递归复制 src → dst：文件直接复制；目录递归；源侧符号链接跳过（防逃出授权根）。
+/// 目标侧每一层都不得是符号链接/重解析点：`std::fs::copy` 与 `create_dir_all`
+/// 都会跟随已存在的目标链接，预先放置的链接会把内容写到授权目录之外。
 /// 返回复制的总字节数。
 fn copy_path_recursive(src: &Path, dst: &Path, depth: usize) -> Result<u64, String> {
     if depth > 24 {
@@ -811,6 +846,9 @@ fn copy_path_recursive(src: &Path, dst: &Path, depth: usize) -> Result<u64, Stri
     let meta = std::fs::symlink_metadata(src).map_err(|e| format!("读取源失败: {e}"))?;
     if meta.file_type().is_symlink() {
         return Ok(0); // 符号链接不跟随，跳过
+    }
+    if is_symlink(dst) {
+        return Err(format!("目标是符号链接，已拒绝：{}", dst.display()));
     }
     if meta.is_dir() {
         std::fs::create_dir_all(dst).map_err(|e| format!("创建目录失败: {e}"))?;
@@ -821,7 +859,7 @@ fn copy_path_recursive(src: &Path, dst: &Path, depth: usize) -> Result<u64, Stri
         }
         Ok(total)
     } else {
-        std::fs::copy(src, dst).map(|n| n).map_err(|e| format!("复制文件失败: {e}"))
+        std::fs::copy(src, dst).map_err(|e| format!("复制文件失败: {e}"))
     }
 }
 
@@ -1053,6 +1091,77 @@ fn wait_with_timeout(child: &mut std::process::Child, timeout: u64) -> Option<st
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    fn cfg_at(root: std::path::PathBuf) -> Cfg {
+        Cfg { root, token: String::new(), auth_user: String::new(), auth_pass: String::new(), exec_enabled: false }
+    }
+
+    /// Pre-planted symlinks inside the authorized directory must never let a write
+    /// land outside it: neither via the copy target (dst is a directory, final name
+    /// is a link), nor via nested targets of a recursive copy, nor via the atomic
+    /// write's temporary file.
+    #[cfg(unix)]
+    #[test]
+    fn preplanted_symlinks_cannot_redirect_copy_or_write_outside_root() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("shidrive-symlink-test-{}", uuid::Uuid::new_v4()));
+        let root = base.join("project");
+        let outside = base.join("outside.txt");
+        std::fs::create_dir_all(root.join("dest")).unwrap();
+        std::fs::create_dir_all(root.join("tree/sub")).unwrap();
+        std::fs::write(&outside, "ORIGINAL").unwrap();
+        std::fs::write(root.join("src.txt"), "payload").unwrap();
+        std::fs::write(root.join("tree/sub/file.txt"), "payload").unwrap();
+        let cfg = cfg_at(root.clone());
+
+        // 1. copy file into a directory whose <srcname> entry is a link to the outside
+        symlink(&outside, root.join("dest/src.txt")).unwrap();
+        let r = call_tool(&cfg, "pc.fs.copy", &json!({ "src": "src.txt", "dst": "dest" }));
+        assert!(r.is_err(), "copy onto symlinked target must be refused: {r:?}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "ORIGINAL");
+
+        // 2. recursive copy of `tree` into existing dir `copy` (→ copy/tree/…) where the
+        //    nested destination file is a pre-planted link to the outside
+        std::fs::create_dir_all(root.join("copy/tree/sub")).unwrap();
+        symlink(&outside, root.join("copy/tree/sub/file.txt")).unwrap();
+        let r = call_tool(&cfg, "pc.fs.copy", &json!({ "src": "tree", "dst": "copy" }));
+        assert!(r.is_err(), "nested symlinked target must be refused: {r:?}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "ORIGINAL");
+
+        // 2b. nested destination *directory* is a link to an outside directory
+        let outside_dir = base.join("outside-dir");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::create_dir_all(root.join("copy2/tree")).unwrap();
+        symlink(&outside_dir, root.join("copy2/tree/sub")).unwrap();
+        let r = call_tool(&cfg, "pc.fs.copy", &json!({ "src": "tree", "dst": "copy2" }));
+        assert!(r.is_err(), "symlinked destination directory must be refused: {r:?}");
+        assert!(!outside_dir.join("file.txt").exists());
+
+        // 2c. an honest copy still works
+        let r = call_tool(&cfg, "pc.fs.copy", &json!({ "src": "tree", "dst": "copy3" }));
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(std::fs::read_to_string(root.join("copy3/sub/file.txt")).unwrap(), "payload");
+
+        // 3. atomic write: a planted link at the old fixed temp name must be irrelevant,
+        //    and a link at the final path is refused
+        symlink(&outside, root.join("out.tmp-shidrive")).unwrap();
+        let r = call_tool(&cfg, "pc.fs.write", &json!({ "path": "out.txt", "content": "NEW" }));
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(std::fs::read_to_string(root.join("out.txt")).unwrap(), "NEW");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "ORIGINAL");
+        symlink(&outside, root.join("linked.txt")).unwrap();
+        let r = call_tool(&cfg, "pc.fs.write", &json!({ "path": "linked.txt", "content": "NEW" }));
+        assert!(r.is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "ORIGINAL");
+        // no temp files left behind
+        let leftovers: Vec<_> = std::fs::read_dir(&root).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp-shidrive") && !e.path().is_symlink())
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn exists_and_read_cannot_probe_sibling_or_outside_root() {

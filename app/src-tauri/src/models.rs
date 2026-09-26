@@ -136,7 +136,7 @@ pub struct Edge {
     pub to: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ScheduleConfig {
     /// every N minutes
@@ -148,7 +148,8 @@ pub enum ScheduleConfig {
     /// weekly on selected weekdays (1=Mon .. 7=Sun) at HH:MM
     #[serde(rename = "weekly")]
     Weekly { weekdays: Vec<u32>, time: String },
-    /// one shot at local datetime "YYYY-MM-DD HH:MM"
+    /// one shot at local datetime; stored canonically as "YYYY-MM-DD HH:MM"
+    /// (the editor's `datetime-local` form "YYYY-MM-DDTHH:MM" is accepted on input)
     #[serde(rename = "once")]
     Once { at: String },
 }

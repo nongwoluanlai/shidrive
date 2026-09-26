@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
 use crate::db::Db;
-use crate::models::{Edge, ScheduleConfig, ScCommit, ScEntry, ScSnapshot, Workflow, WorkflowStep};
+use crate::models::{Edge, ScheduleConfig, ScEntry, ScSnapshot, Workflow, WorkflowStep};
 
 const MAX_OVERVIEW: usize = 2000;
 const MAX_CONSTRAINTS: usize = 2000;
@@ -470,7 +470,9 @@ pub(crate) fn call_tool(state: &McpState, _app: &AppHandle, name: &str, args: &V
             if summary.trim().is_empty() {
                 return tool_error("缺少必填参数 summary（本次提交摘要）。请简述这轮做了哪些工作。".into());
             }
-            // serialize the whole update flow; sc_commit_atomic re-validates inside a transaction
+            // Serialize update flows so the conflict message below can quote the exact
+            // commits that won; the authoritative CAS check happens inside the DB
+            // transaction (sc_commit_patch) together with every write.
             let _guard = state.commit_lock.lock().unwrap_or_else(|p| p.into_inner());
             let head = state.db.sc_head_seq(&ctx_id)?;
             if base != head {
@@ -481,20 +483,8 @@ pub(crate) fn call_tool(state: &McpState, _app: &AppHandle, name: &str, args: &V
                 ));
             }
 
-            // apply write-through to live tables
-            // FIX-01：同一请求可能同时带 overview 与 constraints —— 两次整行更新
-            // 会用旧值互相覆盖。先合并 patch，再一次写入。
+            // FIX-01：同一请求可能同时带 overview 与 constraints —— 合并为一次写入。
             let updates = args.get("updates").cloned().unwrap_or(json!({}));
-            let new_overview = updates.get("overview").and_then(|v| v.as_str()).map(|v| clamp_str(v, MAX_OVERVIEW, "overview"));
-            let new_constraints = updates.get("constraints").and_then(|v| v.as_str()).map(|v| clamp_str(v, MAX_CONSTRAINTS, "constraints"));
-            if new_overview.is_some() || new_constraints.is_some() {
-                state.db.update_context(
-                    &ctx.id,
-                    &ctx.name,
-                    new_overview.as_deref().unwrap_or(&ctx.overview),
-                    new_constraints.as_deref().unwrap_or(&ctx.constraints),
-                )?;
-            }
             let conv = |list: &Value| -> Vec<ScEntry> {
                 list.as_array()
                     .map(|a| {
@@ -511,35 +501,27 @@ pub(crate) fn call_tool(state: &McpState, _app: &AppHandle, name: &str, args: &V
                     })
                     .unwrap_or_default()
             };
-            if let Some(list) = updates.get("todos") {
-                state.db.replace_entries(&ctx_id, "todo", &conv(list))?;
-            }
-            if let Some(list) = updates.get("progress") {
-                state.db.replace_entries(&ctx_id, "progress", &conv(list))?;
-            }
-            if let Some(list) = updates.get("notes") {
-                state.db.replace_entries(&ctx_id, "note", &conv(list))?;
-            }
-
-            // snapshot AFTER write-through so the commit captures the merged state
-            let (_, snap) = snapshot_live(state, &ctx_id)?;
+            let patch = crate::db::ScPatch {
+                overview: updates.get("overview").and_then(|v| v.as_str()).map(|v| clamp_str(v, MAX_OVERVIEW, "overview")),
+                constraints: updates.get("constraints").and_then(|v| v.as_str()).map(|v| clamp_str(v, MAX_CONSTRAINTS, "constraints")),
+                todos: updates.get("todos").map(&conv),
+                progress: updates.get("progress").map(&conv),
+                notes: updates.get("notes").map(&conv),
+            };
             let files: Vec<String> = args
                 .get("files")
                 .and_then(|f| f.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).take(MAX_FILES).collect())
                 .unwrap_or_default();
-            let commit = ScCommit {
-                id: uuid::Uuid::new_v4().to_string(),
-                context_id: ctx_id.clone(),
-                seq: head + 1,
+            let meta = crate::db::ScCommitMeta {
                 agent_type: args.get("agent_type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
                 session_id: args.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 summary: clamp_str(&summary, MAX_SUMMARY, "summary"),
-                files: json!(&files).to_string(),
-                snapshot: json!(&snap).to_string(),
-                created_at: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                files: files.clone(),
             };
-            state.db.sc_commit_atomic(&commit, head).map_err(|e| {
+            // One transaction: version check → overview/constraints → entry lists →
+            // snapshot → commit row. Any failure rolls everything back.
+            let commit = state.db.sc_commit_patch(&ctx_id, head, &patch, &meta).map_err(|e| {
                 if let Some(actual) = e.strip_prefix("__conflict__:") {
                     format!(
                         "版本冲突：提交时检测到当前版本已是 {actual}（其他 Agent 在你读取后先提交了）。请先调用 context_get 获取最新内容，合并你的改动后用新的 version 重新提交。"
@@ -548,7 +530,10 @@ pub(crate) fn call_tool(state: &McpState, _app: &AppHandle, name: &str, args: &V
                     e
                 }
             })?;
-            let _ = _app.emit("sc://commit", json!({"contextId": ctx_id, "seq": commit.seq, "summary": commit.summary}));
+            let _ = _app.emit(
+                "sc://commit",
+                json!({"contextId": ctx_id, "seq": commit.seq, "summary": commit.summary, "agent": commit.agent_type}),
+            );
             Ok(json_bytes(&json!({
                 "version": commit.seq,
                 "message": format!("提交成功：v{} 已写入共享上下文，界面已同步。", commit.seq),
@@ -601,23 +586,7 @@ fn clamp_str(s: &str, max: usize, field: &str) -> String {
 
 /// Snapshot the CURRENT live context tables (working tree).
 fn snapshot_live(state: &McpState, context_id: &str) -> Result<(i64, ScSnapshot), String> {
-    let ctx = state.db.get_context_row(context_id).ok_or("context missing")?;
-    let entries = state.db.list_entries(context_id)?;
-    let mut snap = ScSnapshot {
-        overview: ctx.overview.clone(),
-        constraints: ctx.constraints.clone(),
-        ..Default::default()
-    };
-    for e in entries {
-        let item = ScEntry { content: e.content, status: e.status };
-        match e.kind.as_str() {
-            "todo" => snap.todos.push(item),
-            "progress" => snap.progress.push(item),
-            "note" | "decision" => snap.notes.push(item),
-            _ => {}
-        }
-    }
-    Ok((state.db.sc_head_seq(context_id)?, snap))
+    state.db.sc_snapshot(context_id)
 }
 
 // ---------- workflow MCP tools ----------
@@ -811,7 +780,7 @@ fn call_workflow_tool(state: &McpState, name: &str, args: &Value) -> Result<Valu
             if let Some(v) = args.get("enabled").and_then(|v| v.as_bool()) {
                 w.enabled = v;
             }
-            state.db.update_workflow(&w)?;
+            let w = state.db.update_workflow(&w)?;
             Ok(json_bytes(&json!({ "updated": true, "workflow": wf_public(&w) })))
         }
         "workflow_delete" => {

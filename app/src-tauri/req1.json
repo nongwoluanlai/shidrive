@@ -1,1 +1,0 @@
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"context_update","arguments":{"context_id":"566f2c88-d35e-4803-b953-0b30e1cb6e71","base_version":0,"summary":"完成聊天界面与会话绑定改造","files":["src/App.svelte","src/lib/components/ChatView.svelte"],"agent_type":"codex","updates":{"progress":[{"content":"完成双 Agent 接入验证"}],"notes":[{"content":"待确认：codex 模型网关稳定性"}]}}}}

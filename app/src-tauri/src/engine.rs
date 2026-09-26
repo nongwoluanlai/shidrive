@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDateTime, TimeZone, Weekday};
+use chrono::Local;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::future::Future;
 use serde_json::json;
@@ -17,6 +17,8 @@ use crate::models::*;
 
 pub const EVT_WF_LOG: &str = "wf://log";
 pub const EVT_WF_STATUS: &str = "wf://status";
+
+pub use crate::schedule::{compute_next, fmt_time, parse_time};
 
 struct RunControl {
     stop: Arc<AtomicBool>,
@@ -109,30 +111,63 @@ impl Engine {
     }
 
     async fn tick_once(self: &Arc<Self>) -> Result<(), String> {
-        let workflows = self.db.all_workflows()?;
+        // `scheduled_workflows` joins on `projects`, so a workflow whose project was
+        // removed can never be picked up here even if a stale row survived.
+        let workflows = self.db.scheduled_workflows()?;
         let now = Local::now();
         for w in workflows {
-            if !w.enabled || w.trigger_type != "schedule" {
-                continue;
-            }
             let Some(sched) = w.schedule.clone() else { continue };
-            match w.next_run_at.as_deref() {
+            match w.next_run_at.as_deref().and_then(parse_time) {
                 None => {
-                    let next = compute_next(&sched, now);
-                    self.db.update_workflow_times(&w.id, w.last_run_at.as_deref(), Some(&fmt_time(next)))?;
-                }
-                Some(t) => {
-                    if let Some(due) = parse_time(t) {
-                        if due <= now && !self.active.lock().unwrap().contains_key(&w.id) {
-                            let next = compute_next(&sched, now);
-                            self.db.update_workflow_times(&w.id, Some(&fmt_time(now)), Some(&fmt_time(next)))?;
-                            self.spawn_run(&w, "schedule");
+                    // No (valid) next time yet: arm it — or retire the workflow when the
+                    // schedule has no future occurrence (e.g. a one-shot in the past).
+                    match compute_next(&sched, now) {
+                        Some(next) => self.db.update_workflow_times(&w.id, w.last_run_at.as_deref(), Some(&fmt_time(next)))?,
+                        None => {
+                            log::warn!("workflow {} ({}) has no future occurrence; disabling", w.name, w.id);
+                            self.db.set_workflow_enabled(&w.id, false)?;
                         }
                     }
                 }
+                Some(due) if due <= now => {
+                    if self.active.lock().unwrap().contains_key(&w.id) {
+                        continue;
+                    }
+                    // Consume the slot *before* enqueueing: a one-shot is retired here no
+                    // matter how the run ends (success / failure / stopped), so it can
+                    // never be re-run every tick. The claim is conditional on the row still
+                    // carrying the `next_run_at` we read, so an edit or delete that raced
+                    // with this tick wins and the stale copy is not executed.
+                    let next = compute_next(&sched, now);
+                    let retire = matches!(sched, ScheduleConfig::Once { .. }) || next.is_none();
+                    let claimed = self.db.claim_scheduled_run(
+                        &w.id,
+                        w.next_run_at.as_deref(),
+                        &fmt_time(now),
+                        next.map(fmt_time).as_deref(),
+                        retire,
+                    )?;
+                    if claimed {
+                        self.spawn_run(&w, "schedule");
+                    }
+                }
+                Some(_) => {}
             }
         }
         Ok(())
+    }
+
+    /// Stop every in-flight run of the given workflows (used when their project is
+    /// deleted). Returns how many runs received a stop request.
+    pub fn stop_workflows(&self, workflow_ids: &[String]) -> usize {
+        let run_ids: Vec<String> = {
+            let active = self.active.lock().unwrap();
+            workflow_ids.iter().filter_map(|id| active.get(id).cloned()).collect()
+        };
+        for run_id in &run_ids {
+            self.stop_run(run_id);
+        }
+        run_ids.len()
     }
 
     /// Currently executing runs (for the 运行中任务 panel).
@@ -193,13 +228,9 @@ impl Engine {
             let _ = eng.app.emit(EVT_WF_STATUS, json!({ "runId": run_id2, "workflowId": wf.id, "status": status }));
             eng.controls.lock().unwrap().remove(&run_id2);
             eng.active.lock().unwrap().remove(&wf.id);
-            if status == "success" && wf.trigger_type == "schedule" {
-                if matches!(wf.schedule, Some(ScheduleConfig::Once { .. })) {
-                    let mut w2 = wf.clone();
-                    w2.enabled = false;
-                    let _ = eng.db.update_workflow(&w2);
-                }
-            }
+            // One-shot schedules are retired when the run is *claimed* (tick_once), not
+            // here: doing it on success only made failed/stopped runs repeat forever, and
+            // writing back the stale `wf` copy clobbered edits made during the run.
         });
     }
 
@@ -828,70 +859,6 @@ fn first_line(s: &str) -> String {
     } else {
         l.to_string()
     }
-}
-
-pub fn fmt_time(t: DateTime<Local>) -> String {
-    t.format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
-pub fn parse_time(s: &str) -> Option<DateTime<Local>> {
-    NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S")
-        .or_else(|_| NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M"))
-        .ok()
-        .map(|n| Local.from_local_datetime(&n).single().unwrap_or_else(|| Local.from_utc_datetime(&n)))
-}
-
-pub fn compute_next(sched: &ScheduleConfig, from: DateTime<Local>) -> DateTime<Local> {
-    match sched {
-        ScheduleConfig::Interval { every_minutes } => from + ChronoDuration::minutes((*every_minutes).max(1)),
-        ScheduleConfig::Daily { time } => {
-            let (h, mi) = parse_hhmm(time);
-            let today = from.date_naive().and_hms_opt(h, mi, 0).unwrap_or_default();
-            let today = Local.from_local_datetime(&today).single().unwrap_or(from);
-            if today > from {
-                today
-            } else {
-                today + ChronoDuration::days(1)
-            }
-        }
-        ScheduleConfig::Weekly { weekdays, time } => {
-            let (h, mi) = parse_hhmm(time);
-            for add in 0..8 {
-                let day = from.date_naive() + ChronoDuration::days(add);
-                let wd = num_weekday(day.weekday());
-                if weekdays.contains(&wd) {
-                    if let Some(t) = day.and_hms_opt(h, mi, 0) {
-                        if let Some(t) = Local.from_local_datetime(&t).single() {
-                            if t > from {
-                                return t;
-                            }
-                        }
-                    }
-                }
-            }
-            from + ChronoDuration::weeks(1)
-        }
-        ScheduleConfig::Once { at } => parse_time(at).unwrap_or(from + ChronoDuration::minutes(1)),
-    }
-}
-
-fn num_weekday(w: Weekday) -> u32 {
-    match w {
-        Weekday::Mon => 1,
-        Weekday::Tue => 2,
-        Weekday::Wed => 3,
-        Weekday::Thu => 4,
-        Weekday::Fri => 5,
-        Weekday::Sat => 6,
-        Weekday::Sun => 7,
-    }
-}
-
-fn parse_hhmm(s: &str) -> (u32, u32) {
-    let mut it = s.trim().split(':');
-    let h = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let m = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    (h.min(23), m.min(59))
 }
 
 #[cfg(test)]
