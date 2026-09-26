@@ -21,6 +21,18 @@ fn print_line(s: &str) {
     let _ = out.flush();
 }
 
+/// 后台命令不弹控制台窗（CREATE_NO_WINDOW）；非 Windows 主机为空操作，仅为让
+/// `cargo test` 在 Linux/macOS CI 上也能编译整个 crate。
+#[cfg(windows)]
+fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000)
+}
+#[cfg(not(windows))]
+fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd
+}
+
 fn ask(prompt: &str) -> bool {
     print!("{prompt} [y/N] ");
     let _ = std::io::stdout().flush();
@@ -42,10 +54,7 @@ fn main() {
     print_line("将执行：结束使驾进程、清除开机自启；（可选）删除用户数据。");
     print_line("");
 
-    let kill = std::process::Command::new("taskkill")
-        .args(["/IM", "shidrive.exe", "/F"])
-        .creation_flags(0x0800_0000)
-        .output();
+    let kill = no_window(std::process::Command::new("taskkill").args(["/IM", "shidrive.exe", "/F"])).output();
     match kill {
         Ok(o) if o.status.success() => print_line("√ 已结束使驾进程"),
         _ => print_line("· 使驾当前未在运行"),
@@ -54,16 +63,14 @@ fn main() {
     // 开机自启（tauri-plugin-autostart 写在 HKCU Run，值名随应用名）
     let mut removed_run = false;
     for name in ["ShiDrive", "shidrive", "使驾"] {
-        let st = std::process::Command::new("reg")
-            .args([
-                "delete",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                "/v",
-                name,
-                "/f",
-            ])
-            .creation_flags(0x0800_0000)
-            .output();
+        let st = no_window(std::process::Command::new("reg").args([
+            "delete",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            name,
+            "/f",
+        ]))
+        .output();
         if let Ok(o) = st {
             if o.status.success() {
                 removed_run = true;
@@ -95,17 +102,5 @@ fn main() {
         print_line("按回车退出…");
         let mut buf = String::new();
         let _ = std::io::stdin().read_line(&mut buf);
-    }
-}
-
-#[cfg(windows)]
-trait CreationFlags {
-    fn creation_flags(&mut self, flags: u32) -> &mut Self;
-}
-#[cfg(windows)]
-impl CreationFlags for std::process::Command {
-    fn creation_flags(&mut self, flags: u32) -> &mut Self {
-        use std::os::windows::process::CommandExt as _;
-        std::os::windows::process::CommandExt::creation_flags(self, flags)
     }
 }

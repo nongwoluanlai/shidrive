@@ -378,7 +378,6 @@ impl Tools {
     }
 }
 
-#[cfg(windows)]
 trait CmdFlags {
     fn no_window(&mut self) -> &mut Self;
 }
@@ -387,6 +386,13 @@ impl CmdFlags for std::process::Command {
     fn no_window(&mut self) -> &mut Self {
         use std::os::windows::process::CommandExt;
         self.creation_flags(0x0800_0000)
+    }
+}
+/// 非 Windows 主机（CI / 开发机跑 `cargo test`）：无控制台窗口概念，空操作。
+#[cfg(not(windows))]
+impl CmdFlags for std::process::Command {
+    fn no_window(&mut self) -> &mut Self {
+        self
     }
 }
 
