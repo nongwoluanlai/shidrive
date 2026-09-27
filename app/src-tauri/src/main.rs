@@ -104,6 +104,20 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// 第二个实例启动时（任务栏图标再点一次、双击 exe、开机自启撞上手动启动）由已运行的
+/// 实例调用：把主窗口从托盘 / 最小化 / 其它窗口后面拉到前台。
+/// Windows 只允许"当前前台进程"抢焦点，而此刻拥有前台权的是那个即将退出的新实例，
+/// 单靠 set_focus 往往只会让任务栏图标闪烁；先临时置顶再取消是可靠的提升方式。
+fn raise_main_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_always_on_top(true);
+        let _ = win.set_focus();
+        let _ = win.set_always_on_top(false);
+    }
+}
+
 fn main() {
     // 独立模式：shidrive.exe --coding-mcp [--port N] [--root DIR] [--token T] [--bind ADDR]
     let argv: Vec<String> = std::env::args().collect();
@@ -116,6 +130,12 @@ fn main() {
     std::env::set_var("SHIDRIVE_DEBUG", if debug_mode { "1" } else { "0" });
 
     tauri::Builder::default()
+        // 必须是第一个注册的插件：已有实例在运行时，新进程在这里直接退出，
+        // 已运行实例收到回调后唤出主窗口（--coding-mcp 独立模式在上面已提前返回，不受影响）
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            log::info!("second instance launched (cwd={cwd}, argv={argv:?}); raising the main window");
+            raise_main_window(app);
+        }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
