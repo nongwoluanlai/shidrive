@@ -25,7 +25,23 @@
     }).catch((error) => toast("error", String(error)));
     await saving;
   }
-  async function refresh() { custom = await listSkins(); }
+  async function refresh() { custom = await listSkins(); void loadPreviews(); }
+
+  // 自定义皮肤预览：背景图（无背景则立绘）经 blob URL 呈现，列表变化时释放旧 URL
+  let previews = $state<Record<string, string>>({});
+  async function loadPreviews() {
+    const next: Record<string, string> = {};
+    await Promise.all(custom.map(async (s) => {
+      const file = s.background || s.character || "";
+      if (!file) return;
+      try {
+        const bytes = await api.skinAssetRead(s.dir, file);
+        next[s.id] = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+      } catch { /* 预览缺失不阻塞 */ }
+    }));
+    for (const url of Object.values(previews)) URL.revokeObjectURL(url);
+    previews = next;
+  }
 
   onMount(() => {
     void Promise.all([refresh(), api.settingsGet("ui.skin.last")]).then(([, last]) => {
@@ -51,7 +67,11 @@
       }))
       .then((fn) => { if (disposed) fn(); else unlisten = fn; })
       .catch(() => { /* 非 Tauri 环境（如浏览器预览）没有拖放事件 */ });
-    return () => { disposed = true; unlisten?.(); };
+    return () => {
+      disposed = true;
+      unlisten?.();
+      for (const url of Object.values(previews)) URL.revokeObjectURL(url);
+    };
   });
 
   const isZipPath = (p: string) => /\.zip$/i.test(p);
@@ -147,7 +167,12 @@
     {#each custom as skin (skin.id)}
       <!-- 自定义皮肤卡片带删除按钮，button 不能嵌套 button，所以卡片本身用 role=button -->
       <div class="skin-card custom" class:on={app.skin === skin.id} role="button" tabindex="0" aria-pressed={app.skin === skin.id} onclick={() => choose(skin.id)} onkeydown={(e) => cardKey(e, skin.id)}>
-        <span class="skin-swatch" aria-hidden="true"></span><strong>{skin.name}</strong><span>{t("自定义皮肤")}</span>
+        {#if previews[skin.id]}
+          <img class={!skin.background ? "pf-char" : ""} src={previews[skin.id]} alt="" loading="lazy" />
+        {:else}
+          <span class="skin-swatch" aria-hidden="true"></span>
+        {/if}
+        <strong>{skin.name}</strong><span>{t("自定义皮肤")}</span>
         <button class="skin-del" title={t("删除皮肤")} aria-label={t("删除皮肤")} onclick={(e) => { e.stopPropagation(); void removeSkin(skin); }}>✕</button>
       </div>
     {/each}
@@ -179,7 +204,9 @@
   .skin-note { font-size: .84em; color: var(--text-dim); margin: 7px 0 12px; }
   .skin-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
   .skin-card { display: flex; flex-direction: column; text-align: left; gap: 4px; padding: 8px; border: 2px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); min-width: 0; }
-  .skin-card img, .skin-swatch { width: 100%; height: 78px; object-fit: cover; border-radius: 4px; margin-bottom: 3px; }
+  .skin-card img, .skin-swatch { width: 100%; height: 78px; border-radius: 4px; margin-bottom: 3px; }
+  .skin-card img { object-fit: cover; }
+  .skin-card img.pf-char { object-fit: contain; background: var(--bg-panel); }
   .skin-swatch { background: linear-gradient(135deg, var(--bg-panel), var(--accent-soft, var(--bg-elev2))); }
   .skin-card strong { font-size: .92em; color: var(--text); overflow-wrap: anywhere; }
   .skin-card span:not(.skin-swatch) { font-size: .78em; color: var(--text-dim); }
