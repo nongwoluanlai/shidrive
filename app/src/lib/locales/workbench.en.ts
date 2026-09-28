@@ -303,4 +303,23 @@ export const workbenchEn: Record<string, string> = {
   "已批准，客户端将自动继续授权": "Approved; the client will continue the authorization flow",
   "拒绝": "Deny",
   "读写": "Read/write",
+  // 运行历史
+  "仅保留最近 {count} 条": "Last {count} kept",
+  // 设置 → 帮助与关于
+  "外部编程接入": "External Coding",
+  "帮助与关于": "Help & About",
+  "使用教程": "User Guide",
+  "使驾 ShiDrive 使用教程": "ShiDrive user guide",
+  "打开使用教程 ↗": "Open guide ↗",
+  "联系方式": "Contact",
+  "产品动态、使用技巧与交流，都在公众号「弄倭乱来」。": "Product news, tips and discussion live on our WeChat Official Account “弄倭乱来”.",
+  "公众号二维码：弄倭乱来": "WeChat Official Account QR code: 弄倭乱来",
+  "微信公众号": "WeChat Official Account",
+  "复制名字": "Copy name",
+  "已复制公众号名称「{name}」": "Copied account name “{name}”",
+  "微信扫码关注，或复制名字后在微信中搜索": "Scan with WeChat, or copy the name and search for it in WeChat",
+  "工作室": "Studio",
+  "不乱来工作室": "Noluanlai Studio",
+  "做点小工具，让重复劳动少一点。": "Small tools that take the repetition out of your work.",
+  "关于": "About",
 };

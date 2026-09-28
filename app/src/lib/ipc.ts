@@ -25,6 +25,9 @@ import type {
   WorkflowStep,
 } from "./types";
 
+/** 每个工作流保留的运行历史条数，与后端 db::MAX_RUNS_PER_WORKFLOW 一致 */
+export const RUN_HISTORY_LIMIT = 50;
+
 export const api = {
   // projects
   projectsList: () => invoke<Project[]>("projects_list"),
@@ -132,7 +135,7 @@ export const api = {
   workflowDelete: (id: string) => invoke<void>("workflow_delete", { id }),
   workflowRun: (id: string) => invoke<void>("workflow_run", { id }),
   workflowStop: (run_id: string) => invoke<void>("workflow_stop", { runId: run_id }),
-  runsList: (workflow_id: string, limit = 30) => invoke<WorkflowRun[]>("runs_list", { workflowId: workflow_id, limit }),
+  runsList: (workflow_id: string, limit = RUN_HISTORY_LIMIT) => invoke<WorkflowRun[]>("runs_list", { workflowId: workflow_id, limit }),
 
   // settings
   settingsGet: (key: string) => invoke<string | null>("settings_get", { key }),

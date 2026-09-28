@@ -2,7 +2,7 @@
   // 图形化工作流：SVG 节点画布（并行分支、自由连线）+ 触发按钮 + {t("运行历史")}右列。
   import { onDestroy, onMount, untrack } from "svelte";
   import { app, currentProject, refreshWorkflows, toast } from "../state.svelte";
-  import { api } from "../ipc";
+  import { api, RUN_HISTORY_LIMIT } from "../ipc";
   import type { Edge, ScheduleConfig, Workflow, WorkflowRun, WorkflowStep } from "../types";
   import { onceFromInput, onceToInput, scheduleText } from "./wf-shared";
   import { flushWorkflowSaves, forgetWorkflow, isDirty, trackWorkflowEdit } from "./wf-autosave.svelte";
@@ -809,7 +809,7 @@
 
           <aside class="runs-col">
             <section class="card runs">
-              <h3>{t("运行历史")}</h3>
+              <h3 class="runs-head">{t("运行历史")}<span class="runs-cap">{t("仅保留最近 {count} 条", { count: RUN_HISTORY_LIMIT })}</span></h3>
               <div class="runlist">
                 {#each runs as r (r.id)}
                   <div class="run">
@@ -1070,6 +1070,7 @@
     }
     .runs-col {
       order: 2;
+      height: min(480px, 60vh);
     }
   }
   .canvas-col {
@@ -1088,14 +1089,29 @@
     flex-direction: column;
     gap: 10px;
   }
+  /* 运行历史：卡片占满右列高度，滚动只发生在卡片内的 .runlist 里，
+     记录再多也不会溢出卡片背景 */
   .runs-col {
     display: flex;
     flex-direction: column;
     min-height: 0;
-    overflow-y: auto;
+    overflow: hidden;
   }
-  .runs-col .card {
+  .runs-col .card.runs {
+    flex: 1;
     min-height: 0;
+  }
+  .runs-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .runs-cap {
+    font-size: 0.85em;
+    font-weight: normal;
+    color: var(--text-faint);
   }
   .card h3 {
     font-size: 0.9em;
@@ -1355,11 +1371,18 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    margin-right: -6px; /* 给滚动条留位置，不挤压记录宽度 */
+    padding-right: 6px;
   }
   .run {
     border: 1px solid var(--border-soft);
     border-radius: 8px;
     overflow: hidden;
+    flex-shrink: 0; /* overflow:hidden 的 flex 项最小高度为 0，不禁止收缩会被压扁 */
   }
   .rhead {
     display: flex;

@@ -446,7 +446,7 @@ pub async fn workflow_stop(engine: EngineState<'_>, run_id: String) -> Result<()
 
 #[tauri::command]
 pub async fn runs_list(db: DbState<'_>, workflow_id: String, limit: Option<i64>) -> Result<Vec<WorkflowRun>, String> {
-    db.list_runs(&workflow_id, limit.unwrap_or(30)).map_err(err)
+    db.list_runs(&workflow_id, limit.unwrap_or(crate::db::MAX_RUNS_PER_WORKFLOW).clamp(1, crate::db::MAX_RUNS_PER_WORKFLOW)).map_err(err)
 }
 
 // ---------- settings ----------

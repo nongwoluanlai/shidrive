@@ -3,13 +3,14 @@
   import { api } from "../ipc";
   import { ACCENTS } from "../theme";
   import SkinSettings from "./SkinSettings.svelte";
+  import AboutSettings from "./AboutSettings.svelte";
   import { isEnabled as autoStartEnabled, enable as autoStartEnable, disable as autoStartDisable } from "@tauri-apps/plugin-autostart";
   import AgentsAdmin from "./AgentsAdmin.svelte";
   import RemoteMcpSettings from "./RemoteMcpSettings.svelte";
   import { t } from "../i18n";
   import type { AgentEnvStatusItem, NodeStat } from "../types";
 
-  let tab = $state<"agents" | "remote" | "theme" | "paths">("agents");
+  let tab = $state<"agents" | "remote" | "theme" | "paths" | "about">("agents");
   let registry = $state<AgentEnvStatusItem[]>([]);
 
   // --- paths / ports editing state ---
@@ -176,10 +177,11 @@
     <div class="modal settings">
       <header>{t("设置")} <button class="btn ghost sm" onclick={close}>✕</button></header>
       <div class="tabs">
-        <button class:active={tab === "agents"} onclick={() => { tab = "agents"; void loadRegistry(); }}>Agent 管理</button>
-        <button class:active={tab === "remote"} onclick={() => { tab = "remote"; void loadRegistry(); }}>外部编程接入</button>
-        <button class:active={tab === "paths"} onclick={() => (tab = "paths")}>环境与路径</button>
-        <button class:active={tab === "theme"} onclick={() => (tab = "theme")}>外观主题</button>
+        <button class:active={tab === "agents"} onclick={() => { tab = "agents"; void loadRegistry(); }}>{t("Agent 管理")}</button>
+        <button class:active={tab === "remote"} onclick={() => { tab = "remote"; void loadRegistry(); }}>{t("外部编程接入")}</button>
+        <button class:active={tab === "paths"} onclick={() => (tab = "paths")}>{t("环境与路径")}</button>
+        <button class:active={tab === "theme"} onclick={() => (tab = "theme")}>{t("外观主题")}</button>
+        <button class:active={tab === "about"} onclick={() => (tab = "about")}>{t("帮助与关于")}</button>
       </div>
 
       <div class="body">
@@ -230,6 +232,8 @@
           <AgentsAdmin bind:registry loadRegistry={loadRegistry} />
         {:else if tab === "remote"}
           <RemoteMcpSettings />
+        {:else if tab === "about"}
+          <AboutSettings />
         {:else}
           <div class="sec">
             <h3>{t("通用")}</h3>

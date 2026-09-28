@@ -45,12 +45,18 @@ pub fn list_dir(path: &str) -> Result<Vec<DirEntryInfo>, String> {
             mtime,
         });
     }
-    entries.sort_by(|a, b| match (b.is_dir, a.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
+    sort_entries(&mut entries);
     Ok(entries)
+}
+
+/// 目录在前、文件在后（与 VS Code / 资源管理器一致），同类按名称不区分大小写排序。
+fn sort_entries(entries: &mut [DirEntryInfo]) {
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
 }
 
 pub fn read_file(path: &str) -> Result<(String, bool), String> {
@@ -268,5 +274,42 @@ pub fn desktop_dir() -> Result<String, String> {
         Err("无法获取桌面路径".into())
     } else {
         Ok(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str, is_dir: bool) -> DirEntryInfo {
+        DirEntryInfo { name: name.into(), path: name.into(), is_dir, size: 0, mtime: String::new() }
+    }
+
+    #[test]
+    fn directories_come_before_files_then_case_insensitive_name() {
+        let mut v = vec![
+            entry("README.md", false),
+            entry("src", true),
+            entry("app.ts", false),
+            entry("Docs", true),
+            entry(".gitignore", false),
+            entry("assets", true),
+        ];
+        sort_entries(&mut v);
+        let names: Vec<_> = v.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["assets", "Docs", "src", ".gitignore", "app.ts", "README.md"]);
+    }
+
+    #[test]
+    fn list_dir_puts_real_directories_first() {
+        let root = std::env::temp_dir().join(format!("fsops-sort-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("zeta")).unwrap();
+        std::fs::create_dir_all(root.join("Beta")).unwrap();
+        std::fs::write(root.join("alpha.txt"), "a").unwrap();
+        std::fs::write(root.join("Main.rs"), "m").unwrap();
+        let names: Vec<_> = list_dir(root.to_str().unwrap()).unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["Beta", "zeta", "alpha.txt", "Main.rs"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

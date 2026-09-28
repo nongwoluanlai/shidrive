@@ -4,6 +4,10 @@ use std::sync::Mutex;
 
 use crate::models::*;
 
+/// 每个工作流保留的运行历史条数上限（超出时在新建运行时删除最旧的记录）。
+/// 前端运行历史列表也按这个数目拉取，两边保持一致。
+pub const MAX_RUNS_PER_WORKFLOW: i64 = 50;
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
@@ -572,10 +576,10 @@ impl Db {
                 "INSERT INTO workflow_runs (id,workflow_id,trigger,status,log,started_at) VALUES (?1,?2,?3,'running','',?4)",
                 params![id, workflow_id, trigger, now()],
             )?;
-            // 每个工作流只保留最新 50 条运行历史
+            // 每个工作流只保留最新 MAX_RUNS_PER_WORKFLOW 条运行历史（含刚插入的这条）
             c.execute(
-                "DELETE FROM workflow_runs WHERE workflow_id=?1 AND id NOT IN (SELECT id FROM workflow_runs WHERE workflow_id=?1 ORDER BY started_at DESC, rowid DESC LIMIT 50)",
-                params![workflow_id],
+                "DELETE FROM workflow_runs WHERE workflow_id=?1 AND id NOT IN (SELECT id FROM workflow_runs WHERE workflow_id=?1 ORDER BY started_at DESC, rowid DESC LIMIT ?2)",
+                params![workflow_id, MAX_RUNS_PER_WORKFLOW],
             )?;
             Ok(())
         })?;
@@ -601,7 +605,7 @@ impl Db {
 
     pub fn list_runs(&self, workflow_id: &str, limit: i64) -> Result<Vec<WorkflowRun>, String> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT id,workflow_id,trigger,status,log,started_at,finished_at FROM workflow_runs WHERE workflow_id=?1 ORDER BY started_at DESC LIMIT ?2")?;
+            let mut st = c.prepare("SELECT id,workflow_id,trigger,status,log,started_at,finished_at FROM workflow_runs WHERE workflow_id=?1 ORDER BY started_at DESC, rowid DESC LIMIT ?2")?;
             let rows = st.query_map(params![workflow_id, limit], row_run)?.collect::<rusqlite::Result<Vec<WorkflowRun>>>()?;
             Ok(rows)
         })
@@ -1556,6 +1560,27 @@ mod tests {
 
     fn count(db: &Db, sql: &str) -> i64 {
         db.with(|c| c.query_row(sql, [], |r| r.get::<_, i64>(0))).unwrap()
+    }
+
+    #[test]
+    fn run_history_is_capped_per_workflow_and_keeps_the_newest() {
+        let db = fixture_db();
+        let p = db.create_project("p", "/tmp/p", "").unwrap();
+        let w1 = db.create_workflow(&p.id, "w1", "", false, "manual", None, &[], &Default::default(), &[]).unwrap();
+        let w2 = db.create_workflow(&p.id, "w2", "", false, "manual", None, &[], &Default::default(), &[]).unwrap();
+        let extra = 5;
+        // 同一秒内连续创建：started_at 相同，依靠 rowid 区分新旧
+        let ids: Vec<String> = (0..MAX_RUNS_PER_WORKFLOW + extra).map(|_| db.create_run(&w1.id, "manual").unwrap()).collect();
+        db.create_run(&w2.id, "manual").unwrap();
+        let runs = db.list_runs(&w1.id, 1000).unwrap();
+        assert_eq!(runs.len() as i64, MAX_RUNS_PER_WORKFLOW);
+        // 最新的一条排最前，最旧的 extra 条已被清掉
+        assert_eq!(runs[0].id, *ids.last().unwrap());
+        let kept: std::collections::HashSet<_> = runs.iter().map(|r| r.id.clone()).collect();
+        for old in &ids[..extra as usize] { assert!(!kept.contains(old)); }
+        for new in &ids[extra as usize..] { assert!(kept.contains(new)); }
+        // 别的工作流不受影响
+        assert_eq!(db.list_runs(&w2.id, 1000).unwrap().len(), 1);
     }
 
     /// Populate one project with everything that can hang off it.
