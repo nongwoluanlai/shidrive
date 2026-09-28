@@ -11,6 +11,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@speed-highlight/core": "^2.1.0",
     "@tauri-apps/api": "^2.5.0",
     "@tauri-apps/plugin-autostart": "^2.5.1",
     "dompurify": "^3.2.4",

@@ -332,4 +332,8 @@ export const workbenchEn: Record<string, string> = {
   "上一个 (Shift+Enter)": "Previous (Shift+Enter)",
   "下一个 (Enter)": "Next (Enter)",
   "关闭 (Esc)": "Close (Esc)",
+  // 文件查看器代码着色
+  "文件较大（超过 300 KB），已关闭代码着色": "Large file (over 300 KB): syntax highlighting is off",
+  "代码着色：开（点击关闭）": "Syntax highlighting: on (click to turn off)",
+  "代码着色：关（点击开启）": "Syntax highlighting: off (click to turn on)",
 };

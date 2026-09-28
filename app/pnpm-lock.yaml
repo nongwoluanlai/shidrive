@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@speed-highlight/core':
+        specifier: ^2.1.0
+        version: 2.1.0
       '@tauri-apps/api':
         specifier: ^2.5.0
         version: 2.11.1
@@ -358,6 +361,9 @@ packages:
     resolution: {integrity: sha512-+lIKX7O0+IGe7WuhATaAMMeT7B76vfhXH/l9wLQL+nvyhbw2ohYCKIdWL56JfDu75CWt5oKRP4QFH/jkMtBquA==, tarball: https://registry.npmmirror.com/@rollup/rollup-win32-x64-msvc/-/rollup-win32-x64-msvc-4.63.3.tgz}
     cpu: [x64]
     os: [win32]
+
+  '@speed-highlight/core@2.1.0':
+    resolution: {integrity: sha512-KLoDVy82Hm3N09SLf1L5HoqPo+oIPsPn6C5K3Iz3VTSFygs6vV1Rn3kLyV+D5uyMW3wXtGGFzfJ+kKcFtSSBUQ==, tarball: https://registry.npmmirror.com/@speed-highlight/core/-/core-2.1.0.tgz}
 
   '@sveltejs/acorn-typescript@1.0.13':
     resolution: {integrity: sha512-wgKggnhZVL9Bfx1OaKKTrYY9BFRk6C8UAkQNUcIv1+llzYrIqy+RZm5HPKzn0NpEBvTVhTqB4kQyllZywsRBRQ==, tarball: https://registry.npmmirror.com/@sveltejs/acorn-typescript/-/acorn-typescript-1.0.13.tgz}
@@ -847,6 +853,8 @@ snapshots:
 
   '@rollup/rollup-win32-x64-msvc@4.63.3':
     optional: true
+
+  '@speed-highlight/core@2.1.0': {}
 
   '@sveltejs/acorn-typescript@1.0.13(acorn@8.18.0)':
     dependencies:

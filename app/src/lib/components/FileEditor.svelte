@@ -1,10 +1,11 @@
 <script lang="ts">
   import { t } from "../i18n";
   // Collapsible file preview/editor pane. Save is debounced.
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import { app, toast } from "../state.svelte";
   import { api } from "../ipc";
   import Icon from "./Icon.svelte";
+  import { LANG_LABEL, highlightToBlocks, langForPath, langLoaded, loadLang, loadLangDeep } from "../highlight";
 
   const ed = $derived(app.editor!);
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -138,18 +139,25 @@
     "paddingTop", "paddingRight", "paddingBottom", "paddingLeft",
     "borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth", "boxSizing",
   ] as const;
+  // 查找镜像（<mark>）与着色层（彩色文字）共用同一套对齐逻辑
   function syncMirrorStyle() {
-    if (!taEl || !mirrorEl) return;
+    if (!taEl) return;
     const cs = getComputedStyle(taEl);
-    for (const k of MIRROR_PROPS) (mirrorEl.style as unknown as Record<string, string>)[k] = cs[k] as string;
-    mirrorEl.style.borderStyle = "solid";
-    mirrorEl.style.borderColor = "transparent";
+    for (const el of [mirrorEl, hlEl]) {
+      if (!el) continue;
+      for (const k of MIRROR_PROPS) (el.style as unknown as Record<string, string>)[k] = cs[k] as string;
+      el.style.borderStyle = "solid";
+      el.style.borderColor = "transparent";
+    }
     syncScroll();
   }
   function syncScroll() {
-    if (!taEl || !mirrorEl) return;
-    mirrorEl.scrollTop = taEl.scrollTop;
-    mirrorEl.scrollLeft = taEl.scrollLeft;
+    if (!taEl) return;
+    for (const el of [mirrorEl, hlEl]) {
+      if (!el) continue;
+      el.scrollTop = taEl.scrollTop;
+      el.scrollLeft = taEl.scrollLeft;
+    }
   }
   // 镜像出现/内容变化后：对齐样式与滚动，并重新标出当前项
   // 注意要等 tick()：{@html} 的 DOM 替换可能晚于本 effect，先标上的 .cur 会被新 HTML 整个冲掉
@@ -288,6 +296,226 @@
       cur = -1;
     }
   });
+
+  // ================= 代码着色 =================
+  // 与查找同样的「镜像」思路：textarea 文字设为透明（光标、选区、输入照常），
+  // 其下叠一层逐像素对齐的着色层显示彩色文字。着色层必须与 textarea 内容逐帧一致，
+  // 否则会看到错位的字，所以：
+  //  - 语法加载后同步着色，与按键在同一帧内完成。着色层按 40 行分块，每次只替换
+  //    内容变了的块（通常就一块），DOM 与重排开销和文件大小基本无关；
+  //  - 预计着色耗时超过 HL_SYNC_MS 时，编辑期间先隐藏着色层、露出 textarea 自身的文字，
+  //    停手 HL_DEBOUNCE 后再着色——大文件打字不卡，只是暂时不带颜色。
+  //    预计耗时 = 分词速率（毫秒/字符，滑动平均）× 当前长度 + 增量更新 DOM 的耗时（滑动平均）。
+  //    分词与长度成正比、DOM 增量更新基本恒定，分开估计比「上一次总耗时」稳。
+  //    计时噪声（冷启动 JIT、GC）只会让样本变慢，所以更快的样本立即采纳、更慢的只缓慢上调；
+  //    打开文件时那次分词是冷的（慢 3–5 倍），预计值落在临界区间时空闲再测一次热的；
+  //  - 超过 HL_MAX 字符不着色（工具栏提示）；
+  //  - 输入法组字期间同样露出 textarea 文字，组字下划线等由浏览器原样绘制。
+  const HL_PREF_KEY = "shidrive.editor.highlight";
+  const HL_MAX = 300_000;
+  const HL_SYNC_MS = 12;
+  const HL_DEBOUNCE = 200;
+  let hlEl: HTMLDivElement | undefined = $state();
+  let hlEnabled = $state(readHlPref());
+  let hlReady = $state(false); // 着色层有内容（hlBlocks 非空）
+  let hlStale = $state(false);
+  let composing = $state(false);
+  let langVersion = $state(0); // 语法异步加载完成后 +1，触发重新着色
+
+  function readHlPref(): boolean {
+    try {
+      return localStorage.getItem(HL_PREF_KEY) !== "0";
+    } catch {
+      return true;
+    }
+  }
+  function toggleHl() {
+    hlEnabled = !hlEnabled;
+    try {
+      localStorage.setItem(HL_PREF_KEY, hlEnabled ? "1" : "0");
+    } catch {}
+  }
+
+  const lang = $derived(ed && !ed.binary ? langForPath(ed.path) : null);
+  const hlTooBig = $derived(!!lang && (ed?.content.length ?? 0) > HL_MAX);
+  const hlShown = $derived(hlReady && !hlStale && !composing);
+
+  let hlTimer: ReturnType<typeof setTimeout> | null = null;
+  let tokRate = 0; // 分词速率 ms/字符（0 = 尚未测得）
+  let paintMs = 3; // 增量更新 DOM + 排版 ms
+  const settle = (old: number, v: number) => (!old || v < old ? v : old * 0.8 + v * 0.2);
+  const predictHlMs = (len: number) => tokRate * len + paintMs;
+  function measureTokenize(src: string, l: string): number {
+    const t0 = performance.now();
+    const blocks = highlightToBlocks(src, l);
+    const ms = performance.now() - t0;
+    if (src.length > 4000) tokRate = settle(tokRate, ms / src.length); // 太短的样本计时噪声大
+    return blocks.length;
+  }
+  // 打开文件后空闲时补测一次热的分词速率（只分词、不动 DOM）
+  function scheduleWarmMeasure(path: string, l: string) {
+    const run = () => {
+      const e = app.editor;
+      if (!e || e.path !== path || lang !== l || !hlEnabled) return;
+      const p = predictHlMs(e.content.length);
+      if (p >= HL_SYNC_MS && p < HL_SYNC_MS * 4) measureTokenize(e.content, l);
+    };
+    const w = window as Window & { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number };
+    if (w.requestIdleCallback) w.requestIdleCallback(run, { timeout: 1000 });
+    else setTimeout(run, 300);
+  }
+  let hlKey = ""; // 当前着色内容对应的「路径 + 语言」
+  let hlBlocks: string[] = []; // 最新着色结果（每块 HTML）
+  let hlPainted: string[] = []; // 已写入 hlPaintedEl 的块
+  let hlPaintedEl: HTMLDivElement | undefined;
+  const requestedSubs = new Set<string>();
+
+  function clearHl() {
+    if (hlTimer) clearTimeout(hlTimer);
+    hlTimer = null;
+    hlBlocks = [];
+    hlReady = false;
+    hlStale = false;
+    hlKey = "";
+  }
+  /** 把 hlBlocks 增量写入着色层：只替换变化的块，返回替换的块数。着色层节点换了（开关/切换文件）则全量重写 */
+  function paintHl(): number {
+    const el = hlEl;
+    if (!el) return 0;
+    if (el !== hlPaintedEl) {
+      el.replaceChildren();
+      hlPainted = [];
+      hlPaintedEl = el;
+    }
+    const kids = el.children;
+    const n = hlBlocks.length;
+    let changed = 0;
+    for (let i = 0; i < n; i++) {
+      if (hlPainted[i] === hlBlocks[i]) continue;
+      changed++;
+      let blk = kids[i] as HTMLDivElement | undefined;
+      if (!blk) {
+        blk = document.createElement("div");
+        el.appendChild(blk);
+      }
+      blk.innerHTML = hlBlocks[i]; // highlight.ts 已对文本做 HTML 转义，只含 <span class="tk-*">
+    }
+    while (kids.length > n) kids[kids.length - 1].remove();
+    hlPainted = hlBlocks;
+    return changed;
+  }
+  // Markdown 代码块等运行时才知道的子语言：加载一次，完成后重新着色
+  function onMissingLang(name: string) {
+    if (requestedSubs.has(name)) return;
+    requestedSubs.add(name);
+    void loadLang(name).then((ok) => {
+      if (ok) langVersion++;
+    });
+  }
+  function runHighlight() {
+    if (hlTimer) clearTimeout(hlTimer);
+    hlTimer = null;
+    const e = app.editor;
+    const l = lang;
+    if (!e || e.binary || !l || !hlEnabled || e.content.length > HL_MAX || !langLoaded(l)) {
+      clearHl();
+      return;
+    }
+    const isNewKey = `${e.path}\u0000${l}` !== hlKey;
+    const t0 = performance.now();
+    // textarea 的值把 CRLF 规范成 LF（光标位置也按 LF 算），着色层跟它保持一致
+    const src = e.content.includes("\r") ? e.content.replace(/\r\n?/g, "\n") : e.content;
+    hlBlocks = highlightToBlocks(src, l, onMissingLang);
+    const tokenizeMs = performance.now() - t0;
+    if (src.length > 4000) tokRate = settle(tokRate, tokenizeMs / src.length); // 太短的样本计时噪声大
+    hlKey = `${e.path}\u0000${l}`;
+    hlStale = false;
+    if (isNewKey) scheduleWarmMeasure(e.path, l);
+    if (hlEl && hlReady) {
+      // 常规路径：同步写入并在这里就完成排版，计入耗时（反正绘制前也要排）
+      const changed = paintHl();
+      void hlEl.scrollHeight;
+      // 整层重写（切换文件、打开了块注释）的 DOM 耗时不代表常规按键，不计入 paintMs
+      if (changed <= 2) paintMs = settle(paintMs, performance.now() - t0 - tokenizeMs);
+      syncScroll();
+    } else {
+      // 着色层刚出现：等 {#if} 创建节点后再写入、对齐样式
+      hlReady = true;
+      void tick().then(() => {
+        paintHl();
+        syncMirrorStyle();
+      });
+    }
+  }
+
+  $effect(() => {
+    const content = ed?.content ?? "";
+    const path = ed?.path ?? "";
+    const l = lang;
+    void langVersion;
+    if (!hlEnabled || !l || ed?.binary || content.length > HL_MAX) {
+      clearHl();
+      return;
+    }
+    if (!langLoaded(l)) {
+      clearHl(); // 语法到位前显示纯文本（textarea 自身文字）
+      void loadLangDeep(l).then((ok) => {
+        if (ok) langVersion++;
+      });
+      return;
+    }
+    // 新打开/切换文件：总是立即着色；编辑中：够快就同步，否则防抖
+    // runHighlight 读写 hlReady/hlEl，不能让它们成为本 effect 的依赖（依赖已在上面读取）
+    if (`${path}\u0000${l}` !== hlKey || predictHlMs(content.length) < HL_SYNC_MS) {
+      untrack(runHighlight);
+      return;
+    }
+    hlStale = true;
+    if (hlTimer) clearTimeout(hlTimer);
+    hlTimer = setTimeout(runHighlight, HL_DEBOUNCE);
+  });
+  $effect(() => () => {
+    if (hlTimer) clearTimeout(hlTimer);
+  });
+
+  // 配色明暗跟随编辑区的实际底色，而不是 data-theme：皮肤只给颜色变量、不声明明暗，
+  // 深色主题配浅色皮肤（如薄荷汽水）时按 data-theme 选会得到浅底配浅字
+  let areaEl: HTMLDivElement | undefined = $state();
+  let hlScheme = $state<"dark" | "light">("dark");
+  function detectScheme() {
+    if (!areaEl) return;
+    let light = document.documentElement.dataset.theme === "light";
+    const m = getComputedStyle(areaEl).backgroundColor.match(/[\d.]+/g);
+    if (m && m.length >= 3 && (m.length < 4 || +m[3] >= 0.5)) {
+      const [r, g, b] = m.map(Number);
+      light = 0.2126 * r + 0.7152 * g + 0.0722 * b > 140;
+    }
+    hlScheme = light ? "light" : "dark";
+  }
+  $effect(() => {
+    if (!areaEl || !hlReady) return;
+    detectScheme();
+    // 切换主题/皮肤：html/body 属性或 <head> 里的皮肤样式变化时重新判断（按帧合并）
+    let raf = 0;
+    const mo = new MutationObserver(() => {
+      if (!raf) raf = requestAnimationFrame(() => ((raf = 0), detectScheme()));
+    });
+    mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme", "style", "class"] });
+    mo.observe(document.body, { attributes: true, attributeFilter: ["data-skin", "style", "class"] });
+    mo.observe(document.head, { childList: true, subtree: true, characterData: true });
+    return () => {
+      mo.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
+  });
+
+  const hlTitle = $derived(
+    hlTooBig
+      ? t("文件较大（超过 300 KB），已关闭代码着色")
+      : hlEnabled
+        ? t("代码着色：开（点击关闭）")
+        : t("代码着色：关（点击开启）"),
+  );
 </script>
 
 <!-- 根节点可聚焦 + 键盘监听：让 Ctrl+F/F3/Esc 在焦点位于编辑器任意位置时都归文件查找 -->
@@ -298,6 +526,16 @@
     <span class="ppath" title={ed.path}>{relPath(ed.path)}</span>
     {#if ed.dirty}<span class="badge warn">{t("未保存")}</span>{/if}
     <span class="spacer"></span>
+    {#if !ed.binary && lang}
+      <!-- 语言名 + 着色开关（偏好存 localStorage，默认开） -->
+      <button
+        class="btn ghost sm lang"
+        class:off={!hlEnabled || hlTooBig}
+        title={hlTitle}
+        aria-pressed={hlEnabled}
+        onclick={toggleHl}
+      >{LANG_LABEL[lang] ?? lang}</button>
+    {/if}
     {#if !ed.binary}
       <button class="btn ghost sm" title={t("查找 (Ctrl+F)")} onclick={() => void openFind()}>⌕</button>
     {/if}
@@ -331,17 +569,24 @@
   {#if ed.binary}
     <div class="empty">{t("无法预览二进制文件")}</div>
   {:else}
-    <div class="area">
+    <div class="area" bind:this={areaEl}>
       {#if mirrorHtml}
         <!-- 高亮镜像：内容已逐段 HTML 转义，只插入 <mark> -->
         <div class="mirror" class:stale bind:this={mirrorEl} aria-hidden="true">{@html mirrorHtml}</div>
       {/if}
+      {#if hlReady}
+        <!-- 着色层：内容由 paintHl() 按块增量写入 -->
+        <div class="hl scheme-{hlScheme}" class:hidden={!hlShown} bind:this={hlEl} aria-hidden="true"></div>
+      {/if}
       <textarea
         class="editor-area"
+        class:hl-on={hlShown}
         bind:this={taEl}
         bind:value={ed.content}
         oninput={queueSave}
         onscroll={syncScroll}
+        oncompositionstart={() => (composing = true)}
+        oncompositionend={() => (composing = false)}
         spellcheck="false"
       ></textarea>
     </div>
@@ -428,6 +673,15 @@
     /* 镜像也预留同宽滚动条槽：有无滚动条时两边的换行宽度都一致 */
     scrollbar-gutter: stable;
   }
+  /* 查找镜像与着色层都在 textarea 下面，textarea 必须透明。皮肤的全局规则
+     body[data-skin] :is(textarea) { background-color: var(--bg-elev) } 优先级更高，
+     会把下面两层整个盖住——这里用更高的优先级保持透明，把皮肤给 textarea 的底色挪到容器上，外观不变 */
+  .area > textarea.editor-area {
+    background-color: transparent;
+  }
+  :global(body[data-skin]:not([data-skin=""])) .area {
+    background-color: var(--bg-elev);
+  }
   .mirror {
     position: absolute;
     inset: 0;
@@ -442,6 +696,88 @@
   .mirror.stale {
     visibility: hidden;
   }
+  .lang {
+    font-size: 0.78em;
+    color: var(--text-dim);
+  }
+  .lang.off {
+    color: var(--text-faint);
+    text-decoration: line-through;
+    text-decoration-color: color-mix(in srgb, var(--text-faint) 60%, transparent);
+  }
+  /* 着色层：位于查找镜像之上、textarea 之下；背景透明，查找的 <mark> 底色能透上来 */
+  .hl {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    scrollbar-gutter: stable;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    color: var(--text);
+    pointer-events: none;
+    user-select: none;
+  }
+  .hl.hidden {
+    visibility: hidden;
+  }
+  .editor-area.hl-on {
+    color: transparent;
+    caret-color: var(--text);
+  }
+  .editor-area.hl-on::selection {
+    color: transparent;
+    background: color-mix(in srgb, var(--accent) 32%, transparent);
+  }
+  /* 默认配色：深底 One Dark 风格、浅底 GitHub 风格。皮肤可定义 --hl-kwd 等变量覆盖 */
+  .hl.scheme-dark {
+    --hlx-kwd: #c678dd;
+    --hlx-str: #98c379;
+    --hlx-cmnt: #7f848e;
+    --hlx-num: #d19a66;
+    --hlx-func: #61afef;
+    --hlx-type: #e5c07b;
+    --hlx-class: #e5c07b;
+    --hlx-var: #e06c75;
+    --hlx-oper: #56b6c2;
+    --hlx-bool: #d19a66;
+    --hlx-esc: #56b6c2;
+    --hlx-section: #e06c75;
+    --hlx-insert: #98c379;
+    --hlx-deleted: #e06c75;
+    --hlx-err: #f44747;
+  }
+  .hl.scheme-light {
+    --hlx-kwd: #cf222e;
+    --hlx-str: #0a3069;
+    --hlx-cmnt: #6e7781;
+    --hlx-num: #0550ae;
+    --hlx-func: #8250df;
+    --hlx-type: #953800;
+    --hlx-class: #953800;
+    --hlx-var: #116329;
+    --hlx-oper: #0550ae;
+    --hlx-bool: #0550ae;
+    --hlx-esc: #0a3069;
+    --hlx-section: #0550ae;
+    --hlx-insert: #116329;
+    --hlx-deleted: #82071e;
+    --hlx-err: #cf222e;
+  }
+  .hl :global(.tk-kwd) { color: var(--hl-kwd, var(--hlx-kwd)); }
+  .hl :global(.tk-str) { color: var(--hl-str, var(--hlx-str)); }
+  .hl :global(.tk-cmnt) { color: var(--hl-cmnt, var(--hlx-cmnt)); }
+  .hl :global(.tk-num) { color: var(--hl-num, var(--hlx-num)); }
+  .hl :global(.tk-func) { color: var(--hl-func, var(--hlx-func)); }
+  .hl :global(.tk-type) { color: var(--hl-type, var(--hlx-type)); }
+  .hl :global(.tk-class) { color: var(--hl-class, var(--hlx-class)); }
+  .hl :global(.tk-var) { color: var(--hl-var, var(--hlx-var)); }
+  .hl :global(.tk-oper) { color: var(--hl-oper, var(--hlx-oper)); }
+  .hl :global(.tk-bool) { color: var(--hl-bool, var(--hlx-bool)); }
+  .hl :global(.tk-esc) { color: var(--hl-esc, var(--hlx-esc)); }
+  .hl :global(.tk-section) { color: var(--hl-section, var(--hlx-section)); }
+  .hl :global(.tk-insert) { color: var(--hl-insert, var(--hlx-insert)); }
+  .hl :global(.tk-deleted) { color: var(--hl-deleted, var(--hlx-deleted)); }
+  .hl :global(.tk-err) { color: var(--hl-err, var(--hlx-err)); }
   .mirror :global(mark) {
     color: transparent;
     background: color-mix(in srgb, var(--warn, #d4a72c) 38%, transparent);
