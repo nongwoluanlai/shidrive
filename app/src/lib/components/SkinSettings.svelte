@@ -29,16 +29,28 @@
 
   // 自定义皮肤预览：背景图（无背景则立绘）经 blob URL 呈现，列表变化时释放旧 URL
   let previews = $state<Record<string, string>>({});
+  // refresh() 会被连续调用（挂载、每导入一个包、删除后），loadPreviews 又不被 await：
+  // 只有最新一次调用的结果可以落地，否则较慢的旧调用会用旧列表覆盖新预览；
+  // 组件卸载后才返回的结果也要立即释放，避免 blob 泄漏。
+  let previewGen = 0;
+  let unmounted = false;
+  const IMAGE_MIME: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", gif: "image/gif" };
   async function loadPreviews() {
+    const gen = ++previewGen;
     const next: Record<string, string> = {};
     await Promise.all(custom.map(async (s) => {
       const file = s.background || s.character || "";
       if (!file) return;
       try {
         const bytes = await api.skinAssetRead(s.dir, file);
-        next[s.id] = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+        const type = IMAGE_MIME[file.split(".").pop()?.toLowerCase() ?? ""] ?? "application/octet-stream";
+        next[s.id] = URL.createObjectURL(new Blob([bytes], { type }));
       } catch { /* 预览缺失不阻塞 */ }
     }));
+    if (gen !== previewGen || unmounted) {
+      for (const url of Object.values(next)) URL.revokeObjectURL(url);
+      return;
+    }
     for (const url of Object.values(previews)) URL.revokeObjectURL(url);
     previews = next;
   }
@@ -63,12 +75,14 @@
           dragging = false;
           const zips = payload.paths.filter(isZipPath);
           if (zips.length) void importPaths(zips);
+          else if (payload.paths.length) toast("warn", t("仅支持 .zip 皮肤包"));
         }
       }))
       .then((fn) => { if (disposed) fn(); else unlisten = fn; })
       .catch(() => { /* 非 Tauri 环境（如浏览器预览）没有拖放事件 */ });
     return () => {
       disposed = true;
+      unmounted = true;
       unlisten?.();
       for (const url of Object.values(previews)) URL.revokeObjectURL(url);
     };
@@ -149,6 +163,8 @@
     } catch (error) { toast("error", String(error)); }
   }
   function cardKey(e: KeyboardEvent, id: string) {
+    // 事件会从卡片内的 ✕ 按钮冒泡上来：只处理卡片本身，否则回车/空格删不掉皮肤反而会选中它
+    if (e.target !== e.currentTarget) return;
     if (e.key === "Enter" || e.key === " ") { e.preventDefault(); void choose(id); }
   }
 </script>
@@ -224,6 +240,6 @@
   .skin-opacity-row { display: flex; align-items: center; gap: 8px; font-size: .86em; color: var(--text-dim); margin-top: 12px; }
   .skin-opacity-row input { flex: 1; max-width: 220px; accent-color: var(--accent); }
   .skin-opacity-row b { min-width: 38px; text-align: right; color: var(--text); }
-  .skin-actions :is(a, .linklike) { color: var(--accent); font-size: .85em; background: none; border: none; padding: 0; cursor: pointer; }
+  .skin-actions .linklike { color: var(--accent); font-size: .85em; background: none; border: none; padding: 0; cursor: pointer; }
   .skin-actions .linklike:hover { text-decoration: underline; }
 </style>
