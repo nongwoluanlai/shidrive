@@ -322,4 +322,14 @@ export const workbenchEn: Record<string, string> = {
   "不乱来工作室": "Noluanlai Studio",
   "做点小工具，让重复劳动少一点。": "Small tools that take the repetition out of your work.",
   "关于": "About",
+  // v0.3.13+ 共享上下文 / 文件查找
+  "最近 {n} 条": "Latest {n}",
+  "文件查看器": "File viewer",
+  "查找 (Ctrl+F)": "Find (Ctrl+F)",
+  "在文件中查找…": "Find in file…",
+  "无结果": "No results",
+  "区分大小写": "Match case",
+  "上一个 (Shift+Enter)": "Previous (Shift+Enter)",
+  "下一个 (Enter)": "Next (Enter)",
+  "关闭 (Esc)": "Close (Esc)",
 };

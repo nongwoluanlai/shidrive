@@ -1,6 +1,6 @@
 <script lang="ts">
   import { t, localeTag } from "../i18n";
-  import { onMount, untrack } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { app, currentContext, refreshContexts, toast } from "../state.svelte";
   import { api } from "../ipc";
@@ -22,6 +22,10 @@
   const inputs = $state<Record<string, string>>({ todo: "", progress: "", decision: "", note: "" });
   let commits = $state<ScCommit[]>([]);
   let openCommit = $state<number | null>(null);
+  /** 导出时拉取的提交上限：视为「全部」（后端不裁剪提交历史） */
+  const EXPORT_ALL_LIMIT = 100000;
+  // 各分区列表的滚动容器：新增条目追加在末尾，添加后把对应列表滚到底
+  const listEls: Record<string, HTMLUListElement | undefined> = $state({});
 
   async function refreshCommits(id: string) {
     try {
@@ -34,24 +38,79 @@
 
   function parseFiles(raw: string): string[] {
     try {
-      return JSON.parse(raw) ?? [];
+      const v = JSON.parse(raw);
+      return Array.isArray(v) ? v.map(itemText).filter(Boolean) : [];
     } catch {
       return [];
     }
   }
 
+  // 快照里的条目是 {content, status} 对象（旧数据/外部写入可能是纯字符串）；
+  // 直接 String(obj) 会得到 "[object Object]"——导出 MD 的异常就出在这里。
+  function itemText(v: unknown): string {
+    if (v === null || v === undefined) return "";
+    if (typeof v === "string") return v;
+    if (typeof v === "number" || typeof v === "boolean") return String(v);
+    if (typeof v === "object") {
+      const o = v as Record<string, unknown>;
+      for (const k of ["content", "text", "title", "summary", "name", "path"]) {
+        if (typeof o[k] === "string") return o[k] as string;
+      }
+      try {
+        return JSON.stringify(v);
+      } catch {
+        return "";
+      }
+    }
+    return String(v);
+  }
+
+  interface SnapEntry {
+    content: string;
+    status: string;
+  }
+  /** 把快照中的任意列表规整为 {content, status}[]（界面展示与导出共用）。 */
+  function snapList(v: unknown): SnapEntry[] {
+    if (!Array.isArray(v)) return [];
+    return v
+      .map((it) => ({
+        content: itemText(it),
+        status: it && typeof it === "object" && typeof (it as Record<string, unknown>).status === "string" ? ((it as Record<string, unknown>).status as string) : "",
+      }))
+      .filter((e) => e.content.trim() !== "");
+  }
+
   // 导出全部提交版本为 Markdown（写到系统"下载"目录）
   async function exportMarkdown() {
     if (!ctx) return;
-    const esc = (s: string) => s.replaceAll("|", "\\|").replaceAll("\r\n", "\n");
+    const ctxNow = ctx;
+    // 导出「全部」版本：界面只加载最近 50 条，这里单独拉取完整历史（后端不裁剪提交）
+    let all: ScCommit[];
+    try {
+      all = await api.contextCommits(ctxNow.id, EXPORT_ALL_LIMIT);
+    } catch (e) {
+      toast("error", t("导出失败: ") + String(e));
+      return;
+    }
+    if (ctx?.id !== ctxNow.id) return;
+    const esc = (s: string) => s.replaceAll("\r\n", "\n");
+    // 列表项内的换行：续行缩进两格，保持在同一个列表项里
+    const li = (prefix: string, text: string) => `${prefix}${esc(text).replaceAll("\n", "\n  ")}`;
     const lines: string[] = [];
-    lines.push(t("# 共享上下文：{p0}", { p0: ctx.name }));
+    lines.push(t("# 共享上下文：{p0}", { p0: ctxNow.name }));
     lines.push("");
-    lines.push(t("- 项目：{p0}", { p0: app.projects.find((p) => p.id === ctx.project_id)?.name ?? ctx.project_id }));
+    lines.push(t("- 项目：{p0}", { p0: app.projects.find((p) => p.id === ctxNow.project_id)?.name ?? ctxNow.project_id }));
     lines.push(t("- 导出时间：{p0}", { p0: new Date().toLocaleString(localeTag()) }));
-    lines.push(t("- 提交版本：v1 ~ v{p0}（共 {p1} 条）", { p0: commits.length ? Math.max(...commits.map((c) => c.seq)) : 0, p1: commits.length }));
+    const sorted = [...all].sort((a, b) => a.seq - b.seq);
+    lines.push(
+      t("- 提交版本：v{p0} ~ v{p1}（共 {p2} 条）", {
+        p0: sorted[0]?.seq ?? 0,
+        p1: sorted[sorted.length - 1]?.seq ?? 0,
+        p2: sorted.length,
+      }),
+    );
     lines.push("");
-    for (const c of [...commits].sort((a, b) => a.seq - b.seq)) {
+    for (const c of sorted) {
       lines.push(`---`);
       lines.push("");
       lines.push(`## v${c.seq} · ${c.created_at}`);
@@ -60,28 +119,26 @@
       lines.push("");
       if (c.summary) lines.push(t("**摘要**：{p0}", { p0: esc(c.summary) }), "");
       const files = parseFiles(c.files);
-      if (files.length) lines.push(t("**涉及文件**："), "", ...files.map((f) => `- ${f}`), "");
-      try {
-        const snap = JSON.parse(c.snapshot || "{}") as Record<string, unknown>;
-        const sections: [string, unknown][] = [
-          [t("概述"), snap.overview],
-          [t("条目"), snap.todos ?? snap.entries],
-          [t("进展"), snap.progress],
-          [t("备注"), snap.notes],
-          [t("约束"), snap.constraints],
-        ];
-        for (const [name, val] of sections) {
-          if (val === undefined || val === null || val === "") continue;
-          lines.push(`**${name}**：`, "");
-          if (Array.isArray(val)) for (const it of val) lines.push(`- ${esc(String(it))}`);
-          else lines.push(esc(String(val)));
-          lines.push("");
-        }
-      } catch {
-        /* snapshot 损坏时跳过 */
-      }
+      if (files.length) lines.push(t("**涉及文件**："), "", ...files.map((f) => li("- ", f)), "");
+      const snap = parseSnap(c.snapshot || "{}");
+      const text = (label: string, v: unknown) => {
+        const s = itemText(v).trim();
+        if (s) lines.push(`**${label}**：`, "", esc(s), "");
+      };
+      const list = (label: string, v: unknown, todo = false) => {
+        const rows = snapList(v);
+        if (!rows.length) return;
+        lines.push(`**${label}**：`, "");
+        for (const r of rows) lines.push(li(todo ? (r.status === "done" ? "- [x] " : "- [ ] ") : "- ", r.content));
+        lines.push("");
+      };
+      text(t("概述"), snap.overview);
+      list(t("待办"), snap.todos ?? snap.entries, true);
+      list(t("进展"), snap.progress);
+      list(t("注意"), snap.notes);
+      text(t("约束"), snap.constraints);
     }
-    const name = `context-${ctx.name.replace(/[\\/:*?"<>|]/g, "_")}-${new Date().toISOString().slice(0, 10)}.md`;
+    const name = `context-${ctxNow.name.replace(/[\\/:*?"<>|]/g, "_")}-${new Date().toISOString().slice(0, 10)}.md`;
     try {
       const dir = await api.fsDesktopDir().catch(() => "");
       const initial = dir ? `${dir}\\${name}` : name;
@@ -100,16 +157,12 @@
     }
   }
 
-  interface Snap {
-    overview?: string;
-    todos?: { content: string; status?: string }[];
-    progress?: { content: string }[];
-    notes?: { content: string }[];
-    constraints?: string;
-  }
+  /** 快照字段一律按 unknown 处理：历史数据/外部写入的形状不保证与当前结构一致 */
+  type Snap = Record<string, unknown>;
   function parseSnap(raw: string): Snap {
     try {
-      return JSON.parse(raw) ?? {};
+      const v = JSON.parse(raw);
+      return v && typeof v === "object" && !Array.isArray(v) ? (v as Snap) : {};
     } catch {
       return {};
     }
@@ -223,6 +276,9 @@
       await api.entryAdd(id, kind, content);
       if (ctx?.id === id) inputs[kind] = "";
       await refresh(id);
+      await tick();
+      const el = listEls[kind];
+      if (el) el.scrollTop = el.scrollHeight;
     } catch (e) {
       toast("error", String(e));
     }
@@ -249,6 +305,7 @@
   }
 
   const of = (kind: string) => entries.filter((e) => e.kind === kind);
+  const todoDone = $derived(entries.filter((e) => e.kind === "todo" && e.status === "done").length);
 </script>
 
 <div class="ctxview">
@@ -265,7 +322,7 @@
       </section>
 
       <section class="card">
-        <h3>{t("✅ 待办 Todo")}</h3>
+        <h3>{t("✅ 待办 Todo")}{#if of("todo").length}<span class="count">{todoDone}/{of("todo").length}</span>{/if}</h3>
         <div class="addrow">
           <input
             placeholder={t("添加待办，回车确认")}
@@ -274,7 +331,7 @@
           />
           <button class="btn sm" onclick={() => add("todo")}>{t("添加")}</button>
         </div>
-        <ul class="todos">
+        <ul class="todos scroll" bind:this={listEls.todo}>
           {#each of("todo") as e (e.id)}
             <li class:done={e.status === "done"}>
               <input type="checkbox" checked={e.status === "done"} onchange={() => toggle(e)} />
@@ -288,12 +345,12 @@
       </section>
 
       <section class="card">
-        <h3>{t("📈 进展 Progress")}</h3>
+        <h3>{t("📈 进展 Progress")}{#if of("progress").length}<span class="count">{of("progress").length}</span>{/if}</h3>
         <div class="addrow">
           <input placeholder={t("记录阶段性进展，回车确认")} bind:value={inputs.progress} onkeydown={(e) => e.key === "Enter" && add("progress")} />
           <button class="btn sm" onclick={() => add("progress")}>{t("添加")}</button>
         </div>
-        <ul>
+        <ul class="scroll" bind:this={listEls.progress}>
           {#each of("progress") as e (e.id)}
             <li><span class="content">{e.content}</span><span class="time">{e.created_at.slice(5, 16)}</span><button class="btn ghost sm" onclick={() => remove(e)}>✕</button></li>
           {:else}
@@ -304,12 +361,12 @@
 
       <div class="pair">
         <section class="card">
-          <h3>{t("⚖️ 决策 Decisions")}</h3>
+          <h3>{t("⚖️ 决策 Decisions")}{#if of("decision").length}<span class="count">{of("decision").length}</span>{/if}</h3>
           <div class="addrow">
             <input placeholder={t("记录重要决策")} bind:value={inputs.decision} onkeydown={(e) => e.key === "Enter" && add("decision")} />
             <button class="btn sm" onclick={() => add("decision")}>{t("添加")}</button>
           </div>
-          <ul>
+          <ul class="scroll" bind:this={listEls.decision}>
             {#each of("decision") as e (e.id)}
               <li><span class="content">{e.content}</span><button class="btn ghost sm" onclick={() => remove(e)}>✕</button></li>
             {:else}
@@ -318,12 +375,12 @@
           </ul>
         </section>
         <section class="card">
-          <h3>{t("📝 注意 Notes")}</h3>
+          <h3>{t("📝 注意 Notes")}{#if of("note").length}<span class="count">{of("note").length}</span>{/if}</h3>
           <div class="addrow">
             <input placeholder={t("记录注意事项")} bind:value={inputs.note} onkeydown={(e) => e.key === "Enter" && add("note")} />
             <button class="btn sm" onclick={() => add("note")}>{t("添加")}</button>
           </div>
-          <ul>
+          <ul class="scroll" bind:this={listEls.note}>
             {#each of("note") as e (e.id)}
               <li><span class="content">{e.content}</span><button class="btn ghost sm" onclick={() => remove(e)}>✕</button></li>
             {:else}
@@ -334,7 +391,7 @@
       </div>
 
       <section class="card commits">
-        <h3>{t("🕘 提交历史")} <span class="ver">{t("当前版本 v{version}", { version: commits[0]?.seq ?? 0 })}</span><span class="spacer"></span><button class="btn ghost sm" title={t("导出全部版本为 Markdown（保存到桌面）")} onclick={exportMarkdown}>{t("导出 MD")}</button><button class="btn ghost sm" title={t("刷新")} onclick={() => { if (ctx) void refreshCommits(ctx.id); }}>⟳</button></h3>
+        <h3>{t("🕘 提交历史")} {#if commits.length}<span class="count">{commits.length >= 50 ? t("最近 {n} 条", { n: commits.length }) : commits.length}</span>{/if}<span class="ver">{t("当前版本 v{version}", { version: commits[0]?.seq ?? 0 })}</span><span class="spacer"></span><button class="btn ghost sm" title={t("导出全部版本为 Markdown（保存到桌面）")} onclick={exportMarkdown}>{t("导出 MD")}</button><button class="btn ghost sm" title={t("刷新")} onclick={() => { if (ctx) void refreshCommits(ctx.id); }}>⟳</button></h3>
         <div class="commit-list">
           {#each commits as c (c.seq)}
             <div class="commit">
@@ -346,15 +403,21 @@
               </button>
               {#if openCommit === c.seq}
                 {@const snap = parseSnap(c.snapshot)}
+                {@const sOverview = itemText(snap.overview).trim()}
+                {@const sTodos = snapList(snap.todos ?? snap.entries)}
+                {@const sProgress = snapList(snap.progress)}
+                {@const sNotes = snapList(snap.notes)}
+                {@const sConstraints = itemText(snap.constraints).trim()}
                 <div class="cbody">
                   {#if parseFiles(c.files).length}
                     <div class="cfiles">{t("涉及文件：")}{#each parseFiles(c.files) as f, i (f + i)}{#if i > 0}、{/if}<code>{f}</code>{/each}</div>
                   {/if}
-                  {#if snap.overview}<div class="csec"><b>{t("概述")}</b><div class="ctext">{snap.overview}</div></div>{/if}
-                  {#if snap.todos?.length}<div class="csec"><b>{t("待办")}</b><ul>{#each snap.todos as t (t.content)}<li>{t.content}{t.status === "done" ? " ✓" : ""}</li>{/each}</ul></div>{/if}
-                  {#if snap.progress?.length}<div class="csec"><b>{t("进展")}</b><ul>{#each snap.progress as t (t.content)}<li>{t.content}</li>{/each}</ul></div>{/if}
-                  {#if snap.notes?.length}<div class="csec"><b>{t("注意")}</b><ul>{#each snap.notes as t (t.content)}<li>{t.content}</li>{/each}</ul></div>{/if}
-                  {#if snap.constraints}<div class="csec"><b>{t("约束")}</b><div class="ctext">{snap.constraints}</div></div>{/if}
+                  <!-- 按索引作 key：同一快照里可能有内容相同的条目（按内容作 key 会触发 each_key_duplicate 渲染错误） -->
+                  {#if sOverview}<div class="csec"><b>{t("概述")}</b><div class="ctext">{sOverview}</div></div>{/if}
+                  {#if sTodos.length}<div class="csec"><b>{t("待办")}</b><ul>{#each sTodos as it, i (i)}<li class:done={it.status === "done"}>{it.content}{it.status === "done" ? " ✓" : ""}</li>{/each}</ul></div>{/if}
+                  {#if sProgress.length}<div class="csec"><b>{t("进展")}</b><ul>{#each sProgress as it, i (i)}<li>{it.content}</li>{/each}</ul></div>{/if}
+                  {#if sNotes.length}<div class="csec"><b>{t("注意")}</b><ul>{#each sNotes as it, i (i)}<li>{it.content}</li>{/each}</ul></div>{/if}
+                  {#if sConstraints}<div class="csec"><b>{t("约束")}</b><div class="ctext">{sConstraints}</div></div>{/if}
                 </div>
               {/if}
             </div>
@@ -410,6 +473,25 @@
     font-size: 0.95em;
     color: var(--text-dim);
     font-weight: 600;
+  }
+  .card h3 .count {
+    margin-left: 8px;
+    padding: 0 7px;
+    border-radius: 999px;
+    background: var(--bg-elev);
+    color: var(--text-faint);
+    font-size: 0.8em;
+    font-weight: 500;
+  }
+  /* 各分区列表条目多时在卡片内滚动，而不是整页一股脑摊开 */
+  ul.scroll {
+    max-height: 264px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+  }
+  .pair ul.scroll {
+    max-height: 220px;
   }
   .card textarea {
     background: var(--bg-elev);
@@ -473,8 +555,13 @@
     gap: 6px;
     max-height: 420px;
     overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
   }
   .commit {
+    /* 必须 flex:none：列表是限高的纵向 flex 容器，而 overflow:hidden 让条目的最小高度
+       变成 0，条目一多就被压缩——这就是「提交历史压着叠起来」的根因 */
+    flex: none;
     border: 1px solid var(--border-soft);
     border-radius: 8px;
     overflow: hidden;
@@ -516,6 +603,16 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+    /* 单个版本的快照内容很长时在自身内部滚动，不把整个列表撑满 */
+    max-height: 300px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .csec li {
+    white-space: pre-wrap;
+  }
+  .csec li.done {
+    color: var(--text-faint);
   }
   .cfiles code {
     background: var(--code-bg);

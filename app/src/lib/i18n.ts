@@ -175,7 +175,7 @@ const en: Record<string, string> = {
   "# 共享上下文：{p0}": "# Shared context: {p0}",
   "- 项目：{p0}": "- Project: {p0}",
   "- 导出时间：{p0}": "- Exported at: {p0}",
-  "- 提交版本：v1 ~ v{p0}（共 {p1} 条）": "- Versions: v1–v{p0} ({p1} commits)",
+  "- 提交版本：v{p0} ~ v{p1}（共 {p2} 条）": "- Versions: v{p0}–v{p1} ({p2} commits)",
   "会话 {p0}": "Session {p0}",
   "**摘要**：{p0}": "**Summary**: {p0}",
   "**涉及文件**：": "**Files**:",

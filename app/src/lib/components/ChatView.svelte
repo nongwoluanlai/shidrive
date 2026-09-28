@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { app, chatKey, currentContext, finishTurn, setChatRows, pushLocal, toast, clearChat, sharedContextPrompt, switchAgent, loadChatLocal, saveCfgPref, fullAccessDefault, touchChat } from "../state.svelte";
 import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { api } from "../ipc";
@@ -172,17 +172,52 @@ import type { DisplayItem } from "../state.svelte";
   // 附近的条目真正排版（普遍高于 120px），目标随即被顶出视口——单次校准只能追上
   // 第一波变化，每按一次「上一个」目标就再偏一截（搜索向上跳、看着没动，手动一滚
   // 才出现）。所以改成逐帧收敛：连续两帧不需要修正才算落定，上限 12 帧。
+  //
+  // 抖动根因：即便逐帧收敛，每一帧仍先把「目标被顶走」的中间状态画出来，再在下一帧拉回——
+  // 用户看到的就是定位后上下抖。现在先把目标前后若干条强制真正排版（.cv-settle =
+  // content-visibility:visible），等 contain-intrinsic-size:auto 记住它们的真实高度后
+  // 再撤掉：它们之后再被跳过也按真实高度占位，落点一次到位，不再逐帧漂移。
+  const SETTLE_BEFORE = 12;
+  const SETTLE_AFTER = 20;
+  function settleAround(idx: number): HTMLElement[] {
+    if (!listEl) return [];
+    const out: HTMLElement[] = [];
+    for (const el of listEl.querySelectorAll<HTMLElement>('.msgs-inner > div[id^="msg-"]')) {
+      const i = idToIndex.get(el.id.slice(4));
+      if (i === undefined || i < idx - SETTLE_BEFORE || i > idx + SETTLE_AFTER) continue;
+      el.classList.add("cv-settle");
+      out.push(el);
+    }
+    return out;
+  }
   let scrollToItemSeq = 0;
-  async function scrollToItem(id: string, align: "center" | "start" = "center") {
+  let scrollingToItem = false;
+  async function scrollToItem(id: string, align: "center" | "start" = "center"): Promise<boolean> {
     const idx = idToIndex.get(id);
-    if (idx === undefined || !listEl) return;
+    if (idx === undefined || !listEl) return false;
     const seq = ++scrollToItemSeq;
     stickToBottom = false;
+    pauseFollow(); // 跳转也算「用户在看历史」：3 秒后按距离决定是否恢复贴底
     ensureRendered(idx);
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    if (seq !== scrollToItemSeq) return; // 已有更新的定位请求
+    if (seq !== scrollToItemSeq) return false; // 已有更新的定位请求
     const el = document.getElementById("msg-" + id) as HTMLElement | null;
-    if (!el || !listEl) return;
+    if (!el || !listEl) return false;
+    scrollingToItem = true;
+    const settled = settleAround(idx);
+    try {
+      return await placeItem(seq, id, el, align);
+    } finally {
+      for (const s of settled) s.classList.remove("cv-settle");
+      if (seq === scrollToItemSeq) scrollingToItem = false;
+    }
+  }
+  async function placeItem(seq: number, id: string, el: HTMLElement, align: "center" | "start"): Promise<boolean> {
+    if (!listEl) return false;
+    // 邻居已强制排版：先记下实测高度并让占位高度（topPad/botPad）同步，再定位
+    measureRendered(true);
+    await tick();
+    if (seq !== scrollToItemSeq || !listEl) return false;
     const place = (target: HTMLElement): boolean => {
       if (!listEl) return true;
       const listRect = listEl.getBoundingClientRect();
@@ -203,16 +238,21 @@ import type { DisplayItem } from "../state.svelte";
     el.classList.remove("flash");
     void el.offsetWidth;
     el.classList.add("flash");
-    // 逐帧收敛：markdown/图片异步撑高、跳过态条目补排版都会移动目标
+    // 逐帧校验（兜底）：markdown/图片异步撑高仍可能移动目标；邻居已预排版，通常首帧即稳定
     let stable = 0;
     for (let frame = 0; frame < 12 && stable < 2; frame++) {
       await new Promise((r) => requestAnimationFrame(r));
-      if (seq !== scrollToItemSeq || !listEl) return;
+      if (seq !== scrollToItemSeq || !listEl) return false;
       const cur = document.getElementById("msg-" + id) as HTMLElement | null;
-      if (!cur) return;
+      if (!cur) return false;
       stable = place(cur) ? stable + 1 : 0;
     }
     measureRendered(true);
+    await tick();
+    // 占位高度随实测更新后再校准一次（同一帧内完成，不会画出中间态）
+    const fin = document.getElementById("msg-" + id) as HTMLElement | null;
+    if (fin && seq === scrollToItemSeq) place(fin);
+    return seq === scrollToItemSeq;
   }
 
   const chatRev = () => app.chatRev[key] ?? 0;
@@ -321,28 +361,41 @@ import type { DisplayItem } from "../state.svelte";
     });
   }
 
-  // 定位上一条发出的消息气泡：数据驱动（不再依赖已渲染 DOM，未加载的旧消息也能定位）
-  function jumpToPrevUserMessage() {
+  // 定位上一条发出的消息气泡：按「会话历史顺序」逐条向上，而不是按视口位置。
+  // 旧实现取「视口顶部第一个底边超过 +80px 的条目」作起点并包含它本身：刚定位到的消息
+  // 顶部对齐在 +24px，正好被选为起点 → 再点还是它自己（原地重定位 + 闪烁，看起来没反应，
+  // 只有手动滚开后才继续往上）。现在：
+  // 1) 记住上一次 ↑ 的目标；视口没被用户挪动（或定位仍在进行中）时，直接从它的前一条找；
+  // 2) 否则按视口几何取起点：只把「开头已在视口顶线之上」的条目算作上方（开头可见的不算）。
+  let prevJump: { id: string; top: number } | null = null;
+  function viewportAnchorIndex(): number {
+    if (!listEl) return items.length - 1;
+    const line = listEl.getBoundingClientRect().top + 20; // 定位落点是 +24px，留 4px 容差
+    let cur = startIdx - 1; // 窗口里没有条目在顶线之上：起点落在顶部占位区（窗口之前）
+    for (const el of listEl.querySelectorAll<HTMLElement>('.msgs-inner > div[id^="msg-"]')) {
+      if (el.getBoundingClientRect().top >= line) break;
+      cur = idToIndex.get(el.id.slice(4)) ?? cur;
+    }
+    return cur;
+  }
+  async function jumpToPrevUserMessage() {
     if (!items.length || !listEl) return;
-    const listRect = listEl.getBoundingClientRect();
-    let cur = startIdx;
-    for (const el of Array.from(listEl.querySelectorAll('.msgs-inner > div[id^="msg-"]')) as HTMLElement[]) {
-      if (el.getBoundingClientRect().bottom > listRect.top + 80) {
-        cur = idToIndex.get(el.id.slice(4)) ?? startIdx;
-        break;
-      }
+    let from: number;
+    const lastIdx = prevJump ? idToIndex.get(prevJump.id) : undefined;
+    if (prevJump && lastIdx !== undefined && (scrollingToItem || Math.abs(listEl.scrollTop - prevJump.top) < 8)) {
+      from = lastIdx - 1;
+    } else {
+      from = viewportAnchorIndex();
     }
     let target = -1;
-    for (let i = Math.min(cur, items.length - 1); i >= 0; i--) {
+    for (let i = Math.min(from, items.length - 1); i >= 0; i--) {
       if (items[i].kind === "user") { target = i; break; }
     }
-    if (target < 0) {
-      for (let i = items.length - 1; i >= 0; i--) {
-        if (items[i].kind === "user") { target = i; break; }
-      }
-    }
     if (target < 0) { toast("info", t("没有更早的发出的消息")); return; }
-    void scrollToItem(items[target].id, "start");
+    const id = items[target].id;
+    prevJump = { id, top: Number.NaN }; // 定位进行中：连点时按 id 继续向上
+    const ok = await scrollToItem(id, "start");
+    if (ok && listEl && prevJump?.id === id) prevJump = { id, top: listEl.scrollTop };
   }
   const sessionId = $derived(app.bindingSession[key] ?? null);
   let bindingTitle = $state<string | null>(null);
@@ -412,6 +465,91 @@ import type { DisplayItem } from "../state.svelte";
   // appended chunk/text growth re-anchors the view.
   let lastKeyScrolled = "";
   let lastRevSeen: Record<string, number> = {};
+  let followSeenN = 0;
+  let followSeenTail = 0;
+
+  // ============ 上翻缓冲：用户在看历史时不被实时输出拽回底部 ============
+  // 用户向上滚动即暂停贴底；停止滚动 RESUME_IDLE_MS 后：
+  //   - 离真实底部不超过一屏 → 恢复贴底（期间已有新内容则立即置底，否则等下一次内容更新）；
+  //   - 离得更远（在翻较早的历史）→ 保持不动，需要时点 ↓ 回到最新。
+  // 旧问题：流式输出时每个分片都会程序置底并刷新 lastProgScrollAt，而 onScroll 会把 300ms
+  // 内的滚动一律当作程序滚动的回声忽略——分片间隔 <300ms 时用户的上滚被全部吞掉，
+  // 根本脱离不了贴底。现在用真实输入事件（滚轮/触摸/拖滚动条）识别用户滚动。
+  const RESUME_IDLE_MS = 3000;
+  let lastUserScrollAt = 0;
+  let draggingScrollbar = false;
+  let resumeTimer: ReturnType<typeof setTimeout> | null = null;
+  let resumeArmed = false; // 缓冲已过且离底部近：下一次内容更新即恢复贴底
+  // 用户最后一次滚动停下时离底部的距离：判断「是否在一屏之内」以它为准——
+  // 暂停期间流式输出不断追加，当前距离会越拉越大，不能算到用户头上
+  let userStopDist = 0;
+  let contentDirty = false; // 暂停期间来过新内容
+  function resetFollowPause() {
+    if (resumeTimer) clearTimeout(resumeTimer);
+    resumeTimer = null;
+    resumeArmed = false;
+    contentDirty = false;
+  }
+  function pauseFollow() {
+    if (stickToBottom) contentDirty = false; // 从贴底进入暂停：只统计此后的新内容
+    stickToBottom = false;
+    resumeArmed = false;
+    if (listEl) userStopDist = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight;
+    scheduleResume();
+  }
+  function scheduleResume() {
+    if (resumeTimer) clearTimeout(resumeTimer);
+    resumeTimer = setTimeout(tryResumeFollow, RESUME_IDLE_MS);
+  }
+  function tryResumeFollow() {
+    resumeTimer = null;
+    if (stickToBottom || !listEl) return;
+    const idle = performance.now() - lastUserScrollAt;
+    if (draggingScrollbar || idle < RESUME_IDLE_MS - 20) {
+      // 期间仍有滚动：从最后一次滚动起重新计时
+      resumeTimer = setTimeout(tryResumeFollow, Math.max(200, RESUME_IDLE_MS - idle));
+      return;
+    }
+    if (searchOpen) return; // 正在用 Ctrl+F 搜索：不打扰
+    if (newerHidden > 0) return; // 窗口下面还有未渲染的新消息：说明停在中部历史
+    if (userStopDist > listEl.clientHeight) return; // 停下时离底部超过一屏：在看较早的历史，保持不动
+    if (contentDirty) {
+      contentDirty = false;
+      stickToBottom = true; // 贴底 effect 随即置底
+    } else {
+      resumeArmed = true;
+    }
+  }
+  function noteUserScroll() {
+    lastUserScrollAt = performance.now();
+    if (!stickToBottom) scheduleResume();
+  }
+  function onMsgsWheel(e: WheelEvent) {
+    if (e.deltaY < 0 && listEl && listEl.scrollTop > 0) {
+      lastUserScrollAt = performance.now();
+      if (stickToBottom || resumeArmed) pauseFollow();
+      else scheduleResume();
+    } else if (e.deltaY !== 0) {
+      noteUserScroll();
+    }
+  }
+  function onMsgsPointerDown(e: PointerEvent) {
+    // 只认滚动条区域（点在 .msgs 自身、且位于内容宽度之外）
+    if (!listEl || e.target !== listEl || e.offsetX < listEl.clientWidth) return;
+    draggingScrollbar = true;
+    lastUserScrollAt = performance.now();
+    const up = () => {
+      draggingScrollbar = false;
+      noteUserScroll();
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+    };
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+  }
+  function onMsgsKeydown(e: KeyboardEvent) {
+    if (["PageUp", "PageDown", "ArrowUp", "ArrowDown", "Home", "End", " "].includes(e.key)) noteUserScroll();
+  }
   $effect(() => {
     const k = key;
     const n = items.length;
@@ -433,13 +571,29 @@ import type { DisplayItem } from "../state.svelte";
       lastKeyScrolled = k;
       lastRevSeen[k] = rev;
       stickToBottom = true;
+      untrack(() => resetFollowPause());
+      prevJump = null;
     } else if (rev !== (lastRevSeen[k] ?? 0)) {
       // 历史加载完成（或清空重开）：无条件定位到底部
       lastRevSeen[k] = rev;
       stickToBottom = true;
+      untrack(() => resetFollowPause());
+      prevJump = null;
     }
-    void n;
-    void tailLen;
+    // 用户上翻暂停期间的内容更新：3 秒缓冲已过且离底部不远（resumeArmed）→ 恢复贴底；
+    // 否则只记下「有新内容」，等缓冲结束时再决定
+    const contentChanged = n !== followSeenN || tailLen !== followSeenTail;
+    followSeenN = n;
+    followSeenTail = tailLen;
+    if (!stickToBottom && contentChanged) {
+      if (resumeArmed) {
+        resumeArmed = false;
+        contentDirty = false;
+        stickToBottom = true;
+      } else {
+        contentDirty = true;
+      }
+    }
     if (!stickToBottom || !listEl) return;
     scrollToBottom();
     // markdown/字体/图片异步撑高后再校准两次
@@ -481,12 +635,21 @@ import type { DisplayItem } from "../state.svelte";
     // 结果上翻进入占位区后再也不扩窗，视口停在大片空白里。
     const viewportChanged = listEl.clientHeight !== prevClientH;
     prevClientH = listEl.clientHeight;
-    // 1) 我们自己的程序滚动 echo（含 rAF 校准）一律忽略
-    if (now - lastProgScrollAt < 300) return;
+    // 1) 我们自己的程序滚动 echo（含 rAF 校准）忽略——但刚有真实滚动输入时不算回声：
+    //    流式输出期间程序置底极其频繁，旧逻辑会把用户的上滚也一并吞掉
+    const userActive = draggingScrollbar || now - lastUserScrollAt < 400;
+    if (draggingScrollbar) lastUserScrollAt = now;
+    if (!userActive && now - lastProgScrollAt < 300) return;
     // 2) 内容撑高/锚定只会让 scrollTop 增大或不变；只有用户向上滚才会让 scrollTop 减小
     const scrolledUp = listEl.scrollTop < prevScrollTop - 2;
     prevScrollTop = listEl.scrollTop;
-    if (scrolledUp) stickToBottom = false;
+    if (userActive || scrolledUp) userStopDist = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight;
+    if (scrolledUp) {
+      if (stickToBottom || resumeArmed) pauseFollow();
+      else scheduleResume();
+    } else if (userActive && !stickToBottom) {
+      scheduleResume();
+    }
     if (viewportChanged) return;
     if (scrolledUp) {
       if (startIdx > 0) {
@@ -497,7 +660,11 @@ import type { DisplayItem } from "../state.svelte";
       return;
     }
     const dist = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight;
-    if (dist < 60) stickToBottom = true;
+    if (dist < 60 && newerHidden === 0) {
+      // 用户自己滚回了底部：立即恢复贴底（无需等缓冲）
+      stickToBottom = true;
+      resetFollowPause();
+    }
     if (newerHidden > 0) {
       const b = lastRenderedBottom();
       if (b !== null && b < listEl.clientHeight - 240) void navigateBottomPadIfNeeded(); // 已深入底部占位区
@@ -874,6 +1041,11 @@ import type { DisplayItem } from "../state.svelte";
   let searchIdx = $state(-1);
 
   function onPageKeydown(e: KeyboardEvent) {
+    // 焦点在其它有自己查找功能的区域（如文件查看器，标记 data-find-scope）时不抢 Ctrl+F；
+    // 那边已 preventDefault/stopPropagation，这里再兜一层
+    if (e.defaultPrevented) return;
+    const scope = (e.target as Element | null)?.closest?.("[data-find-scope]");
+    if (scope && scope.getAttribute("data-find-scope") !== "chat") return;
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
       e.preventDefault();
       openSearch();
@@ -1076,7 +1248,7 @@ import type { DisplayItem } from "../state.svelte";
   const agentLabel = (a: string) => app.agents.find((x) => x.id === a)?.name ?? a;
 </script>
 
-<div class="chat">
+<div class="chat" data-find-scope="chat">
   <div class="session-bar">
     <div class="agents">
       {#each app.agents as a (a.id)}
@@ -1138,7 +1310,9 @@ import type { DisplayItem } from "../state.svelte";
 
   <div class="msgs-row">
     <ChatTimeline {items} onJump={(id) => void scrollToItem(id, "start")} />
-    <div class="msgs" bind:this={listEl} onscroll={onScroll}>
+    <!-- 键盘/滚轮/指针监听只用于识别「用户在滚动」（上翻缓冲），不是交互控件 -->
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <div class="msgs" bind:this={listEl} onscroll={onScroll} onwheel={onMsgsWheel} onpointerdown={onMsgsPointerDown} onkeydown={onMsgsKeydown} ontouchmove={noteUserScroll} role="log">
       <div class="msgs-inner" bind:this={msgsInnerEl}>
     {#if loadingHere && items.length === 0}
       <div class="chat-loading">
@@ -1186,7 +1360,7 @@ import type { DisplayItem } from "../state.svelte";
 
   <div class="composer">
     <button class="btn ghost sm up up-prev" title={t("定位上一条发出的消息")} onclick={jumpToPrevUserMessage}>↑</button>
-    <button class="btn ghost sm up" title={t("回到最新")} onclick={() => { stickToBottom = true; if (listEl) listEl.scrollTop = listEl.scrollHeight; }}>↓</button>
+    <button class="btn ghost sm up" title={t("回到最新")} onclick={() => { stickToBottom = true; resetFollowPause(); prevJump = null; if (listEl) listEl.scrollTop = listEl.scrollHeight; }}>↓</button>
     {#if pendingImages.length}
       <div class="thumbs">
         {#each pendingImages as img, i}
@@ -1387,6 +1561,10 @@ import type { DisplayItem } from "../state.svelte";
   .msgs-inner > div[id^="msg-"] {
     content-visibility: auto;
     contain-intrinsic-size: auto 120px;
+  }
+  /* 定位期间目标附近的条目强制排版（见 settleAround），让 auto 记住真实高度 */
+  .msgs-inner > div[id^="msg-"]:global(.cv-settle) {
+    content-visibility: visible;
   }
   .chat-search {
     display: flex;
