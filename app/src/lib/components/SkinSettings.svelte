@@ -5,6 +5,8 @@
   import { t } from "../i18n";
   import { confirmDialog } from "../dialog.svelte";
   import { builtinSkins, listSkins, skinOpacity, setSkinOpacity, type SkinManifest } from "../skins.svelte";
+  import { skinMotion, setSkinMotion, MOTION_LEVELS, type MotionLevel } from "../skin-fx/motion.svelte";
+  const motionLabel: Record<MotionLevel, string> = { full: "完整", lite: "轻量", off: "关闭" };
 
   const MAX_PACKAGE = 32 * 1024 * 1024; // 与 skins.rs 的 MAX_TOTAL 一致
 
@@ -210,6 +212,12 @@
       <input type="range" min="30" max="100" value={Math.round(skinOpacity.value * 100)} oninput={(e) => setSkinOpacity(Number((e.currentTarget as HTMLInputElement).value) / 100)} />
       <b>{Math.round(skinOpacity.value * 100)}%</b>
     </label>
+    <div class="skin-opacity-row" role="radiogroup" aria-label={t("皮肤动效")}>
+      <span>{t("皮肤动效（动态看板与全局特效；系统“减少动态效果”时自动降为轻量）")}</span>
+      {#each MOTION_LEVELS as lv}
+        <button class="skin-motion-btn" class:on={skinMotion.level === lv} role="radio" aria-checked={skinMotion.level === lv} onclick={() => setSkinMotion(lv)}>{t(motionLabel[lv])}</button>
+      {/each}
+    </div>
   {/if}
 </section>
 
@@ -239,6 +247,8 @@
   .skin-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 10px; }
   .skin-opacity-row { display: flex; align-items: center; gap: 8px; font-size: .86em; color: var(--text-dim); margin-top: 12px; }
   .skin-opacity-row input { flex: 1; max-width: 220px; accent-color: var(--accent); }
+  .skin-motion-btn { padding: 3px 10px; border-radius: 6px; border: 1px solid var(--border); background: transparent; color: var(--text-dim); cursor: pointer; }
+  .skin-motion-btn.on { border-color: var(--accent); color: var(--text); background: color-mix(in srgb, var(--accent) 16%, transparent); }
   .skin-opacity-row b { min-width: 38px; text-align: right; color: var(--text); }
   .skin-actions .linklike { color: var(--accent); font-size: .85em; background: none; border: none; padding: 0; cursor: pointer; }
   .skin-actions .linklike:hover { text-decoration: underline; }

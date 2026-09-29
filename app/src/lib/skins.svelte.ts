@@ -1,5 +1,9 @@
 import { api } from "./ipc";
 import { accentContrast } from "./theme";
+import { onSkinEvent } from "./skin-fx/bus";
+import { GlobalFx, sanitizeGlobalFx, type GlobalFxConfig } from "./skin-fx/global-fx";
+import { effectiveMotion } from "./skin-fx/motion.svelte";
+import { sanitizeScene, type SceneSpec } from "./skin-fx/scene";
 
 export interface SkinManifest {
   id: string;
@@ -9,11 +13,33 @@ export interface SkinManifest {
   character?: string;
   vars?: Record<string, string>;
   css?: string;
+  /** Layered character scene (dynamic board); see docs/skin-guide.md「动态看板」. */
+  scene?: unknown;
+  /** Full-window effect timelines bound to app events. */
+  globalFx?: unknown;
 }
 export const builtinSkins = [
   { id: "steins-gate", name: "命运石之门", en: "Steins;Gate", description: "琥珀暖光 · 复古实验室", descriptionEn: "Amber lab light · retro terminal", preview: "/skins/steins-gate/bg.png" },
   { id: "hell", name: "地狱乐", en: "Hell’s Paradise", description: "深红和风 · 山林薄雾", descriptionEn: "Crimson lacquer · mountain mist", preview: "/skins/hell/bg.png" },
 ];
+
+/**
+ * Dynamic board of the active skin. `SkinCharacter` renders it (WebGL) and falls back to the
+ * static character when it is null, when motion is off, or when rendering fails.
+ */
+export const dynamicSkin = $state({
+  id: "",
+  scene: null as SceneSpec | null,
+  urls: null as { body: string; mask: string; layers: string[] } | null,
+});
+
+let globalFx: GlobalFx | null = null;
+onSkinEvent((event) => globalFx?.handle(event));
+function startGlobalFx(config: GlobalFxConfig | null) {
+  globalFx?.dispose();
+  globalFx = config ? new GlobalFx(config, effectiveMotion) : null;
+}
+
 const colorVars = new Set(["--bg", "--bg-panel", "--bg-elev", "--bg-elev2", "--text", "--text-dim", "--text-faint", "--accent", "--accent-contrast", "--accent-soft", "--border", "--border-soft", "--code-bg", "--ok", "--warn", "--danger", "--scroll"]);
 const managed = new Set<string>();
 let generation = 0;
@@ -49,6 +75,8 @@ function clearSkin() {
   document.getElementById("skin-custom-css")?.remove();
   delete document.body.dataset.skin;
   delete document.body.dataset.skinCharacter;
+  startGlobalFx(null);
+  dynamicSkin.id = ""; dynamicSkin.scene = null; dynamicSkin.urls = null;
   for (const url of objectUrls.splice(0)) URL.revokeObjectURL(url);
   // Keep --skin-opacity: the user preference outlives skin switches.
 }
@@ -107,13 +135,21 @@ export function activateSkin(id: string, onError: (message: string) => void): ()
         const manifest = (await listSkins()).find((s) => s.id === id);
         if (!manifest) throw new Error("Skin is no longer installed");
         const css = manifest.css ? scopeSkinCss(manifest.css, id) : "";
-        const [background, character] = await Promise.all([
+        const scene = manifest.scene === undefined ? null : sanitizeScene(manifest.scene);
+        if (manifest.scene !== undefined && !scene) console.warn("[skin] scene ignored: invalid description");
+        const fx = manifest.globalFx === undefined ? null : sanitizeGlobalFx(manifest.globalFx);
+        const [background, character, sceneUrls] = await Promise.all([
           manifest.background ? assetUrl(manifest.dir, manifest.background) : "",
           manifest.character ? assetUrl(manifest.dir, manifest.character) : "",
+          scene ? Promise.all([
+            assetUrl(manifest.dir, scene.body.src),
+            assetUrl(manifest.dir, scene.mask),
+            Promise.all(scene.layers.map((l) => assetUrl(manifest.dir, l.src))),
+          ]) : null,
         ]);
         if (version !== generation) {
           // a newer activation won: free the bitmaps we just created
-          for (const url of [background, character]) {
+          for (const url of [background, character, ...(sceneUrls ? [sceneUrls[0], sceneUrls[1], ...sceneUrls[2]] : [])]) {
             if (!url) continue;
             URL.revokeObjectURL(url);
             const i = objectUrls.indexOf(url);
@@ -135,6 +171,13 @@ export function activateSkin(id: string, onError: (message: string) => void): ()
           style.textContent = css;
           document.head.appendChild(style);
         }
+        if (scene && sceneUrls) {
+          dynamicSkin.urls = { body: sceneUrls[0], mask: sceneUrls[1], layers: sceneUrls[2] };
+          dynamicSkin.scene = scene;
+          dynamicSkin.id = id;
+          document.body.dataset.skinCharacter = "true";
+        }
+        startGlobalFx(fx);
         document.body.dataset.skin = id;
       } catch (error) {
         if (version === generation) { clearSkin(); onError(String(error)); }

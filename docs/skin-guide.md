@@ -91,3 +91,66 @@
 ```
 
 请遵守各皮肤素材的版权许可；人物立绘等素材请使用你有权分发的文件。
+
+## 动态皮肤（scene / globalFx）
+
+v0.3.18 起 `skin.json` 可声明两个可选块，**都是纯数据，皮肤包里不允许任何脚本**：
+
+### `scene`：分层动态看板
+
+替代左下角静态人物图：身体网格按遮罩飘动（头发 / 衣摆 / 呼吸），自动眨眼、视线跟随鼠标，并在事件时切换表情。
+
+```json
+"scene": {
+  "body": { "src": "body.png", "size": [768, 1376], "grid": [40, 72] },
+  "mask": "mask.png",
+  "pivot": { "neck": [370, 330], "chest": [400, 480] },
+  "layers": [
+    { "id": "closed", "src": "face_closed.png", "rect": [266,146,194,172], "bind": "blink" },
+    { "id": "talk",   "src": "face_talk.png",   "rect": [266,126,168,193], "bind": "talk" }
+  ],
+  "idle":  { "wind": 1, "breath": 1, "blink": { "every": [2, 6], "double": 0.15 }, "gaze": { "maxRot": 0.045 } },
+  "clips": {
+    "talk":  { "dur": 2400, "keys": { "talk": "flap(100..170)" } },
+    "smug":  { "dur": 1700, "keys": { "smug": [[0,0],[150,1],[1400,1],[1700,0]], "nod": [[0,0],[180,1],[520,0]] } }
+  },
+  "on": { "message.send": "smug", "agent.streaming": "talk" }
+}
+```
+
+- `size`：坐标系（设计尺寸）；`rect` 与 `pivot` 都用这个坐标。贴图实际像素可以更小，按比例采样。
+- `mask.png`：R = 头发风力、G = 衣摆风力、B = 呼吸、A = 头部跟随。
+- `layers`：表情补丁，`bind` 为参数名，参数 0→1 控制不透明度（`slide` 可选位移）。
+- 内置参数：`blink`（自动眨眼驱动）、`nod`、`jolt`、`blinkHold`（>0.3 时暂停眨眼）。
+- `clips.keys`：`[[毫秒, 值]]` 关键帧（值 -1..1），或 `"flap(最短..最长)"` 口型开合。
+- 事件：`message.send`、`agent.streaming`（回复开始，flap 片段会持续到 `agent.done`）、`agent.done`、`agent.error`、`skin.enter`。
+- 上限：图层 16、片段 16、贴图单张 8 MiB / 总计 32 MiB。所有被引用文件必须在包内且是真实图片。
+- **贴图尺寸**：按显示尺寸的 1.2–1.5 倍出图（看板约 300×540 CSS 像素 → body 约 450×800 即可）；不生成 mipmap，过大反而发糊、占显存。
+- 可用 `tools/make_scene.py`（动态皮肤工具包）从一张立绘 + 表情图生成 mask 与 scene.json。
+
+### `globalFx`：全局特效
+
+```json
+"globalFx": {
+  "presets": { "frost": [ { "at": 0, "fx": "vignette", "color": "#7fc4ff", "opacity": 0.35, "dur": 900 } ] },
+  "on": { "agent.done": "frost" }
+}
+```
+
+原语：`shake`、`flash`、`slices`、`rgbSplit`、`hueShift`、`vignette`、`overlayText`。**引擎不内置任何预设**，`on` 只能引用本皮肤 `presets` 里定义的名字。例如“世界线跳跃”：
+
+```json
+"worldline": [
+  { "at": 0, "fx": "slices", "n": 9, "dur": 1100, "color": "#ffb347" },
+  { "at": 0, "fx": "rgbSplit", "px": 7, "dur": 1100 },
+  { "at": 0, "fx": "shake", "px": 6, "dur": 1100, "steps": true },
+  { "at": 0, "fx": "overlayText", "style": "nixie", "roll": 1100, "dur": 2600 },
+  { "at": 1100, "fx": "flash", "color": "#ffb347", "opacity": 0.28, "dur": 300 }
+]
+```
+
+每个预设 ≤16 步、`at` ≤2000ms；同一预设 1.2s 冷却，闪光每秒最多 3 次。
+
+### 动效档位
+
+设置 → 皮肤插件 → 皮肤动效：**完整 / 轻量 / 关闭**。轻量：关闭飘动与呼吸（仍眨眼/换表情），全局特效只保留 `vignette`、`overlayText`；系统开启“减少动态效果”时完整自动降为轻量。关闭或 WebGL 不可用时看板回退为 `body` 静态图。窗口隐藏时暂停渲染。

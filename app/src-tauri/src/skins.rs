@@ -144,9 +144,83 @@ fn parse_manifest(bytes: &[u8]) -> Result<Value, String> {
             return Err("皮肤变量无效或过多".into());
         }
     }
+    if let Some(scene) = obj.get("scene") {
+        validate_scene(scene)?;
+    }
+    if let Some(fx) = obj.get("globalFx") {
+        if !fx.is_object() {
+            return Err("globalFx 必须是对象".into());
+        }
+    }
     obj.remove("dir");
     Ok(value)
 }
+
+const MAX_SCENE_LAYERS: usize = 16;
+
+/// Dynamic scene (layered character renderer). Only file references are checked here: numeric
+/// parameters, clips and event bindings are clamped/whitelisted by the frontend, which never
+/// executes skin-provided code.
+fn validate_scene(scene: &Value) -> Result<(), String> {
+    let obj = scene.as_object().ok_or("scene 必须是对象")?;
+    let body = obj
+        .get("body")
+        .and_then(Value::as_object)
+        .ok_or("scene.body 缺失")?;
+    safe_relative(
+        body.get("src")
+            .and_then(Value::as_str)
+            .ok_or("scene.body.src 缺失")?,
+    )?;
+    safe_relative(
+        obj.get("mask")
+            .and_then(Value::as_str)
+            .ok_or("scene.mask 缺失")?,
+    )?;
+    if let Some(layers) = obj.get("layers") {
+        let layers = layers.as_array().ok_or("scene.layers 必须是数组")?;
+        if layers.len() > MAX_SCENE_LAYERS {
+            return Err("scene.layers 过多（最多 16 个）".into());
+        }
+        for layer in layers {
+            safe_relative(
+                layer
+                    .get("src")
+                    .and_then(Value::as_str)
+                    .ok_or("scene.layers[].src 缺失")?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Every image file a manifest may reference. Only these can be read back through
+/// `asset_bytes`, and all of them must exist (and be real images) at import time.
+fn declared_assets(manifest: &Value) -> Vec<String> {
+    let mut files = Vec::new();
+    for key in ["background", "character"] {
+        if let Some(name) = manifest[key].as_str() {
+            files.push(name.to_string());
+        }
+    }
+    let scene = &manifest["scene"];
+    for name in [scene["body"]["src"].as_str(), scene["mask"].as_str()]
+        .into_iter()
+        .flatten()
+    {
+        files.push(name.to_string());
+    }
+    if let Some(layers) = scene["layers"].as_array() {
+        files.extend(
+            layers
+                .iter()
+                .filter_map(|l| l["src"].as_str())
+                .map(str::to_string),
+        );
+    }
+    files
+}
+
 fn installed_dir(root: &Path, requested: &str) -> Result<PathBuf, String> {
     no_link(root)?;
     let root = fs::canonicalize(root).map_err(|e| e.to_string())?;
@@ -289,15 +363,13 @@ fn import_reader<R: Read + std::io::Seek>(root: &Path, input: R, len: u64) -> Re
         }
         files.push((rel, bytes));
     }
-    for key in ["background", "character"] {
-        if let Some(name) = manifest[key].as_str() {
-            let rel = safe_relative(name)?;
-            let (_, bytes) = files
-                .iter()
-                .find(|(p, _)| *p == rel)
-                .ok_or("皮肤引用的图片不存在")?;
-            image_mime(&rel, bytes)?;
-        }
+    for name in declared_assets(&manifest) {
+        let rel = safe_relative(&name)?;
+        let (_, bytes) = files
+            .iter()
+            .find(|(p, _)| *p == rel)
+            .ok_or("皮肤引用的图片不存在")?;
+        image_mime(&rel, bytes)?;
     }
     fs::create_dir_all(root).map_err(|e| e.to_string())?;
     no_link(root)?;
@@ -374,10 +446,7 @@ pub fn asset_bytes(root: &Path, requested: &str, file: &str) -> Result<(&'static
     if manifest["id"].as_str() != dir.file_name().and_then(|s| s.to_str()) {
         return Err("皮肤标识不匹配".into());
     }
-    if !["background", "character"]
-        .iter()
-        .any(|key| manifest[*key].as_str() == Some(file))
-    {
+    if !declared_assets(&manifest).iter().any(|name| name == file) {
         return Err("仅可读取 skin.json 声明的图片".into());
     }
     let path = contained_file(&dir, file)?;
@@ -609,6 +678,41 @@ mod tests {
         zip.finish().unwrap();
         assert!(import(&root, &path).is_err());
         assert!(!root.exists());
+    }
+    #[test]
+    fn scene_assets_are_declared_validated_and_readable() {
+        let tmp = Temp::new();
+        let root = tmp.0.join("skins");
+        let png = b"\x89PNG\r\n\x1a\nexample";
+        let manifest = br##"{"id":"dyn","scene":{"body":{"src":"scene/body.png"},"mask":"scene/mask.png","layers":[{"src":"scene/face_a.png"}]},"globalFx":{"on":{}}}"##;
+        let zip = package(&tmp.0, &[("skin.json", manifest), ("scene/body.png", png), ("scene/mask.png", png), ("scene/face_a.png", png), ("scene/extra.png", png)]);
+        import(&root, &zip).unwrap();
+        for file in ["scene/body.png", "scene/mask.png", "scene/face_a.png"] {
+            assert!(asset_bytes(&root, "dyn", file).is_ok(), "{file}");
+        }
+        // present in the package but not referenced by the manifest: not readable
+        assert!(asset_bytes(&root, "dyn", "scene/extra.png").is_err());
+    }
+    #[test]
+    fn rejects_invalid_scene_manifests_without_installing() {
+        let tmp = Temp::new();
+        let root = tmp.0.join("skins");
+        let png = b"\x89PNG\r\n\x1a\nexample";
+        let many: String = (0..17).map(|_| r#"{"src":"b.png"}"#).collect::<Vec<_>>().join(",");
+        let too_many = format!(r#"{{"id":"dyn","scene":{{"body":{{"src":"b.png"}},"mask":"b.png","layers":[{many}]}}}}"#);
+        for manifest in [
+            br#"{"id":"dyn","scene":{"mask":"b.png"}}"#.to_vec(),
+            br#"{"id":"dyn","scene":{"body":{"src":"b.png"}}}"#.to_vec(),
+            br#"{"id":"dyn","scene":{"body":{"src":"../b.png"},"mask":"b.png"}}"#.to_vec(),
+            br#"{"id":"dyn","scene":{"body":{"src":"b.png"},"mask":"missing.png"}}"#.to_vec(),
+            br#"{"id":"dyn","scene":{"body":{"src":"b.png"},"mask":"b.png","layers":[{"src":"x.css"}]}}"#.to_vec(),
+            br#"{"id":"dyn","globalFx":"worldline"}"#.to_vec(),
+            too_many.into_bytes(),
+        ] {
+            let zip = package(&tmp.0, &[("skin.json", manifest.as_slice()), ("b.png", png), ("x.css", b"a{}")]);
+            assert!(import(&root, &zip).is_err(), "{}", String::from_utf8_lossy(&manifest));
+            assert!(!root.exists());
+        }
     }
     #[test]
     fn base64_padding() {

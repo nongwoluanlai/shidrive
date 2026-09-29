@@ -14,4 +14,9 @@ export const skinEn: Record<string, string> = {
   "正在导入…": "Importing…",
   "导入皮肤包（zip）": "Import skin (ZIP)",
   "皮肤开发指南": "Skin author guide",
+  "皮肤动效": "Skin motion",
+  "皮肤动效（动态看板与全局特效；系统“减少动态效果”时自动降为轻量）": "Skin motion (animated character & global effects; drops to Lite when the OS requests reduced motion)",
+  "完整": "Full",
+  "轻量": "Lite",
+  "关闭": "Off",
 };

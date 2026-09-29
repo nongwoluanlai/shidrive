@@ -3,6 +3,7 @@
   import { app, chatKey, currentContext, finishTurn, setChatRows, pushLocal, toast, clearChat, sharedContextPrompt, switchAgent, loadChatLocal, saveCfgPref, fullAccessDefault, touchChat, nextId, adoptBinding, invalidateBindingRead, addDraftImage, clearDraftImages } from "../state.svelte";
 import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { api } from "../ipc";
+  import { emitSkinEvent } from "../skin-fx/bus";
   import MessageItem from "./MessageItem.svelte";
   import { t } from "../i18n";
   import ContextMenu from "./ContextMenu.svelte";
@@ -817,13 +818,17 @@ import type { DisplayItem } from "../state.svelte";
     app.promptRequests[turnKey] = requestId;
     app.pendingMessage[turnKey] = pushLocal(turnKey, { kind: "user", text: text + (imgs.length ? `\n\n[图片 ×${imgs.length}]` : "") });
     app.streaming[turnKey] = true;
+    emitSkinEvent("message.send");
     try {
       const res = await api.acpPrompt(turnCtx, turnAgent, text, imgs, requestId);
       const stop = res?.stopReason ?? "end_turn";
       if (stop !== "end_turn" && key === turnKey) toast("info", t("回合结束（{reason}）", { reason: String(stop) }));
     } catch (e) {
       // A late error from an old request must not pollute a replacement session.
-      if (app.promptRequests[turnKey] === requestId) pushLocal(turnKey, { kind: "error", text: String(e) });
+      if (app.promptRequests[turnKey] === requestId) {
+        pushLocal(turnKey, { kind: "error", text: String(e) });
+        if (key === turnKey) emitSkinEvent("agent.error");
+      }
     } finally {
       // A started turn is completed by its matching status event; do not discard
       // queued final chunks just because the invoke promise resolved first.

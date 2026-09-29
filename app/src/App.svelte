@@ -4,6 +4,7 @@
   import { api } from "./lib/ipc";
   import { applyTheme } from "./lib/theme";
   import { activateSkin, loadSkinOpacity } from "./lib/skins.svelte";
+  import { loadSkinMotion } from "./lib/skin-fx/motion.svelte";
   import { toast as skinToast } from "./lib/state.svelte";
   import { wireEvents } from "./lib/events";
   import TitleBar from "./lib/components/TitleBar.svelte";
@@ -94,7 +95,7 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
     if (locale === "en" || locale === "zh") app.locale = locale;
     const skin = await api.settingsGet("ui.skin").catch(() => null);
     app.skin = skin ?? "";
-    await loadSkinOpacity();
+    await loadSkinOpacity(); void loadSkinMotion();
     // 加载启用的 agent（顺序即会话页 tab 顺序）与缓存能力
     const enabled = await api.agentsEnabledGet().catch(() => [] as string[]);
     const reg = await api.agentsRegistry().catch(() => []);

@@ -15,6 +15,7 @@ import type {
 } from "./types";
 import { api } from "./ipc";
 import { applyTheme } from "./theme";
+import { emitSkinEvent } from "./skin-fx/bus";
 
 export type Tab = "chat" | "context" | "workflows";
 
@@ -476,6 +477,7 @@ export function applySessionUpdate(agentType: AgentType, contextId: string | nul
       let last = list[list.length - 1];
       if (!last || last.kind !== "assistant" || !last.streaming) {
         list.push({ id: nextId(), kind: "assistant", text: "", streaming: true });
+        if (key === chatKey(app.contextId, app.agent)) emitSkinEvent("agent.streaming");
         last = list[list.length - 1];
       }
       last.text += t;
@@ -549,7 +551,9 @@ export function finishTurn(agentType: AgentType, contextId: string | null, reque
   if (requestId && app.promptRequests[key] !== requestId) return;
   const list = app.chat[key];
   if (list) for (const it of list) it.streaming = false;
+  const wasStreaming = !!app.streaming[key];
   app.streaming[key] = false;
+  if (wasStreaming && key === chatKey(app.contextId, app.agent)) emitSkinEvent("agent.done");
   delete app.promptRequests[key];
   delete app.pendingMessage[key];
   delete app.activeTurn[key];
