@@ -16,7 +16,15 @@ import type { DisplayItem } from "../state.svelte";
   let stickToBottom = $state(true);
 
   const ctx = $derived(currentContext());
-  const key = $derived(chatKey(ctx?.id ?? null, app.agent));
+  // $effect + $state 形式（$derived 在此组件内对 app.agent 的追踪不可靠——
+  // 函数调用/模板字符串内的 proxy 读取在 Svelte 5 runes 模式下可能不触发失效）。
+  // effect 显式读取两个依赖并写入 key，确保切换必然更新。
+  let key = $state("");
+  $effect(() => {
+    const ctxId = ctx?.id ?? null;
+    const agent = app.agent;
+    key = `${ctxId}:${agent}`;
+  });
   /** Attachments share the text draft identity. */
   const pendingImages = $derived(app.draftImages[key] ?? []);
   // 按会话记录“正在发送”，而不是整个组件一个开关：某个会话的回合进行中不应锁住其他会话。
@@ -423,6 +431,12 @@ import type { DisplayItem } from "../state.svelte";
       stickToBottom = true;
       input = app.drafts[k] ?? "";
       touchChat(k);
+      // 显式初始化新 key 的 chat 数组：Svelte 5 的动态属性访问
+      // (app.chat[key]) 在 key 变化时可能不触发 $derived 失效——
+      // 写入空数组强制 items 重算，清掉上一个 key 的残留渲染
+      if (!app.chat[k]) app.chat[k] = [];
+      endIdx = Math.min(app.chat[k].length, CHUNK);
+      startIdx = 0;
       app.chatLoadId[k] = loadId;
       app.chatLoading[k] = true;
       const revision = app.bindingRev[k] ?? 0;
@@ -1323,7 +1337,8 @@ import type { DisplayItem } from "../state.svelte";
     <!-- 键盘/滚轮/指针监听只用于识别「用户在滚动」（上翻缓冲），不是交互控件 -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div class="msgs" bind:this={listEl} onscroll={onScroll} onwheel={onMsgsWheel} onpointerdown={onMsgsPointerDown} onkeydown={onMsgsKeydown} ontouchmove={noteUserScroll} role="log">
-      <div class="msgs-inner" bind:this={msgsInnerEl}>
+      {#key key}
+      <div class="msgs-inner" bind:this={msgsInnerEl} data-key={key}>
     {#if loadingHere && items.length === 0}
       <div class="chat-loading">
         <span class="chat-spinner"></span>
@@ -1368,6 +1383,7 @@ import type { DisplayItem } from "../state.svelte";
       {/if}
     {/if}
       </div>
+      {/key}
     </div>
   </div>
 
