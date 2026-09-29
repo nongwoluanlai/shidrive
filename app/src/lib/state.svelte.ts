@@ -398,6 +398,8 @@ export function touchChat(key: string) {
     delete app.bindingTitleMap[k];
     delete app.chatLoading[k];
     delete app.streaming[k];
+    delete app.sessionOccupied[k];
+    delete app.chatLoadId[k];
     chatLru.splice(j, 1);
   }
 }

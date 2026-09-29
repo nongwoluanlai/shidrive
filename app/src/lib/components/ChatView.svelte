@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick, untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import { app, chatKey, currentContext, finishTurn, setChatRows, pushLocal, toast, clearChat, sharedContextPrompt, switchAgent, loadChatLocal, saveCfgPref, fullAccessDefault, touchChat, nextId, adoptBinding, invalidateBindingRead, addDraftImage, clearDraftImages } from "../state.svelte";
 import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { api } from "../ipc";
@@ -16,15 +16,10 @@ import type { DisplayItem } from "../state.svelte";
   let stickToBottom = $state(true);
 
   const ctx = $derived(currentContext());
-  // $effect + $state 形式（$derived 在此组件内对 app.agent 的追踪不可靠——
-  // 函数调用/模板字符串内的 proxy 读取在 Svelte 5 runes 模式下可能不触发失效）。
-  // effect 显式读取两个依赖并写入 key，确保切换必然更新。
-  let key = $state("");
-  $effect(() => {
-    const ctxId = ctx?.id ?? null;
-    const agent = app.agent;
-    key = `${ctxId}:${agent}`;
-  });
+  // 会话身份：上下文 + 适配器。
+  // 注：此前「切 agent 后 key 不变」的现象并非 $derived 失效，而是切换那一帧
+  // 滑窗索引仍停留在旧会话（startIdx>0），topPad 遍历新 items 越界抛错中断了渲染。
+  const key = $derived(chatKey(ctx?.id ?? null, app.agent));
   /** Attachments share the text draft identity. */
   const pendingImages = $derived(app.draftImages[key] ?? []);
   // 按会话记录“正在发送”，而不是整个组件一个开关：某个会话的回合进行中不应锁住其他会话。
@@ -39,6 +34,21 @@ import type { DisplayItem } from "../state.svelte";
   const MAX_RENDER = 240;
   let startIdx = $state(0);
   let endIdx = $state(0);
+  // 会话切换时在渲染「之前」同步复位滑窗：旧会话的 startIdx/endIdx 不能带到新 items 上
+  // （长会话 startIdx 可达数千，新会话可能为空 → 占位计算越界抛错、整轮渲染中断）。
+  // 加载 effect 属于普通 $effect，晚于模板更新执行，来不及。
+  let windowKey = "";
+  $effect.pre(() => {
+    const k = key;
+    if (k === windowKey) return;
+    windowKey = k;
+    untrack(() => {
+      const n = app.chat[k]?.length ?? 0;
+      endIdx = Math.min(n, CHUNK);
+      startIdx = 0;
+      if (n > CHUNK) { endIdx = n; startIdx = Math.max(0, n - CHUNK); }
+    });
+  });
   const shownItems = $derived(items.slice(startIdx, endIdx));
   const olderCount = $derived(startIdx);
   const newerHidden = $derived(Math.max(0, items.length - endIdx));
@@ -55,8 +65,9 @@ import type { DisplayItem } from "../state.svelte";
     const base = it.kind === "user" ? 84 : it.kind === "error" ? 76 : 72;
     return Math.min(base + Math.round((it.text?.length ?? 0) * 0.28), 2600);
   }
-  function hOf(it: DisplayItem): number {
+  function hOf(it: DisplayItem | undefined): number {
     void hVersion;
+    if (!it) return 0; // 防御：索引越界不应中断渲染
     return hMap.get(it.id) ?? estHeight(it);
   }
   // 窗口外占位高度（保持滚动条长度与位置大致成比例）
@@ -81,14 +92,16 @@ import type { DisplayItem } from "../state.svelte";
     }
     if (padCache.start < 0 || padCache.start > startIdx) {
       let sum = 0;
-      for (let i = 0; i < startIdx; i++) sum += hOf(items[i]);
+      const lim = Math.min(startIdx, items.length);
+      for (let i = 0; i < lim; i++) sum += hOf(items[i]);
       padCache.top = sum; padCache.start = startIdx;
     } else if (padCache.start < startIdx) {
       // 窗口下滑（贴底流式回收顶部 / 向下跳转 / 下探扩窗）：从窗口顶端离场的条目
       // 并入顶部占位，高度要「加」上去。v0.3.9 这里写成了减——长会话流式一段时间后
       // 顶部占位被扣成负数、钳到 0：上方明明还有成百上千条，滚动条却显示已到顶，
       // 上翻立刻撞到 scrollTop=0，搜索/时间轴按占位算出的落点也随之失真。
-      for (let i = padCache.start; i < startIdx; i++) padCache.top += hOf(items[i]);
+      const lim = Math.min(startIdx, items.length);
+      for (let i = padCache.start; i < lim; i++) padCache.top += hOf(items[i]);
       padCache.start = startIdx;
     }
     return Math.max(0, padCache.top);
@@ -439,12 +452,19 @@ import type { DisplayItem } from "../state.svelte";
       startIdx = 0;
       app.chatLoadId[k] = loadId;
       app.chatLoading[k] = true;
-      const revision = app.bindingRev[k] ?? 0;
       const valid = () => !cancelled && app.chatLoadId[k] === loadId;
       void (async () => {
         try {
-          const b = await api.bindingGet(ctxId, agent);
-          if (!valid() || (app.bindingRev[k] ?? 0) !== revision) return;
+          // 读取期间绑定被并发改写（session-ready/重绑）时重读，而不是直接放弃——
+          // 否则界面会停在「未绑定会话」且不加载历史
+          let b: Awaited<ReturnType<typeof api.bindingGet>> = null;
+          for (let attempt = 0; ; attempt++) {
+            const revision = app.bindingRev[k] ?? 0;
+            b = await api.bindingGet(ctxId, agent);
+            if (!valid()) return;
+            if ((app.bindingRev[k] ?? 0) === revision) break;
+            if (attempt >= 2) return;
+          }
           const sid = b?.session_id ?? null;
           adoptBinding(k, sid);
           app.bindingTitleMap[k] = b?.title ?? null;
@@ -734,11 +754,14 @@ import type { DisplayItem } from "../state.svelte";
 
   // 内容高度一变（历史重放渲染完成、流式追加、图片/字体加载）即贴底：
   // Markdown 渲染晚于滚动赋值时，仅靠 effect/rAF 会停在半空。
-  onMount(() => {
+  // 跟随元素本身：元素被重建时自动改观察新节点
+  $effect(() => {
+    const el = msgsInnerEl;
+    if (!el) return;
     const ro = new ResizeObserver(() => {
       if (stickToBottom && listEl) scrollToBottom();
     });
-    if (msgsInnerEl) ro.observe(msgsInnerEl);
+    ro.observe(el);
     return () => ro.disconnect();
   });
 
@@ -1309,6 +1332,8 @@ import type { DisplayItem } from "../state.svelte";
             }
           }}
         >✏️</button>
+      {:else if loadingHere && app.bindingSession[key] === undefined}
+        <span class="badge">{t("读取绑定…")}</span>
       {:else}
         <span class="badge">{t("未绑定会话")}</span>
       {/if}
@@ -1337,8 +1362,7 @@ import type { DisplayItem } from "../state.svelte";
     <!-- 键盘/滚轮/指针监听只用于识别「用户在滚动」（上翻缓冲），不是交互控件 -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div class="msgs" bind:this={listEl} onscroll={onScroll} onwheel={onMsgsWheel} onpointerdown={onMsgsPointerDown} onkeydown={onMsgsKeydown} ontouchmove={noteUserScroll} role="log">
-      {#key key}
-      <div class="msgs-inner" bind:this={msgsInnerEl} data-key={key}>
+      <div class="msgs-inner" bind:this={msgsInnerEl}>
     {#if loadingHere && items.length === 0}
       <div class="chat-loading">
         <span class="chat-spinner"></span>
@@ -1383,7 +1407,6 @@ import type { DisplayItem } from "../state.svelte";
       {/if}
     {/if}
       </div>
-      {/key}
     </div>
   </div>
 
