@@ -63,15 +63,15 @@ export const api = {
   acpStatus: (agent_type: string) => invoke<string>("acp_status", { agentType: agent_type }),
   acpConnect: (agent_type: string) => invoke<unknown>("acp_connect", { agentType: agent_type }),
   acpDisconnect: (agent_type: string) => invoke<void>("acp_disconnect", { agentType: agent_type }),
-  acpSessionNew: (context: Context, agent_type: string) => invoke<string>("acp_session_new", { context, agentType: agent_type }),
+  acpSessionNew: (context: Context, agent_type: string, fresh = false) => invoke<string>("acp_session_new", { context, agentType: agent_type, fresh }),
   acpDeepseekNew: (context: Context) => invoke<string>("acp_deepseek_new", { context }),
-  acpPrompt: (context: Context, agent_type: string, text: string, images?: { data: string; mime: string }[]) =>
-    invoke<{ stopReason?: string }>("acp_prompt", { context, agentType: agent_type, text, images: images ?? [] }),
+  acpPrompt: (context: Context, agent_type: string, text: string, images?: { data: string; mime: string }[], requestId?: string) =>
+    invoke<{ stopReason?: string }>("acp_prompt", { context, agentType: agent_type, text, images: images ?? [], requestId }),
   acpCancel: (context_id: string, agent_type: string) => invoke<void>("acp_cancel", { contextId: context_id, agentType: agent_type }),
   acpSetMode: (context_id: string, agent_type: string, mode_id: string) =>
     invoke<void>("acp_set_mode", { contextId: context_id, agentType: agent_type, modeId: mode_id }),
-  acpSetConfigOption: (context_id: string, agent_type: string, option_id: string, value: unknown) =>
-    invoke<void>("acp_set_config_option", { contextId: context_id, agentType: agent_type, optionId: option_id, value }),
+  acpSetConfigOption: (context_id: string, agent_type: string, option_id: string, value: unknown, expectedSessionId?: string) =>
+    invoke<void>("acp_set_config_option", { contextId: context_id, agentType: agent_type, optionId: option_id, value, expectedSessionId }),
   acpRespondElicitation: (request_id: string, response: unknown) =>
     invoke<void>("acp_respond_elicitation", { requestId: request_id, response }),
   acpRespondPermission: (request_id: string, option_id: string) =>

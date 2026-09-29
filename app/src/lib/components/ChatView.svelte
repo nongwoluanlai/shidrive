@@ -1,24 +1,24 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
-  import { app, chatKey, currentContext, finishTurn, setChatRows, pushLocal, toast, clearChat, sharedContextPrompt, switchAgent, loadChatLocal, saveCfgPref, fullAccessDefault, touchChat } from "../state.svelte";
+  import { app, chatKey, currentContext, finishTurn, setChatRows, pushLocal, toast, clearChat, sharedContextPrompt, switchAgent, loadChatLocal, saveCfgPref, fullAccessDefault, touchChat, nextId, adoptBinding, invalidateBindingRead, addDraftImage, clearDraftImages } from "../state.svelte";
 import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { api } from "../ipc";
   import MessageItem from "./MessageItem.svelte";
   import { t } from "../i18n";
   import ContextMenu from "./ContextMenu.svelte";
   import ChatTimeline from "./ChatTimeline.svelte";
-  import type { AgentType, SessionReadyInfo } from "../types";
+  import type { AgentType, Context, SessionReadyInfo } from "../types";
 import type { DisplayItem } from "../state.svelte";
 
   let input = $state("");
   let listEl: HTMLDivElement | undefined = $state();
   let msgsInnerEl: HTMLDivElement | undefined = $state();
   let stickToBottom = $state(true);
-  /** queued image attachments (base64 + data-url preview) */
-  let pendingImages = $state<{ data: string; mime: string; preview: string }[]>([]);
 
   const ctx = $derived(currentContext());
   const key = $derived(chatKey(ctx?.id ?? null, app.agent));
+  /** Attachments share the text draft identity. */
+  const pendingImages = $derived(app.draftImages[key] ?? []);
   // 按会话记录“正在发送”，而不是整个组件一个开关：某个会话的回合进行中不应锁住其他会话。
   const sending = $derived(app.streaming[key] ?? false);
   const items = $derived(app.chat[key] ?? []);
@@ -398,7 +398,7 @@ import type { DisplayItem } from "../state.svelte";
     if (ok && listEl && prevJump?.id === id) prevJump = { id, top: listEl.scrollTop };
   }
   const sessionId = $derived(app.bindingSession[key] ?? null);
-  let bindingTitle = $state<string | null>(null);
+  const bindingTitle = $derived(app.bindingTitleMap[key] ?? null);
 
   const sessionInfo = $derived(app.sessionInfo[key] ?? null);
   const models = $derived(sessionInfo?.response?.models?.availableModels ?? []);
@@ -406,58 +406,71 @@ import type { DisplayItem } from "../state.svelte";
   const status = $derived(app.agentStatus[app.agent]);
   const streaming = $derived(app.streaming[key] ?? false);
   const loadingHere = $derived(app.chatLoading[key] ?? false);
+  const sessionBusy = $derived(app.sessionBusy[key] ?? false);
+  const sessionOccupied = $derived(app.sessionOccupied[key] ?? false);
 
-  // 从绑定的 ACP 会话重放历史（不读本地库）。适配器冷启动 + session/load
-  // 可能要几秒，期间显示忙碌动画。
-  async function refreshFromAdapter(ctxId: string, agent: AgentType, sessionId: string, title?: string) {
-    const k = chatKey(ctxId, agent);
-    if (app.streaming[k]) return;
-    app.chatLoading[k] = true;
-    try {
-      const rows = await api.acpSessionBind(ctx!, agent, sessionId, title, true);
-      // 用户可能已切走：只把结果写回仍在查看的会话
-      if (app.contextId === ctxId && app.agent === agent) {
-        // 空结果说明该会话已在本连接加载过（内存即最新），不要清空现有内容
-        if (rows.length || !app.chat[k]?.length) setChatRows(k, rows);
-      }
-    } catch {
-      // 静默刷新失败不打扰（未连接适配器/加载失败时界面保持空白态）
-    } finally {
-      app.chatLoading[k] = false;
-    }
-  }
-
-  // seed the bound session id whenever context or agent changes
+  // Only session identity is reactive here. Draft keystrokes must not reload
+  // the transcript or reset scroll following. All async work uses captured data.
   $effect(() => {
     const ctxId = ctx?.id;
     const agent = app.agent;
-    if (!ctxId) return;
-    stickToBottom = true; // 切换会话后回到贴底状态
-    input = app.drafts[chatKey(ctxId, agent)] ?? ""; // 恢复该会话未发送草稿
-    void (async () => {
-      try {
-        const k = chatKey(ctxId, agent);
-        // 记录“正在查看”，并把久未查看的其它会话从内存中释放（本地库仍有快照）
-        untrack(() => touchChat(k));
-        // 先读本地快照，立即渲染（不等适配器）；本地为空时保持旧行为
-        const local = await loadChatLocal(k);
-        if (local && !app.chat[k]?.length && app.contextId === ctxId && app.agent === agent) {
-          app.chat[k] = local;
-          app.chatRev[k] = (app.chatRev[k] ?? 0) + 1;
+    if (!ctxId || !agent) return;
+    const context: Context = untrack(() => ({ ...ctx! }));
+    const k = chatKey(ctxId, agent);
+    let cancelled = false;
+    const loadId = nextId();
+    untrack(() => {
+      stickToBottom = true;
+      input = app.drafts[k] ?? "";
+      touchChat(k);
+      app.chatLoadId[k] = loadId;
+      app.chatLoading[k] = true;
+      const revision = app.bindingRev[k] ?? 0;
+      const valid = () => !cancelled && app.chatLoadId[k] === loadId;
+      void (async () => {
+        try {
+          const b = await api.bindingGet(ctxId, agent);
+          if (!valid() || (app.bindingRev[k] ?? 0) !== revision) return;
+          const sid = b?.session_id ?? null;
+          adoptBinding(k, sid);
+          app.bindingTitleMap[k] = b?.title ?? null;
+          const boundRevision = app.bindingRev[k] ?? 0;
+          const sameBinding = () => valid() && app.bindingSession[k] === sid && (app.bindingRev[k] ?? 0) === boundRevision;
+          if (!app.chat[k]?.length && !app.streaming[k]) {
+            const local = await loadChatLocal(k, sid);
+            if (!sameBinding()) return;
+            if (local && !app.chat[k]?.length) {
+              app.chat[k] = local;
+              app.chatSession[k] = sid;
+              app.chatRev[k] = (app.chatRev[k] ?? 0) + 1;
+            }
+          }
+          if (sid && !app.streaming[k] && sameBinding()) {
+            // 每次进入都从适配器重放最新历史（缓存只用于即时渲染，不作为跳过刷新的理由）。
+            // 外部客户端占用会话时 session/load 可能失败或返回部分数据——
+            // 失败保留现有缓存并提示"会话可能被其他客户端使用"。
+            try {
+              const rows = await api.acpSessionBind(context, agent, sid, b?.title ?? undefined, true);
+              if (sameBinding() && !app.streaming[k]) {
+                setChatRows(k, rows, sid);
+                app.sessionOccupied[k] = false;
+              }
+            } catch (e) {
+              if (sameBinding()) {
+                app.sessionOccupied[k] = true;
+              }
+            }
+          }
+        } catch { /* a failed background refresh must preserve existing history */ }
+        finally {
+          if (app.chatLoadId[k] === loadId) app.chatLoading[k] = false;
         }
-        const b = await api.bindingGet(ctxId, agent);
-        app.bindingSession[k] = b?.session_id ?? null;
-        app.bindingTitleMap[k] = b?.title ?? null;
-        bindingTitle = b?.title ?? null;
-        // 历史展示以本地库为准（秒开）；仅本地为空时才等适配器全量重放。
-        // 有本地记录时跳过重放，回合结束后的 ensure_session 会在后台把会话装载回适配器。
-        if (b?.session_id && ctx && ctx.id === ctxId && !app.chat[k]?.length) {
-          await refreshFromAdapter(ctxId, agent, b.session_id, b.title ?? undefined);
-        }
-      } catch {
-        app.chatLoading[chatKey(ctxId, agent)] = false;
-      }
-    })();
+      })();
+    });
+    return () => {
+      cancelled = true;
+      if (app.chatLoadId[k] === loadId) app.chatLoading[k] = false;
+    };
   });
 
   // follow the bottom: on session switch AND after every history load/clear
@@ -717,74 +730,67 @@ import type { DisplayItem } from "../state.svelte";
 
   async function newSession() {
     if (!ctx) return;
-    if (streaming) {
+    const context = { ...ctx }, agent = app.agent, opKey = key;
+    if (app.streaming[opKey] || app.sessionBusy[opKey] || app.chatLoading[opKey]) {
       toast("warn", t("会话正在进行中，请先停止"));
       return;
     }
-    if (!(await confirmDialog({ title: t("新建会话"), message: t("创建新会话？当前绑定的 AI 会话将被解绑（AI 端历史仍保留）。") }))) return;
+    app.sessionBusy[opKey] = true;
+    invalidateBindingRead(opKey);
     try {
-      let sid: string;
-      if (app.agent === "deepseek") {
-        // 失败时保留旧绑定与聊天记录；只在真正建成新会话后替换。
-        sid = await api.acpDeepseekNew(ctx);
-        clearChat(key);
-      } else {
-        await api.bindingUnbind(ctx.id, app.agent);
-        clearChat(key);
-        sid = await api.acpSessionNew(ctx, app.agent);
-      }
-      app.bindingSession[key] = sid;
-      bindingTitle = t("新会话");
-      stickToBottom = true;
-      toast("ok", t("已创建新会话（{agent}）", { agent: agentLabel(app.agent) }));
-    } catch (e) {
-      toast("error", String(e));
-    }
+      if (!(await confirmDialog({ title: t("新建会话"), message: t("创建新会话？当前绑定的 AI 会话将被解绑（AI 端历史仍保留）。") }))) return;
+      // Backend creates first, then atomically replaces binding+snapshot. Failure
+      // preserves the old history for every adapter, not only DeepSeek.
+      const sid = await api.acpSessionNew(context, agent, true);
+      adoptBinding(opKey, sid);
+      clearChat(opKey);
+      app.chatSession[opKey] = sid;
+      app.bindingTitleMap[opKey] = t("新会话");
+      if (key === opKey) stickToBottom = true;
+      toast("ok", t("已创建新会话（{agent}）", { agent: agentLabel(agent) }));
+    } catch (e) { toast("error", String(e)); }
+    finally { app.sessionBusy[opKey] = false; }
   }
 
   async function resumeSession() {
     if (!ctx) return;
+    const context = { ...ctx }, agent = app.agent, opKey = key;
+    if (app.streaming[opKey] || app.sessionBusy[opKey] || app.chatLoading[opKey]) return;
+    app.sessionBusy[opKey] = true;
+    invalidateBindingRead(opKey);
     try {
-      const sid = await api.acpSessionNew(ctx, app.agent);
-      app.bindingSession[key] = sid;
+      const sid = await api.acpSessionNew(context, agent);
+      adoptBinding(opKey, sid);
       toast("ok", t("已恢复绑定的会话"));
-    } catch (e) {
-      toast("error", String(e));
-    }
+    } catch (e) { toast("error", String(e)); }
+    finally { app.sessionBusy[opKey] = false; }
   }
 
   async function send() {
-    if (!ctx || sending) return;
+    if (!ctx || sending || loadingHere || sessionBusy) return;
     const text = input.trim();
     if (!text && !pendingImages.length) return;
-    // 固定本回合的会话身份：await 期间用户可能切换 agent/上下文，之后 ctx/key/app.agent
-    // 都会指向别的会话，回合结束的状态必须写回发起时的那一份。
-    const turnCtx = ctx;
-    const turnAgent = app.agent;
-    const turnKey = key;
+    const turnCtx = { ...ctx }, turnAgent = app.agent, turnKey = key;
+    const requestId = nextId();
     const imgs = pendingImages.map((p) => ({ data: p.data, mime: p.mime }));
     input = "";
     app.drafts[turnKey] = "";
-    pendingImages = [];
+    clearDraftImages(turnKey);
     stickToBottom = true;
-    pushLocal(turnKey, { kind: "user", text: text + (imgs.length ? `\n\n[图片 ×${imgs.length}]` : "") });
+    app.promptRequests[turnKey] = requestId;
+    app.pendingMessage[turnKey] = pushLocal(turnKey, { kind: "user", text: text + (imgs.length ? `\n\n[图片 ×${imgs.length}]` : "") });
     app.streaming[turnKey] = true;
     try {
-      const res = await api.acpPrompt(turnCtx, turnAgent, text, imgs);
+      const res = await api.acpPrompt(turnCtx, turnAgent, text, imgs, requestId);
       const stop = res?.stopReason ?? "end_turn";
       if (stop !== "end_turn" && key === turnKey) toast("info", t("回合结束（{reason}）", { reason: String(stop) }));
     } catch (e) {
-      pushLocal(turnKey, { kind: "error", text: String(e) });
+      // A late error from an old request must not pollute a replacement session.
+      if (app.promptRequests[turnKey] === requestId) pushLocal(turnKey, { kind: "error", text: String(e) });
     } finally {
-      finishTurn(turnAgent, turnCtx.id);
-      // refresh binding (session id may have just been created)
-      api
-        .bindingGet(turnCtx.id, turnAgent)
-        .then((b) => {
-          app.bindingSession[turnKey] = b?.session_id ?? null;
-          if (key === turnKey) bindingTitle = b?.title ?? null;
-        })
-        .catch(() => {});
+      // A started turn is completed by its matching status event; do not discard
+      // queued final chunks just because the invoke promise resolved first.
+      if (app.activeTurn[turnKey]?.turnId !== requestId) finishTurn(turnAgent, turnCtx.id, requestId);
     }
   }
 
@@ -801,7 +807,7 @@ import type { DisplayItem } from "../state.svelte";
   async function setModel(modelId: string) {
     if (!ctx) return;
     try {
-      await api.acpSetConfigOption(ctx.id, app.agent, "model", modelId);
+      await api.acpSetConfigOption(ctx.id, app.agent, "model", modelId, sessionId ?? undefined);
       toast("ok", t("模型已切换"));
     } catch (e) {
       toast("error", String(e));
@@ -942,8 +948,10 @@ import type { DisplayItem } from "../state.svelte";
   });
 
   function setCfg(id: string, value: string) {
+    const agent = app.agent, cfgKey = key, contextId = ctx?.id, sid = sessionId;
+    if (sessionBusy || loadingHere) return;
     // 记住用户选择：跨会话/重启生效（session-ready 后自动回放）
-    saveCfgPref(app.agent, id, value);
+    saveCfgPref(agent, id, value);
     // 更新本地显示（无论是否已有会话）
     if (id === "model" && sessionInfo?.response?.models) sessionInfo.response.models.currentModelId = value;
     if (sessionInfo?.response?.configOptions) {
@@ -952,21 +960,22 @@ import type { DisplayItem } from "../state.svelte";
     }
     if (!sessionId) {
       // 会话尚未创建：暂存，session-ready 后自动应用
-      app.pendingCfg[app.agent] = { id, value };
+      app.pendingCfg[cfgKey] ??= {};
+      app.pendingCfg[cfgKey][id] = value;
       toast("info", t("已记录选择，创建会话后自动应用"));
       return;
     }
-    if (!ctx) return;
+    if (!contextId) return;
     void api
-      .acpSetConfigOption(ctx.id, app.agent, id, value)
+      .acpSetConfigOption(contextId, agent, id, value, sid ?? undefined)
       .then(() => toast("ok", t("已应用")))
       .catch((e) => {
         const msg = String(e);
         if (msg.includes("-32602") || msg.includes("Invalid params")) {
           // 会话真实列表与界面不一致（caps 缓存过期/会话列表变化）：
           // 清掉缓存，重连后拿适配器真实列表
-          delete app.agentCaps[app.agent];
-          void api.settingsSet("caps." + app.agent, "").catch(() => {});
+          delete app.agentCaps[agent];
+          void api.settingsSet("caps." + agent, "").catch(() => {});
           toast(
             "error",
             t("该选项在当前会话不可用（列表已过期）。请点「重新连接」刷新后重试。"),
@@ -1009,7 +1018,7 @@ import type { DisplayItem } from "../state.svelte";
       saveCfgPref(app.agent, item.id, desired);
       cfgInflight++;
       void api
-        .acpSetConfigOption(ctx.id, app.agent, item.id, desired)
+        .acpSetConfigOption(ctx.id, app.agent, item.id, desired, sid)
         .catch(() => {})
         .finally(() => {
           cfgInflight = Math.max(0, cfgInflight - 1);
@@ -1133,26 +1142,24 @@ import type { DisplayItem } from "../state.svelte";
     pasteMenu = { x: e.clientX, y: e.clientY };
   }
   async function pasteIntoInput() {
+    const pasteKey = key, range = { ...pasteRange };
     pasteMenu = null;
     try {
       const text = await api.clipboardReadText();
       if (!text) return;
-      const ta = document.querySelector(".input-row textarea") as HTMLTextAreaElement | null;
-      if (!ta) {
-        input = (input ? input + "\n" : "") + text;
-        return;
-      }
-      const start = Math.min(pasteRange.start, input.length);
-      const end = Math.min(pasteRange.end, input.length);
-      input = input.slice(0, start) + text + input.slice(end);
+      const draft = key === pasteKey ? input : (app.drafts[pasteKey] ?? "");
+      const start = Math.min(range.start, draft.length), end = Math.min(range.end, draft.length);
+      const next = draft.slice(0, start) + text + draft.slice(end);
+      app.drafts[pasteKey] = next;
+      if (key !== pasteKey) return;
+      input = next;
       setTimeout(() => {
-        ta.focus();
-        const pos = start + text.length;
-        ta.setSelectionRange(pos, pos);
+        if (key !== pasteKey) return;
+        const ta = document.querySelector(".input-row textarea") as HTMLTextAreaElement | null;
+        ta?.focus();
+        ta?.setSelectionRange(start + text.length, start + text.length);
       }, 0);
-    } catch (e) {
-      toast("error", String(e));
-    }
+    } catch (e) { toast("error", String(e)); }
   }
 
   // ---------- 发送快捷键（默认 Enter 换行 / Ctrl+Enter 发送，设置可切换） ----------
@@ -1221,18 +1228,20 @@ import type { DisplayItem } from "../state.svelte";
     const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith("image/"));
     if (!files.length) return;
     e.preventDefault();
+    const attachmentKey = key;
+    const attachmentRevision = app.draftImageRev[attachmentKey] ?? 0;
     for (const f of files.slice(0, 4)) {
       const rd = new FileReader();
       rd.onload = () => {
         const url = String(rd.result ?? "");
         const data = url.split(",")[1] ?? "";
-        if (data) pendingImages.push({ data, mime: f.type, preview: url });
+        if (data) addDraftImage(attachmentKey, { data, mime: f.type, preview: url }, attachmentRevision);
       };
       rd.readAsDataURL(f);
     }
   }
   function removeImage(i: number) {
-    pendingImages.splice(i, 1);
+    app.draftImages[key]?.splice(i, 1);
   }
 
   // consume inserted prompts from the 常用提示词 panel
@@ -1241,6 +1250,7 @@ import type { DisplayItem } from "../state.svelte";
     if (!p) return;
     if (app.tab === "chat") {
       input = input ? input + (input.endsWith("\n") ? "" : "\n") + p.text : p.text;
+      app.drafts[key] = input;
       app.insertPrompt = null;
     }
   });
@@ -1273,12 +1283,12 @@ import type { DisplayItem } from "../state.svelte";
           title={t("修改会话标题（本地备注）")}
           onclick={async () => {
             if (!ctx) return;
+            const titleKey = key, titleContextId = ctx.id, titleAgent = app.agent;
             const newTitle = await promptDialog({ title: t("会话标题"), label: t("标题（本地备注）"), initial: bindingTitle ?? "" });
             if (newTitle === null) return;
             try {
-              await api.bindingSetTitle(ctx.id, app.agent, newTitle);
-              bindingTitle = newTitle;
-              app.bindingTitleMap[chatKey(ctx.id, app.agent)] = newTitle;
+              await api.bindingSetTitle(titleContextId, titleAgent, newTitle);
+              app.bindingTitleMap[titleKey] = newTitle;
               toast("ok", t("标题已更新"));
             } catch (e) {
               toast("error", String(e));
@@ -1288,8 +1298,8 @@ import type { DisplayItem } from "../state.svelte";
       {:else}
         <span class="badge">{t("未绑定会话")}</span>
       {/if}
-      <button class="btn sm" onclick={() => (app.historyBind = app.agent)} title={t("绑定 / 切换适配器中的历史会话")}>绑定</button>
-      <button class="btn sm" onclick={sessionId ? resumeSession : newSession} title={sessionId ? t("重新加载会话") : t("创建新会话")}>
+      <button class="btn sm" disabled={streaming || loadingHere || sessionBusy} onclick={() => (app.historyBind = app.agent)} title={t("绑定 / 切换适配器中的历史会话")}>绑定</button>
+      <button class="btn sm" disabled={streaming || loadingHere || sessionBusy} onclick={sessionId ? resumeSession : newSession} title={sessionId ? t("重新加载会话") : t("创建新会话")}>
         {sessionId ? t("重新连接") : t("新会话")}
       </button>
       <button
@@ -1350,6 +1360,9 @@ import type { DisplayItem } from "../state.svelte";
       {#if loadingHere}
         <div class="syncing"><span class="chat-spinner sm"></span> {t("正在同步最新历史…")}</div>
       {/if}
+      {#if sessionOccupied}
+        <div class="session-occupied">⚠ {t("会话可能正被其他客户端使用，当前显示的是本地缓存。切换回来或稍后重试可获取最新内容。")}</div>
+      {/if}
       {#if streaming}
         <div class="thinking"><span class="dot accent pulse"></span> {t("{agent} 正在工作中…", { agent: agentLabel(app.agent) })}</div>
       {/if}
@@ -1402,7 +1415,7 @@ import type { DisplayItem } from "../state.svelte";
       {#each cfgItems as c (c.id)}
           <label class="cfg">
             <span class="cfg-label">{c.label}</span>
-            <select class="cfg-select" value={c.value} onchange={(e) => setCfg(c.id, (e.target as HTMLSelectElement).value)}>
+            <select class="cfg-select" disabled={sessionBusy || loadingHere} value={c.value} onchange={(e) => setCfg(c.id, (e.target as HTMLSelectElement).value)}>
               {#each c.options as o (o.value)}
                 <option value={o.value}>{o.name}</option>
               {/each}
@@ -1428,7 +1441,7 @@ import type { DisplayItem } from "../state.svelte";
     {#if streaming}
       <button class="btn danger" onclick={stop}>■ {t("停止")}</button>
     {:else}
-      <button class="btn primary" disabled={(!input.trim() && !pendingImages.length) || sending || !ctx} onclick={send}>{t("发送")} ➤</button>
+      <button class="btn primary" disabled={(!input.trim() && !pendingImages.length) || sending || loadingHere || sessionBusy || !ctx} onclick={send}>{t("发送")} ➤</button>
     {/if}
     </div>
   </div>
@@ -1529,6 +1542,7 @@ import type { DisplayItem } from "../state.svelte";
   .chat-loading .ld {
     font-size: 0.85em;
   }
+  .session-occupied { padding: 10px 16px; margin: 4px 0; background: rgba(240,170,40,.1); border: 1px solid rgba(240,170,40,.3); border-radius: 8px; font-size: .84em; color: #b57e17; }
   .syncing {
     display: flex;
     align-items: center;

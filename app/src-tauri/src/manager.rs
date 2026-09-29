@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use agent_client_protocol::schema::v1::{McpServer, McpServerHttp, ContentBlock, TextContent, ImageContent};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::RwLock;
 
@@ -19,11 +20,11 @@ fn configured_env_path(env: &std::collections::BTreeMap<String, String>, key: &s
         .filter(|v| !v.trim().is_empty()).map(std::path::PathBuf::from)
 }
 
-fn retry_new_without_mcp(agent_type: &str, with_mcp: &Value) -> bool {
+fn retry_new_without_mcp(agent_type: &str, with_mcp: &[McpServer]) -> bool {
     // DeepSeek declares HTTP MCP support. A -32603 persistence failure is NOT
     // an MCP rejection: retrying it on the same bridge hides the first error
     // behind "the ACP bridge has been disposed" and may create duplicate sessions.
-    agent_type != "deepseek" && with_mcp.as_array().is_some_and(|a| !a.is_empty())
+    agent_type != "deepseek" && !with_mcp.is_empty()
 }
 
 fn deepseek_new_error(error: &str) -> String {
@@ -51,7 +52,7 @@ mod audit_tests {
 
     #[test]
     fn deepseek_first_session_error_is_not_overwritten_by_mcp_retry() {
-        let with_mcp = json!([{ "type": "http", "name": "shidrive", "url": "http://127.0.0.1/mcp" }]);
+        let with_mcp = vec![McpServer::Http(McpServerHttp::new("shidrive", "http://127.0.0.1/mcp"))];
         assert!(!retry_new_without_mcp("deepseek", &with_mcp));
         assert!(retry_new_without_mcp("codex", &with_mcp));
         let original = "Internal error (code -32603)（{\"details\":\"ACP session persistence flush failed\"}）";
@@ -81,12 +82,12 @@ mod audit_tests {
         let (_, tools_json) = &rows[1];
         let tools: Vec<Value> = serde_json::from_str(tools_json).expect("tools row must be valid JSON");
         assert_eq!(tools.len(), 6, "tool_call + tool_call_update merged by toolCallId, nothing dropped");
-        assert!(tools_json.len() < 6 * (crate::acp::TOOL_OUTPUT_MAX_BYTES + 512), "tools row bounded: {}", tools_json.len());
+        assert!(tools_json.len() < 6 * (2 * crate::acp::TOOL_OUTPUT_MAX_BYTES + 512), "tools row bounded: {}", tools_json.len());
         for t in &tools {
             assert_eq!(t["title"], "cargo test");
             assert_eq!(t["status"], "completed");
             assert_eq!(t["rawInput"]["command"][0], "cargo");
-            assert!(t.get("content").is_none(), "content is never rendered by the webview");
+            assert!(t.get("content").is_some(), "bounded standard tool content is retained");
             assert!(t["rawOutput"].as_str().unwrap().len() <= crate::acp::TOOL_OUTPUT_MAX_BYTES + 64);
         }
     }
@@ -105,25 +106,39 @@ mod audit_tests {
 }
 
 /// Cancelling the future must cancel the session it actually prompted (including temp sessions).
-struct ActiveTurn<'a> {
-    manager: &'a AgentManager,
+struct ActiveTurn {
+    app: AppHandle,
+    db: Arc<Db>,
     conn: Arc<AcpConnection>,
     session_id: String,
     context_id: String,
     agent_type: String,
+    turn_id: String,
+    source: &'static str,
     completed: bool,
 }
 
-impl Drop for ActiveTurn<'_> {
+impl Drop for ActiveTurn {
     fn drop(&mut self) {
         if !self.completed {
-            self.conn.notify("session/cancel", json!({ "sessionId": self.session_id }));
-            let _ = self.manager.db.set_binding_status(&self.context_id, &self.agent_type, "interrupted");
-            let _ = self.manager.app.emit("acp://binding-status", json!({
-                "contextId": self.context_id, "agentType": self.agent_type, "status": "interrupted"
-            }));
+            self.conn.cancel_turn(&self.session_id, &self.turn_id);
+            self.status("interrupted");
         }
-        let _ = self.conn.end_turn(&self.session_id);
+        let _ = self.conn.end_turn(&self.session_id, &self.turn_id);
+    }
+}
+
+impl ActiveTurn {
+    fn status(&self, status: &str) {
+        // Workflow temp/explicit sessions do not own the context's UI binding.
+        if self.source == "chat" {
+            let _ = self.db.set_binding_status(&self.context_id, &self.agent_type, status);
+        }
+        let event = if self.source == "chat" { "acp://binding-status" } else { "acp://workflow-status" };
+        let _ = self.app.emit(event, json!({
+            "contextId": self.context_id, "agentType": self.agent_type, "sessionId": self.session_id,
+            "connectionId": self.conn.connection_id, "turnId": self.turn_id, "source": self.source, "status": status
+        }));
     }
 }
 
@@ -148,9 +163,8 @@ pub struct AgentManager {
     /// Serialize connect, disconnect and config replacement for each adapter.
     connection_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     bind_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// serializes prompts per (context_id, agent_type) so a UI turn and a
-    /// workflow turn on the same binding never interleave
-    prompt_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Every entry point uses the same (connection generation, actual SID) lock.
+    prompt_locks: std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl AgentManager {
@@ -168,9 +182,14 @@ impl AgentManager {
         Self { app, db, tools, conns: RwLock::new(HashMap::new()), overrides: RwLock::new(overrides), connection_locks: std::sync::Mutex::new(HashMap::new()), bind_locks: std::sync::Mutex::new(HashMap::new()), prompt_locks: std::sync::Mutex::new(HashMap::new()) }
     }
 
-    fn prompt_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    fn prompt_lock(&self, conn: &AcpConnection, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let key = format!("{}:{}:{session_id}", conn.connection_id, conn.agent_type);
         let mut locks = self.prompt_locks.lock().unwrap();
-        locks.entry(key.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) { return lock; }
+        locks.retain(|_, weak| weak.strong_count() > 0);
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
     }
 
     pub fn mcp_url(&self) -> String {
@@ -183,10 +202,10 @@ impl AgentManager {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
     }
 
-    /// 绑定互斥（与 connection_lock 分离：bind_session 内部还会经
+    /// 按 (context, agent) 串行化绑定变更（与 connection_lock 分离：内部还会经
     /// ensure_connected/disconnect 获取 connection_lock，同一把锁会自死锁）
-    fn bind_lock(&self, agent_type: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.bind_locks.lock().unwrap().entry(agent_type.to_string())
+    fn bind_lock(&self, context_id: &str, agent_type: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.bind_locks.lock().unwrap().entry(format!("{context_id}:{agent_type}"))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
     }
 
@@ -310,11 +329,11 @@ impl AgentManager {
             .map_err(|e| format!("DeepSeek 安装校验：ACP initialize 失败: {e}"))?;
         let result = async {
             let cwd = home.0.to_string_lossy().to_string();
-            let res = conn.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }), Some(Duration::from_secs(90))).await
+            let res = conn.new_session(&cwd, vec![]).await
                 .map_err(|e| format!("DeepSeek 安装校验：session/new 失败: {e}"))?;
             let sid = res.get("sessionId").and_then(Value::as_str)
                 .filter(|sid| !sid.is_empty()).ok_or("DeepSeek 安装校验：session/new 未返回 sessionId")?;
-            conn.request("session/close", json!({ "sessionId": sid }), Some(Duration::from_secs(30))).await
+            conn.close_session(sid).await
                 .map_err(|e| format!("DeepSeek 安装校验：session/close 失败: {e}"))?;
             Ok::<(), String>(())
         }.await;
@@ -323,8 +342,13 @@ impl AgentManager {
     }
 
     pub async fn launch_for(&self, agent_type: &str) -> Result<AgentLaunch, String> {
-        let manual = self.override_for(agent_type).await;
+        let mut manual = self.override_for(agent_type).await;
         if !manual.command.trim().is_empty() {
+            // Empty args + an executable override means "use the registered launch
+            // mode". Non-empty args are a complete, explicit command-line override.
+            if manual.args.is_empty() {
+                if let Some(sp) = crate::agents::spec(agent_type) { manual.args = sp.args.clone(); }
+            }
             return Ok(manual);
         }
         if agent_type == "deepseek" {
@@ -336,7 +360,7 @@ impl AgentManager {
         let node = self.tools.node_exe();
         let node_str = node.to_string_lossy().to_string();
         let mut env: HashMap<String, String> = HashMap::new();
-        let mut args: Vec<String> = Vec::new();
+        let mut args: Vec<String>;
         match agent_type {
             "codex" => {
                 let adapter = self.tools.codex_adapter();
@@ -394,6 +418,7 @@ impl AgentManager {
                 args.extend(sp.args.iter().cloned());
             }
         }
+        args.extend(manual.args); // automatic executable + additional user arguments
         env.extend(manual.env);
         Ok(AgentLaunch { command: node_str, args, env: env.into_iter().collect() })
     }
@@ -459,9 +484,9 @@ impl AgentManager {
     /// mcpServers for session/new: inject the ShiDrive MCP endpoint when the
     /// adapter supports HTTP MCP (or hasn't declared a capability). Other agents
     /// retain their old retry without MCP; DeepSeek preserves the first error.
-    fn mcp_servers_param(&self, conn: &AcpConnection) -> Value {
+    fn mcp_servers_param(&self, conn: &AcpConnection) -> Vec<McpServer> {
         if conn.mcp_degraded() {
-            return json!([]);
+            return vec![];
         }
         let caps = &conn.agent_info.lock().unwrap();
         let declared_http = caps
@@ -472,9 +497,9 @@ impl AgentManager {
             .unwrap_or(false);
         let no_mcp_caps = caps.get("agentCapabilities").and_then(|c| c.get("mcpCapabilities")).is_none();
         if declared_http || no_mcp_caps {
-            json!([{ "type": "http", "url": self.mcp_url(), "name": "shidrive" }])
+            vec![McpServer::Http(McpServerHttp::new("shidrive", self.mcp_url()))]
         } else {
-            json!([])
+            vec![]
         }
     }
 
@@ -482,7 +507,7 @@ impl AgentManager {
         let cwd = self.project_root_for(context);
         let with_mcp = self.mcp_servers_param(conn);
         let res = conn
-            .request("session/new", json!({ "cwd": cwd, "mcpServers": with_mcp }), Some(Duration::from_secs(90)))
+            .new_session(&cwd, with_mcp.clone())
             .await;
         match res {
             Ok(r) => Ok((r.get("sessionId").and_then(|s| s.as_str()).unwrap_or_default().to_string(), r)),
@@ -501,7 +526,7 @@ impl AgentManager {
                 if retry_new_without_mcp(&conn.agent_type, &with_mcp) {
                     // 其他适配器保留原有的无 MCP 回退行为。
                     let res = conn
-                        .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }), Some(Duration::from_secs(90)))
+                        .new_session(&cwd, vec![])
                         .await?;
                     conn.mark_mcp_degraded();
                     return Ok((
@@ -519,59 +544,68 @@ impl AgentManager {
         self.ensure_session_inner(context, agent_type, true).await
     }
 
-    /// `emit_ready=false`：装载/恢复会话但不广播 session-ready。
-    /// 供 set_config_option/set_mode 使用——它们在每轮配置回放里都会调用本函数，
-    /// 若此时广播 session-ready，前端「会话配置记忆」effect 会重套配置并再次
-    /// 触发本函数，形成 IPC 风暴直至 Win32 消息队列耗尽（0x80070718）。
+    /// Serialize binding resolution/creation, but release the context lock while
+    /// prompting so config changes and independent temporary runs remain usable.
     pub async fn ensure_session_inner(&self, context: &Context, agent_type: &str, emit_ready: bool) -> Result<(Arc<AcpConnection>, String), String> {
+        let lock = self.bind_lock(&context.id, agent_type);
+        let _guard = lock.lock().await;
+        self.ensure_session_locked(context, agent_type, emit_ready).await
+    }
+
+    async fn ensure_session_locked(&self, context: &Context, agent_type: &str, emit_ready: bool) -> Result<(Arc<AcpConnection>, String), String> {
         let cwd = self.project_root_for(context);
         let conn = self.ensure_connected(agent_type).await?;
-        let binding = self.db.get_binding(&context.id, agent_type)?;
-
-        if let Some(b) = binding {
-            if let Some(sid) = b.session_id.clone() {
+        if let Some(b) = self.db.get_binding(&context.id, agent_type)? {
+            if let Some(sid) = b.session_id {
                 if !conn.is_loaded(&sid) {
-                    if let Err(e) = conn.load_session(&sid, &cwd, self.mcp_servers_param(&conn)).await {
-                        log::warn!("[{agent_type}] session/load {sid} failed: {e}; unbinding");
-                        let _ = self.db.set_binding_session(&context.id, agent_type, None, Some("会话已失效，待重新创建"), None);
-                        let _ = self.app.emit("acp://update", json!({ "agentType": agent_type, "sessionExpired": true, "contextId": context.id, "detail": e }));
-                    } else {
-                        let caps = conn.cached_caps();
-                        if emit_ready {
-                            let _ = self.app.emit(
-                                "acp://session-ready",
-                                json!({ "agentType": agent_type, "contextId": context.id, "sessionId": sid, "title": self.db.get_binding(&context.id, agent_type).ok().flatten().and_then(|b| b.title), "response": caps }),
-                            );
-                        }
-                        return Ok((conn, sid));
+                    let lock = self.prompt_lock(&conn, &sid);
+                    let _session = lock.lock().await;
+                    if !conn.is_loaded(&sid) {
+                        // Preserve the old binding and snapshot on transient load
+                        // failures; never silently replace it with an empty session.
+                        conn.load_session(&sid, &cwd, self.mcp_servers_param(&conn)).await?;
                     }
-                } else {
-                    // 已装载（最常见的路径）：同样受 emit_ready 约束——v0.3.9 的 quiet 模式漏掉了
-                    // 这一支，set_config_option/set_mode 每次仍会广播 session-ready，
-                    // 前端刚改的选项被 cached_caps 里的旧值刷回
-                    if emit_ready {
-                        let caps = conn.cached_caps();
-                        let _ = self.app.emit(
-                            "acp://session-ready",
-                            json!({ "agentType": agent_type, "contextId": context.id, "sessionId": sid, "title": self.db.get_binding(&context.id, agent_type).ok().flatten().and_then(|b| b.title), "response": caps }),
-                        );
-                    }
-                    return Ok((conn, sid));
                 }
+                if emit_ready {
+                    let _ = self.app.emit("acp://session-ready", json!({
+                        "agentType": agent_type, "contextId": context.id, "sessionId": sid,
+                        "connectionId": conn.connection_id, "title": b.title, "response": conn.cached_caps(&sid)
+                    }));
+                }
+                return Ok((conn, sid));
             }
         }
-
-        // 全新会话必须广播：前端要据此更新 bindingSession/标题/配置栏；它不会成环
-        //（配置回放随后的 set_config_option 走上面的已装载分支，quiet）
         let sid = self.create_and_bind_session(&conn, context, agent_type).await?;
         Ok((conn, sid))
     }
 
-    /// For an explicit DeepSeek New Session: keep the old binding until session/new
-    /// succeeds. A disposed bridge must not erase the user's current session.
+    async fn check_binding_idle(&self, context_id: &str, agent_type: &str) -> Result<(), String> {
+        if let Some(sid) = self.db.get_binding(context_id, agent_type)?.and_then(|b| b.session_id) {
+            if self.conns.read().await.get(agent_type).is_some_and(|c| c.has_active_turn(&sid)) {
+                return Err("会话正在进行中，请先停止后再更换或解绑".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// All adapters keep the old binding until creating the replacement succeeds.
+    pub async fn create_fresh_session(&self, context: &Context, agent_type: &str) -> Result<String, String> {
+        let lock = self.bind_lock(&context.id, agent_type);
+        let _guard = lock.lock().await;
+        self.check_binding_idle(&context.id, agent_type).await?;
+        let conn = self.ensure_connected(agent_type).await?;
+        self.create_and_bind_session(&conn, context, agent_type).await
+    }
+
     pub async fn create_fresh_deepseek_session(&self, context: &Context) -> Result<String, String> {
-        let conn = self.ensure_connected("deepseek").await?;
-        self.create_and_bind_session(&conn, context, "deepseek").await
+        self.create_fresh_session(context, "deepseek").await
+    }
+
+    pub async fn unbind(&self, context_id: &str, agent_type: &str) -> Result<(), String> {
+        let lock = self.bind_lock(context_id, agent_type);
+        let _guard = lock.lock().await;
+        self.check_binding_idle(context_id, agent_type).await?;
+        self.db.unbind(context_id, agent_type)
     }
 
     async fn create_and_bind_session(
@@ -584,12 +618,12 @@ impl AgentManager {
         let cwd = self.project_root_for(context);
         conn.mark_loaded(&sid);
         let title = res.get("title").and_then(Value::as_str).map(|s| s.to_string())
-            .or_else(|| (agent_type == "deepseek").then(|| "新会话".to_string()));
-        conn.cache_caps(&res);
+            .or_else(|| Some("新会话".to_string()));
+        conn.cache_caps(&sid, &res);
         self.db.set_binding_session(&context.id, agent_type, Some(&sid), title.as_deref(), Some(&cwd))?;
         let _ = self.app.emit(
             "acp://session-ready",
-            json!({ "agentType": agent_type, "contextId": context.id, "sessionId": sid, "title": title, "response": res }),
+            json!({ "agentType": agent_type, "contextId": context.id, "sessionId": sid, "connectionId": conn.connection_id, "title": title, "response": res }),
         );
         Ok(sid)
     }
@@ -598,16 +632,18 @@ impl AgentManager {
     async fn load_with_capture(
         &self,
         conn: &Arc<AcpConnection>,
-        agent_type: &str,
         session_id: &str,
         cwd: &str,
     ) -> Result<Vec<(String, String)>, String> {
+        struct CaptureGuard<'a>(&'a AcpConnection, &'a str);
+        impl Drop for CaptureGuard<'_> { fn drop(&mut self) { self.0.abort_capture(self.1); } }
         conn.begin_capture(session_id);
+        let _capture = CaptureGuard(conn, session_id);
         let res = conn.load_session(session_id, cwd, self.mcp_servers_param(conn)).await;
         let updates = conn.end_capture(session_id).await;
         match &res {
             Ok(resp) => {
-                conn.cache_caps(resp);
+                conn.cache_caps(session_id, resp);
                 Ok(replay_to_messages(&updates))
             }
             Err(e) => Err(e.clone()),
@@ -615,8 +651,7 @@ impl AgentManager {
     }
 
     /// Bind an existing (historical) adapter session to a context and return the
-    /// replayed transcript. Chat history is NOT persisted locally — the ACP
-    /// session is the source of truth; the UI renders the returned rows.
+    /// replayed transcript. The UI snapshots rows locally, tagged with this SID.
     /// `silent` marks an automatic background refresh.
     pub async fn bind_session(
         &self,
@@ -626,39 +661,21 @@ impl AgentManager {
         title: Option<&str>,
         silent: bool,
     ) -> Result<Vec<ReplayRow>, String> {
-        // 串行化同 agent 的绑定（独立锁：connection_lock 在内部的
-        // ensure_connected/disconnect 里还会获取，同锁重入会自死锁）
-        let lock = self.bind_lock(agent_type);
+        // Same lock order as UI prompts: context binding -> actual session.
+        let lock = self.bind_lock(&context.id, agent_type);
         let _guard = lock.lock().await;
-        let _ = silent;
-        let cwd = self.project_root_for(context);
-        let mut conn = self.ensure_connected(agent_type).await?;
-        log::info!(
-            "[{agent_type}] bind_session ctx={} sid={session_id} loaded={} other_loaded={}",
-            context.id,
-            conn.is_loaded(session_id),
-            conn.has_other_loaded(session_id)
-        );
-        // 始终尝试重放取转录（多个上下文可能绑定同一个适配器会话，跳过重放
-        // 会让新打开的那个上下文拿到空历史）。重放失败时重启适配器走冷启动
-        // 路径再试一次——冷启动重放是可靠的。
-        let mut loaded = match self.load_with_capture(&conn, agent_type, session_id, &cwd).await {
-            Ok(rows) => Some(rows),
-            Err(e) => {
-                log::warn!("[{agent_type}] session/load {session_id} failed: {e}");
-                None
-            }
-        };
-        if loaded.is_none()
-            || (loaded.as_ref().unwrap_or(&Vec::new()).is_empty() && conn.has_other_loaded(session_id))
-        {
-            log::warn!("[{agent_type}] restarting adapter to re-replay session {session_id}");
-            self.disconnect(agent_type).await;
-            conn = self.ensure_connected(agent_type).await?;
-            loaded = Some(self.load_with_capture(&conn, agent_type, session_id, &cwd).await?);
+        self.check_binding_idle(&context.id, agent_type).await?;
+        if silent && self.db.get_binding(&context.id, agent_type)?.and_then(|b| b.session_id).as_deref() != Some(session_id) {
+            return Err("会话绑定已变化，忽略过期的历史刷新".into());
         }
+        let cwd = self.project_root_for(context);
+        let conn = self.ensure_connected(agent_type).await?;
+        let session_lock = self.prompt_lock(&conn, session_id);
+        let _session = session_lock.lock().await;
+        // Empty replay is a valid result. Never kill other sessions to manufacture
+        // history, and never capture notifications from an active prompt.
+        let loaded = self.load_with_capture(&conn, session_id, &cwd).await?;
         let rows: Vec<ReplayRow> = loaded
-            .unwrap_or_default()
             .into_iter()
             .map(|(role, content)| ReplayRow { role, content })
             .collect();
@@ -667,12 +684,12 @@ impl AgentManager {
         self.db.set_binding_session(&context.id, agent_type, Some(session_id), title, Some(&cwd))?;
         // 绑定了带历史的会话视为一次已完成的对话状态
         let _ = self.db.set_binding_status(&context.id, agent_type, "completed");
-        let caps = conn.cached_caps();
+        let caps = conn.cached_caps(session_id);
         let mut response = caps.as_object().cloned().unwrap_or_default();
         response.insert("bound".to_string(), Value::Bool(true));
         let _ = self.app.emit(
             "acp://session-ready",
-            json!({ "agentType": agent_type, "contextId": context.id, "sessionId": session_id, "response": response }),
+            json!({ "agentType": agent_type, "contextId": context.id, "sessionId": session_id, "connectionId": conn.connection_id, "response": response }),
         );
         Ok(rows)
     }
@@ -693,99 +710,107 @@ impl AgentManager {
         text: &str,
         images: &[crate::models::PromptImage],
     ) -> Result<Value, String> {
-        // one turn at a time per session (workflow temp sessions never block the UI bound session)
-        let lock_sid = match &target {
-            SessionTarget::Explicit(sid) => format!("{agent_type}:{sid}"),
-            _ => format!("{agent_type}:ctx-{}", context.id),
-        };
-        let turn_lock = self.prompt_lock(&lock_sid);
-        let _turn = turn_lock.lock().await;
-        let mut conn = self.ensure_connected(agent_type).await?;
-        let cwd = self.project_root_for(context);
-        let sid: String = match target {
-            SessionTarget::Binding => {
-                let (conn2, sid) = self.ensure_session(context, agent_type).await?;
-                conn = conn2;
-                sid
-            }
-            SessionTarget::Explicit(sid) => {
-                if !conn.is_loaded(&sid) {
-                    conn.load_session(&sid, &cwd, self.mcp_servers_param(&conn)).await?;
-                }
-                sid
-            }
-            SessionTarget::Temp => {
-                let (sid, _res) = self.session_new_impl(&conn, context).await?;
-                if sid.is_empty() {
-                    return Err("适配器未返回 sessionId".into());
-                }
-                conn.mark_loaded(&sid);
-                sid
-            }
-        };
-
-        conn.begin_turn(&sid, &context.id);
-        let mut turn = ActiveTurn {
-            manager: self, conn: conn.clone(), session_id: sid.clone(), context_id: context.id.clone(),
-            agent_type: agent_type.to_string(), completed: false,
-        };
-        let _ = self.db.set_binding_status(&context.id, agent_type, "running");
-        let _ = self.app.emit("acp://binding-status", json!({ "contextId": context.id, "agentType": agent_type, "status": "running" }));
-        let mut blocks = Vec::new();
-        if !text.is_empty() {
-            blocks.push(json!({ "type": "text", "text": text }));
-        }
-        for img in images {
-            blocks.push(json!({ "type": "image", "data": img.data, "mimeType": img.mime }));
-        }
-        if blocks.is_empty() {
-            blocks.push(json!({ "type": "text", "text": text }));
-        }
-        let result = conn
-            .request("session/prompt", json!({ "sessionId": sid, "prompt": blocks }), None)
-            .await;
-        let interrupted = matches!(&result, Ok(v) if v.get("stopReason").and_then(|s| s.as_str()) == Some("cancelled"));
-        let final_status = match &result {
-            Err(_) => "interrupted",
-            Ok(_) if interrupted => "interrupted",
-            _ => "completed",
-        };
-        let _ = self.db.set_binding_status(&context.id, agent_type, final_status);
-        let _ = self.app.emit("acp://binding-status", json!({ "contextId": context.id, "agentType": agent_type, "status": final_status }));
-        // 回合内容经 acp://update 实时流给前端；历史不再落本地库
-        turn.completed = true;
-        result
+        self.prompt_with_request_id(context, agent_type, target, text, images, None, "workflow").await
     }
 
-    /// Convenience wrapper used by the chat UI.
-    pub async fn prompt(
-        &self,
-        context: &Context,
-        agent_type: &str,
-        text: &str,
-        images: &[crate::models::PromptImage],
+    async fn prompt_with_request_id(
+        &self, context: &Context, agent_type: &str, target: SessionTarget,
+        text: &str, images: &[crate::models::PromptImage], request_id: Option<&str>, source: &'static str,
     ) -> Result<Value, String> {
-        self.prompt_with(context, agent_type, SessionTarget::Binding, text, images).await
+        let binding_lock = self.bind_lock(&context.id, agent_type);
+        let binding_guard = if matches!(&target, SessionTarget::Binding) { Some(binding_lock.lock().await) } else { None };
+        let mut conn = self.ensure_connected(agent_type).await?;
+        let cwd = self.project_root_for(context);
+        let sid = match target {
+            SessionTarget::Binding => {
+                let (c, sid) = self.ensure_session_locked(context, agent_type, true).await?;
+                conn = c;
+                sid
+            }
+            SessionTarget::Explicit(sid) => sid,
+            SessionTarget::Temp => {
+                let (sid, caps) = self.session_new_impl(&conn, context).await?;
+                if sid.is_empty() { return Err("适配器未返回 sessionId".into()); }
+                conn.mark_loaded(&sid);
+                conn.cache_caps(&sid, &caps);
+                sid
+            }
+        };
+        let lock = self.prompt_lock(&conn, &sid);
+        let session_guard = lock.lock_owned().await;
+        if !conn.is_alive() { return Err("适配器连接已断开，请重试".into()); }
+        if !conn.is_loaded(&sid) { conn.load_session(&sid, &cwd, self.mcp_servers_param(&conn)).await?; }
+        let turn_id = request_id.filter(|id| !id.is_empty()).map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        conn.begin_turn(&sid, &context.id, &turn_id, source)?;
+        let mut turn = ActiveTurn {
+            app: self.app.clone(), db: self.db.clone(), conn: conn.clone(),
+            session_id: sid.clone(), context_id: context.id.clone(),
+            agent_type: agent_type.to_string(), turn_id: turn_id.clone(), source, completed: false,
+        };
+        // Register before releasing the binding guard so rebind/unbind cannot
+        // redirect the UI or cancel button while this session is running.
+        drop(binding_guard);
+        turn.status("running");
+        let mut blocks = Vec::new();
+        if !text.is_empty() { blocks.push(ContentBlock::Text(TextContent::new(text))); }
+        for img in images { blocks.push(ContentBlock::Image(ImageContent::new(img.data.clone(), img.mime.clone()))); }
+        if blocks.is_empty() { blocks.push(ContentBlock::Text(TextContent::new(text))); }
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        struct CancelOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) { if let Some(tx) = self.0.take() { let _ = tx.send(()); } }
+        }
+        let mut cancel = CancelOnDrop(Some(cancel_tx));
+        // Dropping a workflow future is not an ACP cancellation acknowledgement.
+        // Keep the SID lock/buffer alive until the peer replies (or disconnects),
+        // otherwise the next prompt could steal late chunks from the canceled one.
+        let task = tokio::spawn(async move {
+            let _session = session_guard;
+            let request = conn.prompt_session(&sid, blocks);
+            tokio::pin!(request);
+            let mut was_cancelled = false;
+            let mut result = tokio::select! {
+                biased;
+                result = &mut request => result,
+                _ = cancel_rx => {
+                    was_cancelled = true;
+                    conn.cancel_turn(&sid, &turn_id);
+                    request.await
+                }
+            };
+            let interrupted = was_cancelled || matches!(&result, Ok(v) if v.get("stopReason").and_then(Value::as_str) == Some("cancelled"));
+            turn.status(if result.is_err() || interrupted { "interrupted" } else { "completed" });
+            let (text, _, _) = conn.end_turn(&sid, &turn_id);
+            if source == "workflow" {
+                if let Ok(Value::Object(obj)) = &mut result {
+                    obj.insert("_shidriveOutput".into(), Value::String(cap_str(text)));
+                }
+            }
+            turn.completed = true;
+            drop(turn);
+            result
+        });
+        let joined = task.await;
+        cancel.0.take();
+        joined.map_err(|e| format!("会话任务结束异常: {e}"))?
+    }
+
+    pub async fn prompt(&self, context: &Context, agent_type: &str, text: &str, images: &[crate::models::PromptImage]) -> Result<Value, String> {
+        self.prompt_from_ui(context, agent_type, text, images, None).await
+    }
+
+    pub async fn prompt_from_ui(&self, context: &Context, agent_type: &str, text: &str, images: &[crate::models::PromptImage], request_id: Option<&str>) -> Result<Value, String> {
+        self.prompt_with_request_id(context, agent_type, SessionTarget::Binding, text, images, request_id, "chat").await
     }
 
     pub async fn cancel(&self, context_id: &str, agent_type: &str) -> Result<(), String> {
-        let binding = self.db.get_binding(context_id, agent_type)?;
-        if let Some(sid) = binding.and_then(|b| b.session_id) {
-            let conn = self.ensure_connected(agent_type).await?;
-            // 连接重建过的话先装载会话，避免 cancel 打到适配器不认识的 id 上
-            if !conn.is_loaded(&sid) {
-                if let Some(context) = self.db.get_context_row(context_id) {
-                    let _ = self.ensure_session(&context, agent_type).await;
+        if let Some(sid) = self.db.get_binding(context_id, agent_type)?.and_then(|b| b.session_id) {
+            if let Some(conn) = self.conns.read().await.get(agent_type) {
+                if conn.has_active_turn(&sid) {
+                    conn.cancel_session(&sid);
                 }
             }
-            let live = self
-                .db
-                .get_binding(context_id, agent_type)
-                .ok()
-                .flatten()
-                .and_then(|b| b.session_id)
-                .unwrap_or(sid);
-            conn.notify("session/cancel", json!({ "sessionId": live }));
         }
         Ok(())
     }
@@ -794,34 +819,33 @@ impl AgentManager {
         let Some(context) = self.db.get_context_row(context_id) else {
             return Ok(());
         };
-        let (conn, sid) = self.ensure_session_inner(&context, agent_type, false).await?;
-        conn.request("session/set_mode", json!({ "sessionId": sid, "modeId": mode_id }), Some(Duration::from_secs(15)))
+        let lock = self.bind_lock(context_id, agent_type);
+        let _guard = lock.lock().await;
+        let (conn, sid) = self.ensure_session_locked(&context, agent_type, false).await?;
+        conn.set_session_mode(&sid, mode_id)
             .await?;
         // 之后任何 session-ready 都会把 cached_caps 发给前端：同步缓存，避免刷回旧模式
-        conn.note_mode(mode_id);
+        conn.note_mode(&sid, mode_id);
         Ok(())
     }
 
-    pub async fn set_config_option(&self, context_id: &str, agent_type: &str, option_id: &str, value: Value) -> Result<(), String> {
+    pub async fn set_config_option(&self, context_id: &str, agent_type: &str, option_id: &str, value: Value, expected_session_id: Option<&str>) -> Result<(), String> {
         let Some(context) = self.db.get_context_row(context_id) else {
             return Ok(());
         };
-        // 走 ensure_session 而非裸绑定 id：适配器重启后内存中无旧会话，
-        // 直接发请求会得到 "Session ... not found"（-32603）；装载/恢复失败时
-        // ensure_session 会解绑并新建，再对返回的活跃 id 应用配置。
-        // quiet（不发 session-ready）：否则前端「配置记忆」effect 重套配置再触发
-        // 本函数，形成 IPC 风暴直至 Win32 消息队列耗尽
-        let (conn, sid) = self.ensure_session_inner(&context, agent_type, false).await?;
-        let res = conn.request(
-            "session/set_config_option",
-            // codex-acp expects `configId`; zed-style adapters use `configOptionId` — send both
-            json!({ "sessionId": sid, "configOptionId": option_id, "configId": option_id, "value": value }),
-            Some(Duration::from_secs(15)),
-        )
-        .await?;
+        let lock = self.bind_lock(context_id, agent_type);
+        let _guard = lock.lock().await;
+        if let Some(expected) = expected_session_id {
+            let current = self.db.get_binding(context_id, agent_type)?.and_then(|b| b.session_id);
+            if current.as_deref() != Some(expected) { return Err("会话绑定已改变，忽略过期配置请求".into()); }
+        }
+        // Quiet: emitting session-ready here would trigger the UI preference
+        // effect recursively. A failed load leaves the original binding intact.
+        let (conn, sid) = self.ensure_session_locked(&context, agent_type, false).await?;
+        let res = conn.set_session_config(&sid, option_id, &value).await?;
         // 同步能力缓存（适配器返回新的 configOptions 就整体采纳，否则只改这一项）：
         // 之后的 session-ready 携带 cached_caps，不同步会把前端刚改的值刷回旧值
-        conn.note_config_option(option_id, &value, &res);
+        conn.note_config_option(&sid, option_id, &value, &res);
         // 记住模型选择（会话恢复时也能看到）
         if option_id == "model" {
             if let Some(m) = value.as_str() {
@@ -853,14 +877,6 @@ impl AgentManager {
         } else {
             Err("适配器未连接，无法应答输入请求".into())
         }
-    }
-
-    /// Capabilities payload for the UI after a resume. Load responses carry
-    /// models/modes but we may skip the load when the session is already live —
-    /// in that case reuse whatever the UI already has (frontend merges).
-    fn session_caps(&self, conn: &Arc<AcpConnection>, _sid: &str) -> Value {
-        let info = conn.agent_info.lock().unwrap().clone();
-        json!({ "fromResume": true, "agentCapabilities": info.get("agentCapabilities").cloned().unwrap_or(Value::Null) })
     }
 
     pub fn setup_status(&self) -> SetupStatus {

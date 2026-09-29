@@ -278,7 +278,8 @@ export interface ToolCallUpdate {
   title?: string;
   kind?: string;
   status?: "pending" | "in_progress" | "completed" | "failed";
-  content?: unknown[];
+  /** Standard tool content, or a bounded string when the payload is oversized. */
+  content?: unknown;
   rawInput?: unknown;
   rawOutput?: unknown;
   locations?: { path: string; line?: number }[];
@@ -345,6 +346,8 @@ export interface ConfigOption {
 }
 
 export interface SessionReadyInfo {
+  title?: string | null;
+  connectionId?: string;
   agentType: AgentType;
   contextId: string;
   sessionId: string;

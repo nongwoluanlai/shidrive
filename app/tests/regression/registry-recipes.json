@@ -1,0 +1,47 @@
+{
+  "repository": "https://github.com/agentclientprotocol/registry",
+  "commit": "9875e7702461a68b8252f929a35fb05c26ad86a2",
+  "recipes": {
+    "cline": {
+      "file": "cline/agent.json",
+      "version": "3.0.65",
+      "package": "cline@3.0.65",
+      "args": [
+        "--acp"
+      ]
+    },
+    "codebuddy": {
+      "file": "codebuddy-code/agent.json",
+      "version": "2.159.0",
+      "package": "@tencent-ai/codebuddy-code@2.159.0",
+      "args": [
+        "--acp"
+      ]
+    },
+    "qoder": {
+      "file": "qoder/agent.json",
+      "version": "0.2.14",
+      "package": "@qoder-ai/qodercli@0.2.14",
+      "args": [
+        "--acp"
+      ]
+    },
+    "minimax": {
+      "file": "minimax-code/agent.json",
+      "version": "0.2.7",
+      "package": "@minimax-ai/code@0.2.7",
+      "args": [
+        "acp"
+      ]
+    },
+    "grok": {
+      "file": "grok-build/agent.json",
+      "version": "1.0.44",
+      "package": "@xai-official/grok@1.0.44",
+      "args": [
+        "agent",
+        "stdio"
+      ]
+    }
+  }
+}

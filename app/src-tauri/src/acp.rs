@@ -1,14 +1,25 @@
-//! Minimal ACP (Agent Client Protocol) client over stdio JSON-RPC.
+//! ShiDrive host integration around the official ACP Rust SDK (stable protocol v1).
 //!
-//! Speaks newline-delimited JSON-RPC 2.0 with an adapter process
-//! (e.g. `@agentclientprotocol/codex-acp`, `zcode-acp-server`).
+//! The SDK owns JSON-RPC framing/dispatch, IDs and pending replies. This module
+//! owns the process, session routing, UI decisions and lifecycle policies.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use agent_client_protocol::{
+    schema::{v1 as protocol, ProtocolVersion},
+    Agent, Client, ConnectionTo, Error as SdkError, JsonRpcRequest, Lines, UntypedMessage,
+};
+use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
+
+#[path = "acp_compat.rs"]
+mod compat;
+#[path = "acp_file_tasks.rs"]
+mod file_tasks;
 use tauri::{AppHandle, Emitter};
 
 use crate::models::AgentLaunch;
@@ -19,44 +30,64 @@ pub const EVT_PERMISSION: &str = "acp://permission";
 /// ACP unstable elicitation：agent 请求用户输入（选项/自由文本），ACP 规范尚未转正，
 /// 适配器侧以 MCP elicitation 形状桥接（message + requestedSchema → {action, content}）
 pub const EVT_ELICIT: &str = "acp://elicitation";
+pub const EVT_REQUESTS_CANCELLED: &str = "acp://requests-cancelled";
 
-type PendingMap = Arc<Mutex<HashMap<Value, tokio::sync::oneshot::Sender<Result<Value, String>>>>>;
-/// permission_key ("{agent_type}:{rpc_id}") -> resolver delivering the chosen option id
-type PermissionMap = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Value>>>>;
-/// elicitation_key -> resolver delivering {action: accept|decline|cancel, content?}
+/// Requests retain their session identity so cancellation cannot affect another turn.
+struct UserRequest {
+    session_id: String,
+    tx: tokio::sync::oneshot::Sender<Value>,
+}
+/// One lock orders gate changes, insertion/removal and UI events. A cancelled
+/// SID stays blocked after acknowledgement until a new owned turn is accepted.
+#[derive(Default)]
+struct UserRequests {
+    permissions: HashMap<String, UserRequest>,
+    elicitations: HashMap<String, UserRequest>,
+    cancelled_sessions: HashSet<String>,
+}
 
 /// Match adapter and preflight environment, including PATH prefix semantics.
-pub(crate) fn apply_launch_env(cmd: &mut tokio::process::Command, env: &std::collections::BTreeMap<String, String>) {
+pub(crate) fn apply_launch_env(
+    cmd: &mut tokio::process::Command,
+    env: &std::collections::BTreeMap<String, String>,
+) {
     cmd.env("PYTHONUNBUFFERED", "1");
     for (key, value) in env {
         if key.eq_ignore_ascii_case("PATH") {
             let mut paths: Vec<_> = std::env::split_paths(value).collect();
-            if let Some(current) = std::env::var_os("PATH") { paths.extend(std::env::split_paths(&current)); }
-            cmd.env("PATH", std::env::join_paths(paths).unwrap_or_else(|_| value.into()));
+            if let Some(current) = std::env::var_os("PATH") {
+                paths.extend(std::env::split_paths(&current));
+            }
+            cmd.env(
+                "PATH",
+                std::env::join_paths(paths).unwrap_or_else(|_| value.into()),
+            );
         } else {
             cmd.env(key, value);
         }
     }
 }
 
-struct PendingRequest { pending: PendingMap, id: Value }
-
-/// JSON-RPC ids may be numbers or strings; adapters choose either. Never coerce.
-fn parse_rpc_id(v: Option<&Value>) -> Option<Value> {
-    let v = v?;
-    match v {
-        Value::Number(_) | Value::String(_) => Some(v.clone()),
-        _ => None,
-    }
+/// A pending *UI decision*, not a JSON-RPC pending response. A dropped SDK
+/// callback must also remove its dialog, even if the transport is still alive.
+struct UserDecisionGuard {
+    connection: Weak<AcpConnection>,
+    request_id: String,
 }
-impl Drop for PendingRequest {
-    fn drop(&mut self) { self.pending.lock().unwrap().remove(&self.id); }
+impl Drop for UserDecisionGuard {
+    fn drop(&mut self) {
+        if let Some(conn) = self.connection.upgrade() {
+            conn.cancel_user_request(&self.request_id);
+        }
+    }
 }
 
 /// Accumulated transcript of the current turn for one session (persisted on turn end).
 #[derive(Default)]
 struct TurnBuffer {
     context_id: Option<String>,
+    turn_id: String,
+    source: String,
     text: String,
     thought: String,
     tools: Vec<Value>,
@@ -64,13 +95,14 @@ struct TurnBuffer {
 
 pub struct AcpConnection {
     pub agent_type: String,
-    out_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Distinguishes session ids reused after a process restart.
+    pub connection_id: String,
+    sdk: Mutex<Option<ConnectionTo<Agent>>>,
+    closed: tokio::sync::watch::Sender<bool>,
     child: Mutex<Option<tokio::process::Child>>,
     io_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
-    next_id: AtomicI64,
-    pending: PendingMap,
-    permissions: PermissionMap,
-    elicitations: PermissionMap,
+    requests: Mutex<UserRequests>,
+    file_tasks: Arc<file_tasks::FileTasks>,
     buffers: Arc<Mutex<HashMap<String, TurnBuffer>>>,
     /// sessions currently being loaded (replay updates are discarded)
     loading: Arc<Mutex<HashSet<String>>>,
@@ -79,26 +111,29 @@ pub struct AcpConnection {
     /// serialize session/load operations (adapters dislike concurrent loads)
     load_lock: Arc<tokio::sync::Mutex<()>>,
     /// cached capability fragments (models/modes/configOptions) from session responses
-    caps_cache: Mutex<Value>,
+    caps_cache: Mutex<HashMap<String, Value>>,
     /// sessions whose updates are being captured (history replay on bind)
     capturing: Arc<Mutex<HashSet<String>>>,
     captures: Arc<Mutex<HashMap<String, Vec<Value>>>>,
     pub agent_info: Mutex<Value>,
     alive: AtomicBool,
+    lifecycle: Mutex<()>,
     app: AppHandle,
 }
 
 impl Drop for AcpConnection {
     fn drop(&mut self) {
-        if let Some(child) = self.child.lock().unwrap().as_mut() {
-            let _ = child.start_kill();
-        }
+        self.on_closed();
     }
 }
 
 impl AcpConnection {
     /// Spawn the adapter process and perform the ACP handshake.
-    pub async fn spawn(app: AppHandle, agent_type: &str, launch: &AgentLaunch) -> Result<Arc<Self>, String> {
+    pub async fn spawn(
+        app: AppHandle,
+        agent_type: &str,
+        launch: &AgentLaunch,
+    ) -> Result<Arc<Self>, String> {
         let mut cmd = tokio::process::Command::new(&launch.command);
         cmd.args(&launch.args)
             .env("PYTHONUNBUFFERED", "1")
@@ -110,25 +145,13 @@ impl AcpConnection {
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 
-        let mut child = cmd.spawn().map_err(|e| format!("启动适配器失败 ({}): {e}", launch.command))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("启动适配器失败 ({}): {e}", launch.command))?;
         crate::child_job::attach(&child); // 随宿主退出回收（含其派生的 codex 等孙进程）
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let stderr = child.stderr.take().ok_or("no stderr")?;
-
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let writer_task = tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let mut writer = stdin;
-            while let Some(line) = out_rx.recv().await {
-                if writer.write_all(line.as_bytes()).await.is_err() {
-                    break;
-                }
-                if writer.flush().await.is_err() {
-                    break;
-                }
-            }
-        });
 
         // Log adapter stderr (never blocking the protocol).
         let stderr_type = agent_type.to_string();
@@ -143,108 +166,225 @@ impl AcpConnection {
             }
         });
 
+        let (closed, _) = tokio::sync::watch::channel(false);
         let conn = Arc::new(Self {
             agent_type: agent_type.to_string(),
-            out_tx,
+            connection_id: uuid::Uuid::new_v4().to_string(),
+            sdk: Mutex::new(None),
+            closed,
             child: Mutex::new(Some(child)),
-            io_tasks: Mutex::new(vec![writer_task.abort_handle(), stderr_task.abort_handle()]),
-            next_id: AtomicI64::new(1),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            permissions: Arc::new(Mutex::new(HashMap::new())),
-            elicitations: Arc::new(Mutex::new(HashMap::new())),
+            io_tasks: Mutex::new(vec![stderr_task.abort_handle()]),
+            requests: Mutex::new(UserRequests::default()),
+            file_tasks: file_tasks::FileTasks::new(),
             buffers: Arc::new(Mutex::new(HashMap::new())),
             loading: Arc::new(Mutex::new(HashSet::new())),
             loaded: Arc::new(Mutex::new(HashSet::new())),
             load_lock: Arc::new(tokio::sync::Mutex::new(())),
-            caps_cache: Mutex::new(Value::Null),
+            caps_cache: Mutex::new(HashMap::new()),
             capturing: Arc::new(Mutex::new(HashSet::new())),
             captures: Arc::new(Mutex::new(HashMap::new())),
             agent_info: Mutex::new(Value::Null),
             alive: AtomicBool::new(true),
+            lifecycle: Mutex::new(()),
             app,
         });
 
-        conn.spawn_reader(stdout);
         conn.emit_status("connecting", None);
         // Also closes the process when the initialize future is cancelled.
         struct InitGuard(Option<Arc<AcpConnection>>);
         impl Drop for InitGuard {
-            fn drop(&mut self) { if let Some(conn) = self.0.take() { conn.shutdown(); } }
+            fn drop(&mut self) {
+                if let Some(conn) = self.0.take() {
+                    conn.shutdown();
+                }
+            }
         }
         let mut guard = InitGuard(Some(conn.clone()));
 
-        let init = conn
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": 1,
-                    "clientCapabilities": {
-                        "fs": { "readTextFile": true, "writeTextFile": true },
-                        "terminal": false
-                    }
-                }),
-                Some(Duration::from_secs(30)),
+        let ready = conn.start_sdk(stdin, stdout);
+        ready
+            .await
+            .map_err(|_| "ACP SDK 连接任务未启动".to_string())?;
+        let request = protocol::InitializeRequest::new(ProtocolVersion::V1)
+            .client_capabilities(
+                protocol::ClientCapabilities::new()
+                    .fs(protocol::FileSystemCapabilities::new()
+                        .read_text_file(true)
+                        .write_text_file(true))
+                    .terminal(false),
             )
+            .client_info(protocol::Implementation::new(
+                "shidrive",
+                env!("CARGO_PKG_VERSION"),
+            ));
+        let init = conn
+            .sdk_request(compat::Preserve(request), Some(Duration::from_secs(30)))
             .await?;
-        conn.emit_status("connected", Some(&init));
-        *conn.agent_info.lock().unwrap() = init;
+        if init.typed.protocol_version != ProtocolVersion::V1 {
+            return Err(format!(
+                "适配器返回了不支持的 ACP 协议版本：{}（当前使用 v1）",
+                init.typed.protocol_version
+            ));
+        }
+        {
+            // Serialize connected/disconnected events with driver shutdown.
+            let _lifecycle = conn.lifecycle.lock().unwrap();
+            if !conn.is_alive() {
+                return Err("适配器在 initialize 完成前断开了连接".into());
+            }
+            conn.emit_status("connected", Some(&init.raw));
+            *conn.agent_info.lock().unwrap() = init.raw;
+        }
         guard.0 = None;
         Ok(conn)
     }
 
-    fn spawn_reader(self: &Arc<Self>, stdout: tokio::process::ChildStdout) {
-        let conn = self.clone();
-        let task = tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut reader = stdout;
-            let mut buf = Vec::with_capacity(8192);
-            let mut chunk = [0u8; 8192];
-            'outer: loop {
-                match reader.read(&mut chunk).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                }
-                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = buf.drain(..=pos).collect();
-                    let s = String::from_utf8_lossy(&line);
-                    let s = s.trim();
-                    if s.is_empty() {
-                        continue;
-                    }
-                    match serde_json::from_str::<Value>(s) {
-                        Ok(msg) => {
-                            if conn.handle_message(msg).await.is_err() {
-                                break 'outer;
-                            }
+    fn start_sdk(
+        self: &Arc<Self>,
+        stdin: tokio::process::ChildStdin,
+        stdout: tokio::process::ChildStdout,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        // Standard Tokio codec supplies a bounded line stream. The SDK's Lines
+        // transport, not ShiDrive code, parses and writes JSON-RPC frames.
+        const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
+        let transport = Lines::new(
+            SinkExt::<String>::sink_map_err(
+                FramedWrite::new(stdin, LinesCodec::new()),
+                std::io::Error::other,
+            ),
+            FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_BYTES))
+                .map(|line| line.map_err(std::io::Error::other)),
+        );
+        let notify_conn = Arc::downgrade(self);
+        let permission_conn = Arc::downgrade(self);
+        let elicitation_conn = Arc::downgrade(self);
+        let write_conn = Arc::downgrade(self);
+        let read_files = self.file_tasks.clone();
+        let write_files = self.file_tasks.clone();
+        let close_conn = Arc::downgrade(self);
+        let ready_conn = Arc::downgrade(self);
+        let exit_conn = Arc::downgrade(self);
+        let mut stopped = self.closed.subscribe();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let builder = Client.builder().name("shidrive-acp-v1")
+            .on_receive_notification(async move |notification: compat::SessionUpdate, _cx| {
+                if let Some(conn) = notify_conn.upgrade() { conn.handle_session_update(notification); }
+                Ok(())
+            }, agent_client_protocol::on_receive_notification!())
+            .on_receive_request(async move |request: protocol::ReadTextFileRequest, responder, cx| {
+                let job = read_files.reserve(&request.session_id.to_string(), request.path.as_os_str().len())?;
+                let cancellation = responder.cancellation();
+                cx.spawn(async move {
+                    let result = job.run(cancellation, move || {
+                        read_text_file_range(&request.path.to_string_lossy(), request.line.map(u64::from), request.limit.map(u64::from))
+                    }).await.map(protocol::ReadTextFileResponse::new);
+                    let _ = responder.respond_with_result(result);
+                    Ok(())
+                })
+            }, agent_client_protocol::on_receive_request!())
+            .on_receive_request(async move |request: compat::WriteTextFile, responder, cx| {
+                let request = request.0;
+                let job = write_files.reserve(&request.session_id.to_string(), request.content.len().saturating_add(request.path.as_os_str().len()))?;
+                let cancellation = responder.cancellation();
+                let weak = write_conn.clone();
+                cx.spawn(async move {
+                    let path = request.path.clone();
+                    let result = job.run(cancellation, move || {
+                        std::fs::write(request.path, request.content).map_err(|e| e.to_string())
+                    }).await;
+                    if result.is_ok() {
+                        if let Some(conn) = weak.upgrade().filter(|conn| conn.is_alive()) {
+                            let _ = conn.app.emit(EVT_UPDATE, json!({ "agentType": conn.agent_type, "fileChanged": path }));
                         }
-                        Err(e) => log::debug!("[{}] non-json line: {e}", conn.agent_type),
                     }
-                }
-                if buf.len() > 32 * 1024 * 1024 {
-                    break;
+                    let _ = responder.respond_with_result(result.map(|_| protocol::WriteTextFileResponse::new()));
+                    Ok(())
+                })
+            }, agent_client_protocol::on_receive_request!())
+            .on_receive_request(async move |request: protocol::RequestPermissionRequest, responder, cx| {
+                let conn = permission_conn.upgrade().ok_or_else(SdkError::internal_error)?;
+                let Some((request_id, rx)) = conn.enqueue_decision(&request.session_id.to_string(), serde_json::to_value(request)?, false)? else {
+                    return responder.respond(protocol::RequestPermissionResponse::new(protocol::RequestPermissionOutcome::Cancelled));
+                };
+                let guard = UserDecisionGuard { connection: permission_conn.clone(), request_id };
+                let cancellation = responder.cancellation();
+                drop(conn);
+                cx.spawn(async move {
+                    let _guard = guard;
+                    let outcome = tokio::select! {
+                        value = rx => serde_json::from_value::<protocol::RequestPermissionResponse>(json!({
+                            "outcome": value.unwrap_or_else(|_| json!({"outcome":"cancelled"}))
+                        })).map_err(SdkError::from),
+                        _ = cancellation.cancelled() => Err(SdkError::request_cancelled()),
+                    };
+                    let _ = responder.respond_with_result(outcome);
+                    Ok(())
+                })
+            }, agent_client_protocol::on_receive_request!())
+            .on_receive_request(async move |request: compat::Elicitation, responder, cx| {
+                let conn = elicitation_conn.upgrade().ok_or_else(SdkError::internal_error)?;
+                let sid = request.params.get("sessionId").and_then(Value::as_str).unwrap_or_default().to_string();
+                let Some((request_id, rx)) = conn.enqueue_decision(&sid, request.params, true)? else {
+                    return responder.respond(json!({"action":"cancel"}));
+                };
+                let guard = UserDecisionGuard { connection: elicitation_conn.clone(), request_id };
+                let cancellation = responder.cancellation();
+                drop(conn);
+                cx.spawn(async move {
+                    let _guard = guard;
+                    let outcome = tokio::select! {
+                        value = rx => Ok(value.unwrap_or_else(|_| json!({"action":"cancel"}))),
+                        _ = cancellation.cancelled() => Err(SdkError::request_cancelled()),
+                    };
+                    let _ = responder.respond_with_result(outcome);
+                    Ok(())
+                })
+            }, agent_client_protocol::on_receive_request!())
+            .on_close(async move |_cx| {
+                if let Some(conn) = close_conn.upgrade() { conn.on_closed(); }
+                Ok(())
+            });
+        let driver = builder.connect_with(transport, async move |cx| {
+            if let Some(conn) = ready_conn.upgrade() {
+                *conn.sdk.lock().unwrap() = Some(cx.clone());
+            }
+            let _ = ready_tx.send(());
+            cx.incoming_closed().await;
+            Ok(())
+        });
+        let task = tokio::spawn(async move {
+            // EOF, parse/IO failure, explicit disconnect AND a dropped driver
+            // all clear the host-owned permission/elicitation queues.
+            struct DriverExit(Weak<AcpConnection>);
+            impl Drop for DriverExit {
+                fn drop(&mut self) {
+                    if let Some(conn) = self.0.upgrade() {
+                        conn.on_closed();
+                    }
                 }
             }
-            conn.on_closed();
+            let _exit = DriverExit(exit_conn);
+            tokio::select! {
+                result = driver => if let Err(error) = result { log::debug!("ACP SDK connection ended: {error}"); },
+                _ = stopped.changed() => {},
+            }
         });
         self.io_tasks.lock().unwrap().push(task.abort_handle());
+        ready_rx
     }
 
     fn on_closed(&self) {
+        let _lifecycle = self.lifecycle.lock().unwrap();
         if !self.alive.swap(false, Ordering::SeqCst) {
             return;
         }
-        // fail all pending requests
-        let mut pending = self.pending.lock().unwrap();
-        for (_, tx) in pending.drain() {
-            let _ = tx.send(Err("适配器连接已断开".into()));
-        }
-        drop(pending);
-        // cancel pending permissions with "reject"
-        let mut perms = self.permissions.lock().unwrap();
-        for (_, tx) in perms.drain() {
-            let _ = tx.send(json!({ "optionId": "__connection_closed__" }));
-        }
-        drop(perms);
+        // JSON-RPC pending replies belong to the SDK. Wake application callers
+        // as well, including ones waiting during an explicit local shutdown.
+        self.file_tasks.close();
+        self.closed.send_replace(true);
+        self.sdk.lock().unwrap().take();
+        // Close both UI queues, including unscoped legacy elicitations.
+        self.cancel_user_requests(None);
         // Windows：先按 PID 终止整棵进程树（适配器派生的 codex/node 孙进程
         // 不随直接子进程死亡）；start_kill 作为兜底
         #[cfg(windows)]
@@ -253,8 +393,14 @@ impl AcpConnection {
                 .args(["/F", "/T", "/PID", &pid.to_string()])
                 .output();
         }
-        if let Some(child) = self.child.lock().unwrap().as_mut() { let _ = child.start_kill(); }
-        for task in self.io_tasks.lock().unwrap().drain(..) { task.abort(); }
+        // Drop the handle after requesting termination: Tokio then reaps the
+        // child even while the manager still caches this closed connection.
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            let _ = child.start_kill();
+        }
+        for task in self.io_tasks.lock().unwrap().drain(..) {
+            task.abort();
+        }
         self.emit_status("disconnected", None);
     }
 
@@ -265,274 +411,312 @@ impl AcpConnection {
         );
     }
 
-    /// Handle one incoming JSON-RPC message. Returns Err when the stream should close.
-    async fn handle_message(self: &Arc<Self>, msg: Value) -> Result<(), ()> {
-        let method = msg.get("method").and_then(|m| m.as_str()).map(|s| s.to_string());
-        let id = parse_rpc_id(msg.get("id"));
-
-        match (method.as_deref(), id) {
-            // response to our request
-            (None, Some(id)) => {
-                if let Some(tx) = self.pending.lock().unwrap().remove(&id) {
-                    if let Some(err) = msg.get("error") {
-                        let _ = tx.send(Err(format_acp_error(err)));
-                    } else {
-                        let _ = tx.send(Ok(msg.get("result").cloned().unwrap_or(Value::Null)));
-                    }
-                }
-                Ok(())
-            }
-            // server -> client request
-            (Some(m), Some(id)) => {
-                let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                self.handle_server_request(id, m, params).await;
-                Ok(())
-            }
-            // notification
-            (Some(m), None) => {
-                if m == "session/update" {
-                    let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                    self.handle_session_update(params);
-                }
-                Ok(())
-            }
-            (None, None) => Ok(()),
+    fn enqueue_decision(
+        &self,
+        session_id: &str,
+        params: Value,
+        elicitation: bool,
+    ) -> Result<Option<(String, tokio::sync::oneshot::Receiver<Value>)>, SdkError> {
+        let mut requests = self.requests.lock().unwrap();
+        if !self.is_alive() {
+            return Err(SdkError::internal_error().data("适配器连接已断开"));
         }
-    }
-
-    async fn handle_server_request(self: &Arc<Self>, id: Value, method: &str, params: Value) {
-        match method {
-            "fs/read_text_file" => {
-                let path = params.get("path").and_then(|p| p.as_str()).unwrap_or_default();
-                let line = params.get("line").and_then(|v| v.as_u64());
-                let limit = params.get("limit").and_then(|v| v.as_u64());
-                match read_text_file_range(path, line, limit) {
-                    Ok(content) => self.respond(id, Ok(json!({ "content": content }))),
-                    Err(e) => self.respond(id, Err(json!({ "code": -32000, "message": e }))),
-                }
-            }
-            "fs/write_text_file" => {
-                let path = params.get("path").and_then(|p| p.as_str()).unwrap_or_default();
-                let contents = params.get("contents").and_then(|c| c.as_str()).unwrap_or_default();
-                match std::fs::write(path, contents) {
-                    Ok(_) => {
-                        let _ = self.app.emit(EVT_UPDATE, json!({ "agentType": self.agent_type, "fileChanged": path }));
-                        self.respond(id, Ok(Value::Null))
-                    }
-                    Err(e) => self.respond(id, Err(json!({ "code": -32000, "message": e.to_string() }))),
-                }
-            }
-            "session/request_permission" => {
-                let session_id = params.get("sessionId").and_then(|s| s.as_str()).unwrap_or_default().to_string();
-                let key = format!("{}:{}:{id}", self.agent_type, uuid::Uuid::new_v4());
-                let (tx, rx) = tokio::sync::oneshot::channel::<Value>();
-                {
-                    let mut permissions = self.permissions.lock().unwrap();
-                    if !self.is_alive() { return; }
-                    permissions.insert(key.clone(), tx);
-                }
-                let _ = self.app.emit(
-                    EVT_PERMISSION,
-                    json!({
-                        "requestId": key,
-                        "agentType": self.agent_type,
-                        "sessionId": session_id,
-                        "params": params,
-                    }),
-                );
-                // Do not block the protocol reader on a user decision: it must still
-                // process prompt cancellation, responses and EOF.
-                let conn = self.clone();
-                tokio::spawn(async move {
-                    let outcome = rx.await.unwrap_or_else(|_| json!({ "outcome": "cancelled" }));
-                    if conn.is_alive() {
-                        conn.respond(id, Ok(json!({ "outcome": outcome })));
-                    }
-                });
-            }
-            // ACP unstable elicitation（含常见别名）：agent 向用户请求结构化输入。
-            // 与 request_permission 同构：事件到 UI，oneshot 等待用户作答；
-            // 应答整体为 { action: "accept"|"decline"|"cancel", content?: {...} }，原样回给适配器。
-            "elicitation/create" | "session/elicitation/create" | "elicitation/request" => {
-                let session_id = params.get("sessionId").and_then(|s| s.as_str()).unwrap_or_default().to_string();
-                let key = format!("{}:{}:{id}", self.agent_type, uuid::Uuid::new_v4());
-                let (tx, rx) = tokio::sync::oneshot::channel::<Value>();
-                {
-                    let mut m = self.elicitations.lock().unwrap();
-                    if !self.is_alive() { return; }
-                    m.insert(key.clone(), tx);
-                }
-                let _ = self.app.emit(
-                    EVT_ELICIT,
-                    json!({
-                        "requestId": key,
-                        "agentType": self.agent_type,
-                        "sessionId": session_id,
-                        "params": params,
-                    }),
-                );
-                let conn = self.clone();
-                tokio::spawn(async move {
-                    let outcome = rx.await.unwrap_or_else(|_| json!({ "action": "cancel" }));
-                    if conn.is_alive() {
-                        conn.respond(id, Ok(outcome));
-                    }
-                });
-            }
-            "terminal/create" | "terminal/output" | "terminal/wait_for_exit" | "terminal/release" | "terminal/kill" => {
-                self.respond(id, Err(json!({ "code": -32601, "message": "terminal not supported" })));
-            }
-            other => {
-                log::debug!("[{}] unhandled server request: {other}", self.agent_type);
-                self.respond(id, Err(json!({ "code": -32601, "message": "method not found" })));
-            }
+        // Empty SID is an explicitly connection-scoped legacy extension. Do
+        // not guess a current turn or cancel it when an unrelated SID stops.
+        if !session_id.is_empty() && requests.cancelled_sessions.contains(session_id) {
+            return Ok(None);
         }
-    }
-
-    fn respond(&self, id: Value, result: Result<Value, Value>) {
-        let msg = match result {
-            Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
-            Err(e) => json!({ "jsonrpc": "2.0", "id": id, "error": e }),
+        let key = format!("{}:{}", self.agent_type, uuid::Uuid::new_v4());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (map, event) = if elicitation {
+            (&mut requests.elicitations, EVT_ELICIT)
+        } else {
+            (&mut requests.permissions, EVT_PERMISSION)
         };
-        let _ = self.out_tx.send(msg.to_string() + "\n");
+        map.insert(
+            key.clone(),
+            UserRequest {
+                session_id: session_id.into(),
+                tx,
+            },
+        );
+        // Same lock for the gate, insertion, cancellation and emission: no
+        // expired dialog can be published after its cancellation event.
+        let _ = self.app.emit(event, json!({
+            "requestId": key, "agentType": self.agent_type, "sessionId": session_id, "params": params
+        }));
+        Ok(Some((key, rx)))
     }
 
-    fn handle_session_update(&self, params: Value) {
-        let session_id = params.get("sessionId").and_then(|s| s.as_str()).unwrap_or_default().to_string();
-        // history capture (bind flow): buffer replay updates instead of emitting
+    fn cancel_user_request(&self, request_id: &str) {
+        let mut guard = self.requests.lock().unwrap();
+        let requests = &mut *guard;
+        for (map, outcome) in [
+            (&mut requests.permissions, json!({"outcome":"cancelled"})),
+            (&mut requests.elicitations, json!({"action":"cancel"})),
+        ] {
+            if let Some(request) = map.remove(request_id) {
+                let _ = request.tx.send(outcome);
+                let _ = self.app.emit(EVT_REQUESTS_CANCELLED, json!({
+                    "agentType": self.agent_type, "connectionId": self.connection_id, "requestIds": [request_id]
+                }));
+            }
+        }
+    }
+
+    fn handle_session_update(&self, notification: compat::SessionUpdate) {
+        let session_id = notification.typed.session_id.to_string();
+        let raw = notification
+            .raw
+            .get("update")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let utype = raw
+            .get("sessionUpdate")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let update = if matches!(utype.as_str(), "tool_call" | "tool_call_update") {
+            compact_tool_update(&raw)
+        } else {
+            raw
+        };
         if self.capturing.lock().unwrap().contains(&session_id) {
             self.captures
                 .lock()
                 .unwrap()
                 .entry(session_id)
                 .or_default()
-                .push(params.get("update").cloned().unwrap_or(Value::Null));
+                .push(update);
             return;
         }
-        // discard replay during session/load
         if self.loading.lock().unwrap().contains(&session_id) {
             return;
         }
-        let update = params.get("update").cloned().unwrap_or(Value::Null);
-        let utype = update.get("sessionUpdate").and_then(|t| t.as_str()).unwrap_or_default();
-
-        // accumulate transcript —— 只对有进行中回合（begin_turn 登记过）的会话。
-        // 没有回合却收到正文/工具块的，只能是 session/load 重放在捕获窗口
-        // (end_capture) / 静默窗口 (finish_load) 之后才姗姗来迟的尾巴，或 cancel 之后
-        // 的残余 chunk。以前这里 entry().or_default() 兜住后照样 emit 给前端：WebView
-        // 把整段历史当成实时流再追加一遍（永不结束的 streaming 条目、逐 chunk 重渲染），
-        // 同时 Rust 侧 TurnBuffer 无人 end_turn 也一直涨——这是绑定长历史时 WebView
-        // 内存持续上涨的一条路径。现在直接丢弃，非正文类通知（模式/命令/配置更新）照常透传。
-        let is_transcript = matches!(
-            utype,
-            "agent_message_chunk" | "agent_thought_chunk" | "user_message_chunk" | "tool_call" | "tool_call_update" | "plan"
-        );
-        let mut flush_ctx: Option<String> = None;
-        {
-            let mut buffers = self.buffers.lock().unwrap();
-            let Some(buf) = buffers.get_mut(&session_id) else {
-                if is_transcript {
-                    log::debug!("[{}] drop stray {utype} for session {session_id} (no active turn)", self.agent_type);
-                    return;
-                }
-                drop(buffers);
-                let _ = self.app.emit(
-                    EVT_UPDATE,
-                    json!({ "agentType": self.agent_type, "sessionId": session_id, "contextId": Value::Null, "update": update }),
-                );
-                return;
-            };
-            match utype {
-                "agent_message_chunk" => {
-                    if let Some(t) = chunk_text(&update) {
-                        buf.text.push_str(&t);
-                    }
-                }
-                "agent_thought_chunk" => {
-                    if let Some(t) = chunk_text(&update) {
-                        buf.thought.push_str(&t);
-                    }
-                }
-                "tool_call" => {
-                    buf.tools.push(update.clone());
-                }
-                "tool_call_update" => {
-                    let tid = update.get("toolCallId").and_then(|t| t.as_str());
-                    if let Some(existing) = buf.tools.iter_mut().find(|t| {
-                        t.get("toolCallId").and_then(|x| x.as_str()) == tid
-                            || t.get("update").and_then(|u| u.get("toolCallId")).and_then(|x| x.as_str()) == tid
-                    }) {
-                        // merge fields so the original title/kind survive updates
-                        if let (Some(obj), Some(newobj)) = (existing.as_object_mut(), update.as_object()) {
-                            for (k, v) in newobj {
-                                obj.insert(k.clone(), v.clone());
-                            }
-                        }
-                    } else {
-                        buf.tools.push(update.clone());
-                    }
-                }
-                _ => {}
-            }
-            if !matches!(utype, "user_message_chunk") {
-                flush_ctx = buf.context_id.clone();
+        if utype == "config_option_update" {
+            self.cache_caps(&session_id, &update);
+        }
+        if utype == "current_mode_update" {
+            if let Some(mode) = update.get("currentModeId").and_then(Value::as_str) {
+                self.note_mode(&session_id, mode);
             }
         }
-
-        // 工具调用负载只发前端真正渲染的部分（见 compact_tool_update）——实时回合里的
-        // 命令输出 / diff / MCP 结果与绑定重放一样会在 WebView 里成倍放大并把本地快照撑爆
-        let update = if matches!(utype, "tool_call" | "tool_call_update") { compact_tool_update(&update) } else { update };
+        let is_transcript = matches!(
+            utype.as_str(),
+            "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "user_message_chunk"
+                | "tool_call"
+                | "tool_call_update"
+                | "plan"
+        );
+        let route = {
+            let mut buffers = self.buffers.lock().unwrap();
+            if let Some(buf) = buffers.get_mut(&session_id) {
+                match utype.as_str() {
+                    "agent_message_chunk" => {
+                        if let Some(t) = chunk_text(&update) {
+                            buf.text.push_str(&t);
+                        }
+                    }
+                    "agent_thought_chunk" => {
+                        if let Some(t) = chunk_text(&update) {
+                            buf.thought.push_str(&t);
+                        }
+                    }
+                    "tool_call" | "tool_call_update" => {
+                        let tid = update.get("toolCallId");
+                        if let Some(existing) =
+                            buf.tools.iter_mut().find(|t| t.get("toolCallId") == tid)
+                        {
+                            if let (Some(obj), Some(fields)) =
+                                (existing.as_object_mut(), update.as_object())
+                            {
+                                for (k, v) in fields {
+                                    if !v.is_null() {
+                                        obj.insert(k.clone(), v.clone());
+                                    }
+                                }
+                            }
+                        } else {
+                            buf.tools.push(update.clone());
+                        }
+                    }
+                    _ => {}
+                }
+                Some((
+                    buf.context_id.clone(),
+                    buf.turn_id.clone(),
+                    buf.source.clone(),
+                ))
+            } else {
+                None
+            }
+        };
+        if is_transcript && route.is_none() {
+            log::debug!(
+                "[{}] drop stray {utype} for session {session_id} (no active turn)",
+                self.agent_type
+            );
+            return;
+        }
+        let (context_id, turn_id, source) = route.unwrap_or((None, String::new(), "chat".into()));
+        // Workflow output belongs to the run, never to a context's unrelated binding.
+        let event = if source == "workflow" {
+            "acp://workflow-update"
+        } else {
+            EVT_UPDATE
+        };
         let _ = self.app.emit(
-            EVT_UPDATE,
+            event,
             json!({
-                "agentType": self.agent_type,
-                "sessionId": session_id,
-                "contextId": flush_ctx,
-                "update": update,
+                "agentType": self.agent_type, "connectionId": self.connection_id,
+                "sessionId": session_id, "contextId": context_id, "turnId": turn_id,
+                "source": source, "update": update,
             }),
         );
     }
 
     // ---------- outgoing ----------
 
-    pub async fn request(&self, method: &str, params: Value, timeout: Option<Duration>) -> Result<Value, String> {
-        if !self.alive.load(Ordering::SeqCst) {
-            return Err(format!("{method} 失败：适配器未连接"));
+    /// Typed SDK requests only; request IDs/pending responders are SDK-owned.
+    /// This future is polled by manager tasks, never by the SDK dispatch handler.
+    async fn sdk_request<R: JsonRpcRequest>(
+        &self,
+        request: R,
+        timeout: Option<Duration>,
+    ) -> Result<R::Response, String> {
+        let sdk = self.sdk.lock().unwrap().clone().ok_or("适配器连接已断开")?;
+        let method = request.method().to_string();
+        let mut closed = self.closed.subscribe();
+        if !self.is_alive() {
+            return Err("适配器连接已断开".into());
         }
-        let id = Value::Number(self.next_id.fetch_add(1, Ordering::SeqCst).into());
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        {
-            let mut pending = self.pending.lock().unwrap();
-            // Recheck under the same lock used to drain on disconnect.
-            if !self.is_alive() { return Err(format!("{method} 失败：适配器未连接")); }
-            pending.insert(id.clone(), tx);
-        }
-        let _pending = PendingRequest { pending: self.pending.clone(), id: id.clone() };
-        let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        // PendingRequest Drop 负责在断开时清理 pending 表
-        self.out_tx
-            .send(msg.to_string() + "\n")
-            .map_err(|_| format!("{method} 失败：无法写入适配器"))?;
-
         let wait = async {
-            rx.await.map_err(|_| format!("{method} 失败：适配器已断开"))?
+            tokio::select! {
+                // A response already delivered by the SDK wins a simultaneous
+                // EOF; otherwise a valid final prompt result could be lost.
+                biased;
+                result = sdk.send_request(request).block_task() => result.map_err(format_acp_error),
+                _ = closed.changed() => Err("适配器连接已断开".into()),
+            }
         };
         match timeout {
-            Some(d) => match tokio::time::timeout(d, wait).await {
-                Ok(res) => res,
-                Err(_) => {
-                    // drop the stale sender so it doesn't leak until disconnect
-                    self.pending.lock().unwrap().remove(&id);
-                    Err(format!("{method} 超时（{}s）", d.as_secs()))
-                }
-            },
+            Some(duration) => tokio::time::timeout(duration, wait)
+                .await
+                .map_err(|_| format!("{method} 超时（{}s）", duration.as_secs()))?,
             None => wait.await,
         }
     }
 
-    pub fn notify(&self, method: &str, params: Value) {
-        let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        let _ = self.out_tx.send(msg.to_string() + "\n");
+    async fn preserving<R: JsonRpcRequest>(
+        &self,
+        request: R,
+        timeout: Option<Duration>,
+    ) -> Result<Value, String> {
+        self.sdk_request(compat::Preserve(request), timeout)
+            .await
+            .map(|r| r.raw)
+    }
+
+    pub async fn new_session(
+        &self,
+        cwd: &str,
+        mcp_servers: Vec<protocol::McpServer>,
+    ) -> Result<Value, String> {
+        self.preserving(
+            protocol::NewSessionRequest::new(cwd).mcp_servers(mcp_servers),
+            Some(Duration::from_secs(90)),
+        )
+        .await
+    }
+
+    pub async fn close_session(&self, sid: &str) -> Result<Value, String> {
+        self.preserving(
+            protocol::CloseSessionRequest::new(sid.to_string()),
+            Some(Duration::from_secs(30)),
+        )
+        .await
+    }
+
+    pub async fn prompt_session(
+        &self,
+        sid: &str,
+        blocks: Vec<protocol::ContentBlock>,
+    ) -> Result<Value, String> {
+        self.preserving(protocol::PromptRequest::new(sid.to_string(), blocks), None)
+            .await
+    }
+
+    /// Atomically stop admissions for the SID before sending cancellation.
+    pub fn cancel_session(&self, sid: &str) {
+        self.cancel_matching_turn(sid, None);
+    }
+
+    /// Owned background turns cannot cancel a newer turn reusing the same SID.
+    pub fn cancel_turn(&self, sid: &str, turn_id: &str) {
+        self.cancel_matching_turn(sid, Some(turn_id));
+    }
+
+    fn cancel_matching_turn(&self, sid: &str, expected: Option<&str>) {
+        // Lock order: buffers -> requests -> file scope / SDK. Holding the
+        // buffers lock through notify also orders cancel against begin_turn.
+        let buffers = self.buffers.lock().unwrap();
+        if expected.is_some_and(|id| !buffers.get(sid).is_some_and(|b| b.turn_id == id)) {
+            return;
+        }
+        let mut requests = self.requests.lock().unwrap();
+        requests.cancelled_sessions.insert(sid.into());
+        self.file_tasks.cancel_session(sid);
+        self.drain_user_requests(&mut requests, Some(sid));
+        if let Some(sdk) = self.sdk.lock().unwrap().as_ref() {
+            if let Err(e) =
+                sdk.send_notification(protocol::CancelNotification::new(sid.to_string()))
+            {
+                log::debug!("ACP cancel could not be queued: {e}");
+            }
+        }
+    }
+
+    pub async fn set_session_mode(&self, sid: &str, mode: &str) -> Result<Value, String> {
+        self.preserving(
+            protocol::SetSessionModeRequest::new(sid.to_string(), mode.to_string()),
+            Some(Duration::from_secs(15)),
+        )
+        .await
+    }
+
+    pub async fn set_session_config(
+        &self,
+        sid: &str,
+        id: &str,
+        value: &Value,
+    ) -> Result<Value, String> {
+        let value = match value {
+            Value::String(s) => protocol::SessionConfigOptionValue::value_id(s.clone()),
+            Value::Bool(b) => protocol::SessionConfigOptionValue::boolean(*b),
+            _ => return Err("ACP 配置值必须是选项 ID 或布尔值".into()),
+        };
+        self.preserving(
+            protocol::SetSessionConfigOptionRequest::new(sid.to_string(), id.to_string(), value),
+            Some(Duration::from_secs(15)),
+        )
+        .await
+    }
+
+    /// Deliberate extension/test escape hatch. Standard ACP operations above
+    /// never use stringly typed requests. Framing and correlation remain SDK-owned.
+    pub async fn extension_request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, String> {
+        if !method.starts_with('_') {
+            return Err("扩展 ACP 方法名必须以下划线开头".into());
+        }
+        let request = UntypedMessage::new(method, params).map_err(format_acp_error)?;
+        self.sdk_request(request, timeout).await
     }
 
     /// Mark a session as loading (replayed updates are dropped).
@@ -558,8 +742,9 @@ impl AcpConnection {
     }
 
     /// Cache capability fragments from session/new or session/load responses.
-    pub fn cache_caps(&self, res: &Value) {
-        let mut cur = self.caps_cache.lock().unwrap();
+    pub fn cache_caps(&self, session_id: &str, res: &Value) {
+        let mut cache = self.caps_cache.lock().unwrap();
+        let cur = cache.entry(session_id.to_string()).or_insert(Value::Null);
         let mut obj = match cur.take() {
             Value::Object(o) => o,
             _ => serde_json::Map::new(),
@@ -574,20 +759,21 @@ impl AcpConnection {
         *cur = Value::Object(obj);
     }
 
-    pub fn cached_caps(&self) -> Value {
-        self.caps_cache.lock().unwrap().clone()
+    pub fn cached_caps(&self, session_id: &str) -> Value {
+        self.caps_cache.lock().unwrap().get(session_id).cloned().unwrap_or(Value::Null)
     }
 
     /// set_config_option 成功后同步能力缓存：适配器若在响应里给出新的 configOptions
     ///（codex-acp 会）就整体采纳，否则只把该项的 currentValue（以及 model 对应的
     /// currentModelId）改成刚设置的值。session-ready 事件原样携带 cached_caps，
     /// 不同步的话前端刚改的选项会被旧值刷回。
-    pub fn note_config_option(&self, option_id: &str, value: &Value, res: &Value) {
+    pub fn note_config_option(&self, session_id: &str, option_id: &str, value: &Value, res: &Value) {
         if res.get("configOptions").is_some_and(|v| v.is_array()) {
-            self.cache_caps(res);
+            self.cache_caps(session_id, res);
             return;
         }
-        let mut cur = self.caps_cache.lock().unwrap();
+        let mut cache = self.caps_cache.lock().unwrap();
+        let cur = cache.entry(session_id.to_string()).or_insert_with(|| json!({}));
         if let Some(opts) = cur.get_mut("configOptions").and_then(|v| v.as_array_mut()) {
             for o in opts.iter_mut() {
                 if o.get("id").and_then(|i| i.as_str()) == Some(option_id) {
@@ -605,8 +791,9 @@ impl AcpConnection {
     }
 
     /// set_mode 成功后同步缓存里的当前模式（理由同上）。
-    pub fn note_mode(&self, mode_id: &str) {
-        let mut cur = self.caps_cache.lock().unwrap();
+    pub fn note_mode(&self, session_id: &str, mode_id: &str) {
+        let mut cache = self.caps_cache.lock().unwrap();
+        let cur = cache.entry(session_id.to_string()).or_insert_with(|| json!({}));
         if let Some(m) = cur.get_mut("modes").and_then(|v| v.as_object_mut()) {
             m.insert("currentModeId".into(), Value::String(mode_id.to_string()));
         }
@@ -616,6 +803,12 @@ impl AcpConnection {
     pub fn begin_capture(&self, session_id: &str) {
         self.capturing.lock().unwrap().insert(session_id.to_string());
         self.captures.lock().unwrap().remove(session_id);
+    }
+
+    pub fn abort_capture(&self, session_id: &str) {
+        self.capturing.lock().unwrap().remove(session_id);
+        self.captures.lock().unwrap().remove(session_id);
+        self.loading.lock().unwrap().remove(session_id);
     }
 
     /// Stop capturing and return the buffered updates, waiting for the replay to settle.
@@ -643,37 +836,42 @@ impl AcpConnection {
 
     /// Serialized, replay-suppressed session/load with one retry. Adapters without
     /// session/load (e.g. DeepSeek Harness) fall back to session/resume.
-    pub async fn load_session(&self, session_id: &str, cwd: &str, mcp_servers: Value) -> Result<Value, String> {
+    pub async fn load_session(&self, session_id: &str, cwd: &str, mcp_servers: Vec<protocol::McpServer>) -> Result<Value, String> {
         let _g = self.load_lock.lock().await;
-        let params = json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers });
+        struct LoadGuard<'a>(&'a AcpConnection, &'a str, bool);
+        impl Drop for LoadGuard<'_> {
+            fn drop(&mut self) {
+                if !self.2 { self.0.loading.lock().unwrap().remove(self.1); }
+            }
+        }
+        let mut guard = LoadGuard(self, session_id, false);
+        let request = protocol::LoadSessionRequest::new(session_id.to_string(), cwd).mcp_servers(mcp_servers.clone());
         self.begin_load(session_id);
-        let mut res = self.request("session/load", params.clone(), Some(Duration::from_secs(60))).await;
+        let mut res = self.preserving(request.clone(), Some(Duration::from_secs(60))).await;
         if res.is_err() {
             // one retry after a short pause
             tokio::time::sleep(Duration::from_millis(600)).await;
             self.begin_load(session_id);
-            res = self.request("session/load", params, Some(Duration::from_secs(60))).await;
+            res = self.preserving(request, Some(Duration::from_secs(60))).await;
         }
         // session/load 不支持时（-32601 / 明确不支持文案）退回 session/resume
         if let Some(err_text) = res.as_ref().err() {
             let unsupported = err_text.contains("-32601") || err_text.contains("not supported")
                 || err_text.contains("不支持") || err_text.contains("Unsupported");
             if unsupported {
-                let resume_params = json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers });
+                let resume = protocol::ResumeSessionRequest::new(session_id.to_string(), cwd).mcp_servers(mcp_servers);
                 self.begin_load(session_id);
                 res = self
-                    .request("session/resume", resume_params, Some(Duration::from_secs(60)))
+                    .preserving(resume, Some(Duration::from_secs(60)))
                     .await
                     .map_err(|e| format!("session/resume 亦失败（适配器不支持 session/load）：{e}"));
             }
         }
+        if let Ok(response) = &res { self.cache_caps(session_id, response); }
         let ok = res.is_ok();
-        let err = res.as_ref().err().cloned();
         self.finish_load(session_id, ok);
-        res.map_err(|e| {
-            let _ = err;
-            e
-        })
+        guard.2 = true;
+        res
     }
     pub fn is_loaded(&self, session_id: &str) -> bool {
         self.loaded.lock().unwrap().contains(session_id)
@@ -709,13 +907,8 @@ impl AcpConnection {
         let mut arr: Vec<serde_json::Value> = Vec::new();
         let mut cursor: Option<String> = None;
         for _page in 0..50 {
-            let mut params = json!({});
-            if let Some(c) = &cursor {
-                params["cursor"] = json!(c);
-            }
-            let res = self
-                .request("session/list", params, Some(Duration::from_secs(30)))
-                .await?;
+            let request = protocol::ListSessionsRequest::new().cursor(cursor.clone());
+            let res = self.preserving(request, Some(Duration::from_secs(30))).await?;
             if let Some(a) = res.get("sessions").and_then(|s| s.as_array()) {
                 arr.extend(a.iter().cloned());
             } else if let Some(a) = res.as_array() {
@@ -756,21 +949,58 @@ impl AcpConnection {
         Ok(out)
     }
 
-    /// Begin tracking a turn: returns previous buffer content (if any) and resets it.
-    pub fn begin_turn(&self, session_id: &str, context_id: &str) {
-        // A live prompt starts immediately after load. Its updates must not be
-        // discarded by the replay settle window.
-        self.loading.lock().unwrap().remove(session_id);
-        let mut buffers = self.buffers.lock().unwrap();
-        buffers.insert(
-            session_id.to_string(),
-            TurnBuffer { context_id: Some(context_id.to_string()), ..Default::default() },
-        );
+    pub fn has_active_turn(&self, session_id: &str) -> bool {
+        self.buffers.lock().unwrap().contains_key(session_id)
     }
 
-    /// End the turn: persist accumulated transcript rows and return (assistant_text, thought, tools_json).
-    pub fn end_turn(&self, session_id: &str) -> (String, String, String) {
-        let buf = self.buffers.lock().unwrap().remove(session_id).unwrap_or_default();
+    /// The manager holds the (connection, session) lock. Refuse overwrite even if a
+    /// future caller forgets that lock; a rejected turn must never erase its owner.
+    pub fn begin_turn(
+        &self,
+        session_id: &str,
+        context_id: &str,
+        turn_id: &str,
+        source: &str,
+    ) -> Result<(), String> {
+        let mut buffers = self.buffers.lock().unwrap();
+        if buffers.contains_key(session_id) {
+            return Err("该会话已有进行中的回合".into());
+        }
+        if !self.is_alive() {
+            return Err("适配器连接已断开".into());
+        }
+        let mut requests = self.requests.lock().unwrap();
+        requests.cancelled_sessions.remove(session_id);
+        self.file_tasks.begin_session(session_id);
+        self.loading.lock().unwrap().remove(session_id);
+        buffers.insert(
+            session_id.to_string(),
+            TurnBuffer {
+                context_id: Some(context_id.to_string()),
+                turn_id: turn_id.to_string(),
+                source: source.to_string(),
+                ..Default::default()
+            },
+        );
+        Ok(())
+    }
+
+    pub fn end_turn(&self, session_id: &str, turn_id: &str) -> (String, String, String) {
+        let buf = {
+            let mut buffers = self.buffers.lock().unwrap();
+            if !buffers
+                .get(session_id)
+                .is_some_and(|b| b.turn_id == turn_id)
+            {
+                return (String::new(), String::new(), "[]".into());
+            }
+            let mut requests = self.requests.lock().unwrap();
+            let buf = buffers.remove(session_id).unwrap();
+            self.drain_user_requests(&mut requests, Some(session_id));
+            // Keep a cancelled SID's gate closed through the ended state.
+            // Only an accepted begin_turn may open a new epoch.
+            buf
+        };
         (
             buf.text.trim().to_string(),
             buf.thought.trim().to_string(),
@@ -778,10 +1008,42 @@ impl AcpConnection {
         )
     }
 
+    /// Drain currently queued decisions. Session cancellation additionally
+    /// closes the admission gate in cancel_matching_turn before this step.
+    pub fn cancel_user_requests(&self, session_id: Option<&str>) {
+        self.drain_user_requests(&mut self.requests.lock().unwrap(), session_id);
+    }
+
+    fn drain_user_requests(&self, requests: &mut UserRequests, session_id: Option<&str>) {
+        let mut cancelled = Vec::new();
+        for (map, outcome) in [
+            (&mut requests.permissions, json!({ "outcome": "cancelled" })),
+            (&mut requests.elicitations, json!({ "action": "cancel" })),
+        ] {
+            let ids: Vec<_> = map
+                .iter()
+                .filter(|(_, r)| session_id.is_none_or(|sid| r.session_id == sid))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in ids {
+                if let Some(r) = map.remove(&id) {
+                    let _ = r.tx.send(outcome.clone());
+                }
+                cancelled.push(id);
+            }
+        }
+        if !cancelled.is_empty() {
+            let _ = self.app.emit(EVT_REQUESTS_CANCELLED, json!({
+                "agentType": self.agent_type, "connectionId": self.connection_id, "requestIds": cancelled
+            }));
+        }
+    }
+
     /// Deliver the user's permission decision to the pending server request.
     pub fn resolve_permission(&self, request_id: &str, option_id: &str) -> Result<(), String> {
-        if let Some(tx) = self.permissions.lock().unwrap().remove(request_id) {
-            tx.send(json!({ "outcome": "selected", "optionId": option_id }))
+        if let Some(tx) = self.requests.lock().unwrap().permissions.remove(request_id) {
+            tx.tx
+                .send(json!({ "outcome": "selected", "optionId": option_id }))
                 .map_err(|_| "权限请求已失效".to_string())
         } else {
             Err("权限请求已失效".into())
@@ -790,8 +1052,16 @@ impl AcpConnection {
 
     /// Deliver the user's elicitation answer to the pending server request.
     pub fn resolve_elicitation(&self, request_id: &str, response: Value) -> Result<(), String> {
-        if let Some(tx) = self.elicitations.lock().unwrap().remove(request_id) {
-            tx.send(response).map_err(|_| "输入请求已失效".to_string())
+        if let Some(tx) = self
+            .requests
+            .lock()
+            .unwrap()
+            .elicitations
+            .remove(request_id)
+        {
+            tx.tx
+                .send(response)
+                .map_err(|_| "输入请求已失效".to_string())
         } else {
             Err("输入请求已失效".into())
         }
@@ -821,15 +1091,17 @@ const TOOL_LOCATIONS_MAX: usize = 8;
 /// rawOutput / rawInput 三份原样进入 WebView：先是 IPC 字符串、再 JSON.parse、再进
 /// `$state` 代理（Svelte 5 每读一个属性就生成一个 signal 常驻）、随后整份 JSON.stringify
 /// 落本地快照——几十 MB 的历史在 WebView 里放大好几倍，且随聊天一直驻留。
-/// 前端从不读取 `content`（MessageItem 只用 toolCallId/title/kind/status/locations/
-/// rawInput/rawOutput），rawInput/rawOutput 超过上限的部分也永远不会展示。
+/// 标准 content 可能是唯一的工具结果：保留并限长，而不是删除；MessageItem 可展示
+/// 文本、diff 摘要和超限时的字符串回退。rawInput/rawOutput 同样有独立预算。
 /// 输出始终是合法 JSON 对象——这一点是 v0.3.9 用 cap_str 掐断工具行字符串时丢失的。
 pub fn compact_tool_update(update: &Value) -> Value {
     let Some(obj) = update.as_object() else { return update.clone() };
     let mut out = serde_json::Map::with_capacity(obj.len());
     for (k, v) in obj {
         match k.as_str() {
-            "content" => continue,
+            "content" => {
+                out.insert(k.clone(), cap_json_value(v, TOOL_OUTPUT_MAX_BYTES));
+            }
             "rawInput" => {
                 out.insert(k.clone(), cap_json_value(v, TOOL_INPUT_MAX_BYTES));
             }
@@ -886,22 +1158,9 @@ fn chunk_text(update: &Value) -> Option<String> {
     }
 }
 
-fn format_acp_error(err: &Value) -> String {
-    let details = err
-        .get("data")
-        .map(|d| {
-            if d.is_null() {
-                String::new()
-            } else {
-                format!("（{d}）")
-            }
-        })
-        .unwrap_or_default();
-    match (err.get("message").and_then(|m| m.as_str()), err.get("code").and_then(|c| c.as_i64())) {
-        (Some(m), Some(code)) => format!("{m} (code {code}){details}"),
-        (Some(m), None) => format!("{m}{details}"),
-        _ => format!("{}{details}", err),
-    }
+fn format_acp_error(err: SdkError) -> String {
+    let details = err.data.as_ref().filter(|d| !d.is_null()).map(|d| format!("（{d}）")).unwrap_or_default();
+    format!("{} (code {}){details}", err.message, i32::from(err.code))
 }
 
 fn read_text_file_range(path: &str, line: Option<u64>, limit: Option<u64>) -> Result<String, String> {
@@ -928,7 +1187,7 @@ mod audit_tests {
     use super::*;
 
     #[test]
-    fn compact_tool_update_drops_content_and_caps_raw_fields() {
+    fn compact_tool_update_preserves_content_and_caps_raw_fields() {
         let big = "x".repeat(TOOL_INPUT_MAX_BYTES * 2);
         let update = json!({
             "sessionUpdate": "tool_call_update",
@@ -942,7 +1201,7 @@ mod audit_tests {
             "locations": (0..20).map(|i| json!({ "path": format!("f{i}.rs") })).collect::<Vec<_>>(),
         });
         let c = compact_tool_update(&update);
-        assert!(c.get("content").is_none(), "content is never rendered by the webview");
+        assert!(c["content"].as_str().unwrap().len() < TOOL_OUTPUT_MAX_BYTES + 64, "content-only results are retained with a bound");
         for k in ["sessionUpdate", "toolCallId", "title", "kind", "status"] {
             assert_eq!(c.get(k), update.get(k), "{k} must survive untouched");
         }
@@ -974,16 +1233,6 @@ mod audit_tests {
     }
 
     #[test]
-    fn dropped_request_removes_pending_sender() {
-        let pending: PendingMap = Default::default();
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
-        pending.lock().unwrap().insert(Value::from(7), tx);
-        { let _request = PendingRequest { pending: pending.clone(), id: Value::from(7) }; }
-        assert!(pending.lock().unwrap().is_empty());
-        assert!(matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)));
-    }
-
-    #[test]
     fn launch_env_preserves_override_and_prepends_path() {
         let mut cmd = tokio::process::Command::new("unused");
         let prefix = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixture-bin");
@@ -1001,7 +1250,8 @@ mod audit_tests {
 
     #[test]
     fn file_range_accepts_unbounded_limit_without_overflow() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/acp.rs");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file!());
+        let path = path.to_str().unwrap();
         let full = read_text_file_range(path, None, None).unwrap();
         let ranged = read_text_file_range(path, Some(2), Some(u64::MAX)).unwrap();
         assert_eq!(ranged, full.split_inclusive('\n').skip(1).collect::<String>());

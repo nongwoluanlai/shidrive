@@ -347,50 +347,39 @@ impl Db {
         title: Option<&str>,
         workspace: Option<&str>,
     ) -> Result<AgentBinding, String> {
-        let existing = self.get_binding(context_id, agent_type)?;
-        let ts = now();
-        match existing {
-            Some(b) => {
-                self.with(|c| {
-                    c.execute(
-                        "UPDATE agent_bindings SET session_id=?2, title=COALESCE(?3,title), workspace=COALESCE(?4,workspace), updated_at=?5 WHERE id=?1",
-                        params![b.id, session_id, title, workspace, ts],
-                    )?;
-                    Ok(())
-                })?;
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            let previous: Option<Option<String>> = tx.query_row(
+                "SELECT session_id FROM agent_bindings WHERE context_id=?1 AND agent_type=?2",
+                params![context_id, agent_type], |r| r.get(0),
+            ).optional()?;
+            let changed = previous.as_ref().map(|sid| sid.as_deref()) != Some(session_id);
+            if changed {
+                tx.execute("DELETE FROM chat_store WHERE key=?1", params![format!("{context_id}:{agent_type}")])?;
             }
-            None => {
-                let b = AgentBinding {
-                    id: uuid(),
-                    context_id: context_id.to_string(),
-                    agent_type: agent_type.to_string(),
-                    session_id: session_id.map(|s| s.to_string()),
-                    title: title.map(|s| s.to_string()),
-                    workspace: workspace.map(|s| s.to_string()),
-                    status: String::new(),
-                    model: String::new(),
-                    created_at: ts.clone(),
-                    updated_at: ts,
-                };
-                self.with(|c| {
-                    c.execute(
-                        "INSERT INTO agent_bindings (id,context_id,agent_type,session_id,title,workspace,status,model,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,'','',?7,?8)",
-                        params![b.id, b.context_id, b.agent_type, b.session_id, b.title, b.workspace, b.created_at, b.updated_at],
-                    )?;
-                    Ok(())
-                })?;
-            }
-        }
+            tx.execute(
+                "INSERT INTO agent_bindings (id,context_id,agent_type,session_id,title,workspace,status,model,created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,'','',?7,?7)
+                 ON CONFLICT(context_id,agent_type) DO UPDATE SET
+                   session_id=excluded.session_id,
+                   title=CASE WHEN ?8 THEN excluded.title ELSE COALESCE(excluded.title,agent_bindings.title) END,
+                   workspace=COALESCE(excluded.workspace,agent_bindings.workspace),
+                   status=CASE WHEN ?8 THEN '' ELSE agent_bindings.status END,
+                   model=CASE WHEN ?8 THEN '' ELSE agent_bindings.model END,
+                   updated_at=excluded.updated_at",
+                params![uuid(), context_id, agent_type, session_id, title, workspace, now(), changed],
+            )?;
+            tx.commit()
+        })?;
         self.get_binding(context_id, agent_type)?.ok_or_else(|| "binding missing".into())
     }
 
     pub fn unbind(&self, context_id: &str, agent_type: &str) -> Result<(), String> {
         self.with(|c| {
-            c.execute(
-                "DELETE FROM agent_bindings WHERE context_id=?1 AND agent_type=?2",
-                params![context_id, agent_type],
-            )?;
-            Ok(())
+            let tx = c.unchecked_transaction()?;
+            tx.execute("DELETE FROM agent_bindings WHERE context_id=?1 AND agent_type=?2", params![context_id, agent_type])?;
+            tx.execute("DELETE FROM chat_store WHERE key=?1", params![format!("{context_id}:{agent_type}")])?;
+            tx.commit()
         })
     }
 
@@ -972,7 +961,25 @@ impl Db {
 
     /// 覆盖写入一个会话的本地聊天记录（每回合结束时整份快照，简单可靠）。
     pub fn chat_store_set(&self, key: &str, items_json: &str) -> Result<(), String> {
+        let snapshot: serde_json::Value = serde_json::from_str(items_json).map_err(|e| e.to_string())?;
         self.with(|c| {
+            // New snapshots carry their binding identity. A delayed IPC from the
+            // previous binding must not recreate deleted history after a rebind.
+            if snapshot.get("version").and_then(|v| v.as_u64()) == Some(2) {
+                let (ctx, agent) = key.split_once(':').ok_or(rusqlite::Error::InvalidQuery)?;
+                if !snapshot.get("items").is_some_and(|v| v.is_array())
+                    || !snapshot.get("sessionId").is_some_and(|v| v.is_null() || v.is_string()) {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                let exists: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM contexts WHERE id=?1)", [ctx], |r| r.get(0))?;
+                let sid: Option<String> = c.query_row(
+                    "SELECT session_id FROM agent_bindings WHERE context_id=?1 AND agent_type=?2",
+                    params![ctx, agent], |r| r.get(0),
+                ).optional()?.flatten();
+                if !exists || sid.as_deref() != snapshot.get("sessionId").and_then(|v| v.as_str()) {
+                    return Ok(()); // stale snapshot, not a storage failure
+                }
+            }
             c.execute(
                 "INSERT INTO chat_store (key,items_json,updated_at) VALUES (?1,?2,?3)
                  ON CONFLICT(key) DO UPDATE SET items_json=?2, updated_at=?3",

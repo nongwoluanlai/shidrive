@@ -470,6 +470,9 @@ impl Engine {
 
         match result {
             Ok(res) => {
+                if let Some(output) = res.get("_shidriveOutput").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    self.log(run_id, &format!("[{agent_type}] {output}"));
+                }
                 let stop = res.get("stopReason").and_then(|s| s.as_str()).unwrap_or("?").to_string();
                 self.log(run_id, &format!("← [{agent_type}] 回合结束（stop={stop}）"));
                 true

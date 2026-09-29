@@ -4,6 +4,13 @@
   import { api } from "../ipc";
 
   const req = $derived(app.permissions[0] ?? null);
+  const inFlight = new Set<string>();
+  let busyId = $state<string | null>(null);
+  const busy = $derived(!!req && busyId === req.requestId);
+  function removeAnswered(id: string) {
+    app.permissions = app.permissions.filter((r) => r.requestId !== id);
+  }
+
 
   const kindIcon = (kind?: string) =>
     ({ read: "📖", edit: "✏️", delete: "🗑", move: "📂", search: "🔍", execute: "▶", think: "🤔", fetch: "🌐", other: "🔧" }[kind ?? "other"] ?? "🔧");
@@ -17,14 +24,22 @@
   );
 
   async function respond(optionId: string) {
-    if (!req) return;
+    if (!req || inFlight.has(req.requestId)) return;
+    const requestId = req.requestId;
+    inFlight.add(requestId);
+    busyId = requestId;
     try {
-      // answer first; shift afterwards so the request stays visible if the IPC throws
-      await api.acpRespondPermission(req.requestId, optionId);
+      await api.acpRespondPermission(requestId, optionId);
+      removeAnswered(requestId);
     } catch (e) {
-      toast("error", t("权限应答失败: {p0}", { p0: String(e) }));
+      // Transient IPC failures remain retryable. A canceled/expired request must
+      // not block the next dialog or remove it instead.
+      if (/已失效|适配器未连接|连接已断开/.test(String(e))) removeAnswered(requestId);
+      else toast("error", t("权限应答失败: {p0}", { p0: String(e) }));
+    } finally {
+      inFlight.delete(requestId);
+      if (busyId === requestId) busyId = null;
     }
-    app.permissions.shift();
   }
 
   function optionClass(kind: string) {
@@ -48,7 +63,7 @@
       </div>
       <footer>
         {#each req.params?.options ?? [] as opt (opt.optionId)}
-          <button class="btn {optionClass(opt.kind)}" onclick={() => respond(opt.optionId)}>{opt.name}</button>
+          <button disabled={busy} class="btn {optionClass(opt.kind)}" onclick={() => respond(opt.optionId)}>{opt.name}</button>
         {/each}
       </footer>
     </div>

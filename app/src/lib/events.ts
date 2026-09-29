@@ -1,6 +1,6 @@
 // Wire backend events to global state. Called once from App.svelte on mount.
 import { listen } from "@tauri-apps/api/event";
-import { app, applySessionUpdate, finishTurn, markTurn, toast, chatKey } from "./state.svelte";
+import { app, applySessionUpdate, applyBindingStatus, adoptBinding, capabilityLists, toast, chatKey } from "./state.svelte";
 import type { AgentType, ElicitationRequest, PermissionRequest, SessionReadyInfo } from "./types";
 import { api } from "./ipc";
 
@@ -41,6 +41,9 @@ export async function wireEvents() {
     sessionId?: string;
     contextId?: string | null;
     update?: { sessionUpdate?: string } & Record<string, unknown>;
+    turnId?: string;
+    connectionId?: string;
+    source?: string;
     sessionExpired?: boolean;
     detail?: string;
   }>("acp://update", (e) => {
@@ -49,12 +52,12 @@ export async function wireEvents() {
       toast("warn", `会话已失效（${p.agentType}）${p.detail ? "：" + p.detail : ""}，请新建会话`);
       return;
     }
-    if (p.update) {
+    if (p.update && p.source !== "workflow") {
       const ctxId = p.contextId ?? findContextBySession(p.agentType, p.sessionId);
       // 找不到所属上下文的更新以前会写进 "-:agent" 这个没有任何界面展示、也永远
       // 不会被清理的幽灵聊天里（只增不减）；现在直接丢弃
       if (!ctxId) return;
-      applySessionUpdate(p.agentType, ctxId, p.sessionId ?? "", p.update);
+      applySessionUpdate(p.agentType, ctxId, p.sessionId ?? "", p.update, p);
     }
   });
 
@@ -70,57 +73,53 @@ export async function wireEvents() {
     app.elicitations.push(e.payload);
   });
 
+  await listen<{ requestIds: string[] }>("acp://requests-cancelled", (e) => {
+    const ids = new Set(e.payload.requestIds);
+    app.permissions = app.permissions.filter((r) => !ids.has(r.requestId));
+    app.elicitations = app.elicitations.filter((r) => !ids.has(r.requestId));
+  });
+
   await listen<SessionReadyInfo>("acp://session-ready", (e) => {
     const p = e.payload;
     const key = chatKey(p.contextId, p.agentType);
-    // resume 场景的 payload 不含 models/modes —— 保留已有能力信息
-    const prev = app.sessionInfo[key];
-    const merged: SessionReadyInfo = {
-      ...p,
-      response: {
-        ...prev?.response,
-        ...p.response,
-      },
-    };
-    // 恢复/重连的 session-ready 常不带 models/configOptions：用该 agent 的
-    // 能力缓存补齐缺失字段（真实会话数据已在上面的合并中优先），配置栏不空
-    const cached = app.agentCaps[p.agentType];
-    if (cached) {
-      if (!merged.response.models && cached.models) merged.response.models = cached.models;
-      if (!merged.response.configOptions?.length && cached.configOptions) {
-        merged.response.configOptions = cached.configOptions as typeof merged.response.configOptions;
-      }
-    }
+    const old = app.sessionInfo[key];
+    const prev = old?.sessionId === p.sessionId && old.connectionId === p.connectionId ? old : undefined;
+    adoptBinding(key, p.sessionId);
+    const merged: SessionReadyInfo = { ...p, response: { ...prev?.response, ...p.response } };
+    const cached = capabilityLists(app.agentCaps[p.agentType] ?? {});
+    if (!merged.response.models && cached.models) merged.response.models = cached.models;
+    if (!merged.response.configOptions?.length && cached.configOptions) merged.response.configOptions = cached.configOptions;
     app.sessionInfo[key] = merged;
-    app.bindingSession[key] = p.sessionId;
-    // 缓存 agent 能力（模型/配置项），供会话创建前展示
+    if (p.title != null) app.bindingTitleMap[key] = p.title;
     const caps = merged.response;
     if (caps.models || caps.configOptions) {
-      app.agentCaps[p.agentType] = { models: caps.models, configOptions: caps.configOptions };
+      app.agentCaps[p.agentType] = capabilityLists(caps);
       void api.settingsSet("caps." + p.agentType, JSON.stringify(app.agentCaps[p.agentType])).catch(() => {});
     }
-    // 应用会话创建前暂存的配置
-    const pending = app.pendingCfg[p.agentType];
+    // Pre-session choices belong to a context+agent, not to whichever session
+    // happens to become ready first on this adapter.
+    const pending = app.pendingCfg[key];
     if (pending) {
-      delete app.pendingCfg[p.agentType];
-      void api
-        .acpSetConfigOption(p.contextId, p.agentType, pending.id, pending.value)
-        .catch(() => {});
+      delete app.pendingCfg[key];
+      for (const [id, value] of Object.entries(pending)) {
+        void api.acpSetConfigOption(p.contextId, p.agentType, id, value, p.sessionId).catch(() => {});
+      }
     }
   });
 
-  // 回合结束（完成/中断）：按事件里的 (context, agent) 收尾对应会话的流式状态——与当前
-  // 正在查看的会话无关，保证切换 agent/上下文后结束状态仍写回发起回合的那一份；
-  // 随后自增目录树版本号 → FileTree 自动刷新，及时看到 Agent 产出的文件
-  await listen<{ contextId: string; agentType: string; status: string }>("acp://binding-status", (e) => {
-    const { contextId, agentType, status } = e.payload;
-    // 回合进行中的会话不能被内存 LRU 淘汰（否则回合结束落库时只剩半截）
-    markTurn(chatKey(contextId, agentType), status === "running");
-    if (status === "completed" || status === "interrupted") {
-      finishTurn(agentType as AgentType, contextId);
+  await listen<{
+    contextId: string; agentType: string; status: string; sessionId: string;
+    turnId: string; connectionId?: string; source?: string;
+  }>("acp://binding-status", (e) => {
+    if (applyBindingStatus(e.payload)) {
       app.treeRev++;
       fireAfterAction();
     }
+  });
+
+  // Workflow output is displayed in its run log; only refresh the file tree here.
+  await listen<{ status: string }>("acp://workflow-status", (e) => {
+    if (e.payload.status === "completed" || e.payload.status === "interrupted") app.treeRev++;
   });
 
   // workflow run log/status: global so the 运行中 view keeps state across tab switches
@@ -150,8 +149,8 @@ export async function wireEvents() {
 
 function findContextBySession(agentType: AgentType, sessionId?: string): string | null {
   if (!sessionId) return null;
-  for (const [key, info] of Object.entries(app.sessionInfo)) {
-    if (key.endsWith(`:${agentType}`) && info.sessionId === sessionId) {
+  for (const [key, bound] of Object.entries(app.bindingSession)) {
+    if (key.endsWith(`:${agentType}`) && bound === sessionId) {
       return key.slice(0, key.length - agentType.length - 1);
     }
   }

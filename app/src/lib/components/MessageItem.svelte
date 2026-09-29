@@ -38,12 +38,20 @@
     ({ read: "📖", edit: "✏️", delete: "🗑", move: "📂", search: "🔍", execute: "▶", think: "🤔", fetch: "🌐", plan: "🗺", other: "🔧" }[kind ?? "other"] ??
     "🔧");
 
-  function toolDetail(t: { rawInput?: unknown; rawOutput?: unknown }): string {
+  function toolDetail(t: { rawInput?: unknown; rawOutput?: unknown; content?: unknown }): string {
     const parts: string[] = [];
     if (t.rawInput !== undefined) parts.push(tr("输入：") + "\n" + JSON.stringify(t.rawInput, null, 2));
     if (t.rawOutput !== undefined) {
       const out = typeof t.rawOutput === "string" ? t.rawOutput : JSON.stringify(t.rawOutput, null, 2);
       parts.push(tr("输出：") + "\n" + (out.length > 4000 ? out.slice(0, 4000) + "\n" + tr("…(截断)") : out));
+    }
+    if (t.content != null) {
+      const content = Array.isArray(t.content) ? t.content.map((block: any) => {
+        if (block?.type === "content" && block.content?.type === "text") return block.content.text ?? "";
+        if (block?.type === "diff") return `${block.path ?? ""}\n--- old\n${block.oldText ?? ""}\n+++ new\n${block.newText ?? ""}`;
+        return JSON.stringify(block, null, 2);
+      }).join("\n\n") : typeof t.content === "string" ? t.content : JSON.stringify(t.content, null, 2);
+      parts.push(tr("输出：") + "\n" + (content.length > 4000 ? content.slice(0, 4000) + "\n" + tr("…(截断)") : content));
     }
     return parts.join("\n\n");
   }
@@ -164,7 +172,7 @@
     </div>
     {#if groupOpen}
       {#each item.tools ?? [] as t (t.toolCallId)}
-      {#if t.toolCallId === "__plan__"}
+      {#if t.toolCallId === "__plan__" || t.toolCallId.startsWith("__plan__:")}
         <div class="tool plan">
           <div class="thead"><span>🗺 {tr("计划")}</span></div>
           <ul class="plan-list">

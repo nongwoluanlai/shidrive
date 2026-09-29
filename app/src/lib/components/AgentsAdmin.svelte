@@ -181,7 +181,7 @@
       const hasEnv = Object.keys(env).length > 0;
       await api.agentConfigSet(
         r.id,
-        d.command.trim() || hasEnv
+        d.command.trim() || hasEnv || d.args.trim()
           ? { command: d.command.trim(), args: d.args.split("\n").map((x) => x.trim()).filter(Boolean), env }
           : null,
       );
@@ -300,7 +300,7 @@
               <input value={draftOf(r).command} oninput={(e) => (drafts[r.id] = { ...draftOf(r), command: (e.target as HTMLInputElement).value })} placeholder={r.npm ? t("留空自动") : r.id === "cursor" ? "…\\dist-package\\cursor-agent.cmd" : "…\\opencode.exe"} />
             </div>
             {#if !r.npm}
-              <p class="help-text">{t("参数 acp 已自动附加，无需填写。")}</p>
+              <p class="help-text">{t("参数留空时自动使用 acp；填写参数时按完整参数执行。")}</p>
             {/if}
             <div class="field"><label>{t("参数（每行一个，一般留空）")}</label><textarea rows="2" class="mono" value={draftOf(r).args} oninput={(e) => (drafts[r.id] = { ...draftOf(r), args: (e.target as HTMLTextAreaElement).value })}></textarea></div>
             <div class="field"><label>{t("环境变量（每行 KEY=VALUE）")}</label><textarea rows="2" class="mono" value={draftOf(r).env} oninput={(e) => (drafts[r.id] = { ...draftOf(r), env: (e.target as HTMLTextAreaElement).value })}></textarea></div>

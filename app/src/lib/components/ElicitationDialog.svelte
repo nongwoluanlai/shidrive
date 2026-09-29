@@ -22,6 +22,13 @@
   }
 
   const req = $derived(app.elicitations[0] ?? null);
+  const inFlight = new Set<string>();
+  let busyId = $state<string | null>(null);
+  const busy = $derived(!!req && busyId === req.requestId);
+  function removeAnswered(id: string) {
+    app.elicitations = app.elicitations.filter((r) => r.requestId !== id);
+  }
+
 
   function parseParams(raw: Record<string, unknown> | undefined): ElicitParams {
     const p = (raw ?? {}) as Record<string, unknown>;
@@ -100,7 +107,8 @@
   }
 
   async function respond(action: "accept" | "decline" | "cancel", fields?: Field[]) {
-    if (!req) return;
+    if (!req || inFlight.has(req.requestId)) return;
+    const requestId = req.requestId;
     let payload: Record<string, unknown> = { action };
     if (action === "accept" && fields) {
       const missing = fields.filter((f) => f.required && (values[f.name] === undefined || String(values[f.name] ?? "").trim() === ""));
@@ -110,16 +118,23 @@
       }
       payload = { action: "accept", content: buildContent(fields) };
     }
+    inFlight.add(requestId);
+    busyId = requestId;
     try {
-      await api.acpRespondElicitation(req.requestId, payload);
+      await api.acpRespondElicitation(requestId, payload);
+      removeAnswered(requestId);
     } catch (e) {
-      toast("error", t("输入应答失败: {p0}", { p0: String(e) }));
+      if (/已失效|适配器未连接|连接已断开/.test(String(e))) removeAnswered(requestId);
+      else toast("error", t("输入应答失败: {p0}", { p0: String(e) }));
+    } finally {
+      inFlight.delete(requestId);
+      if (busyId === requestId) busyId = null;
     }
-    app.elicitations.shift();
   }
 
   // 单 enum 字段：点选项 = 填值并直接提交
   function quickPick(f: Field, value: string) {
+    if (busy) return;
     values[f.name] = value;
     if (parsed && parsed.fields.length === 1) void respond("accept", parsed.fields);
   }
@@ -153,31 +168,31 @@
             {#if f.kind === "enum"}
               <div class="opts">
                 {#each f.options as opt (opt.value)}
-                  <button class="btn sm" class:primary={values[f.name] === opt.value} onclick={() => quickPick(f, opt.value)}>{opt.label}</button>
+                  <button disabled={busy} class="btn sm" class:primary={values[f.name] === opt.value} onclick={() => quickPick(f, opt.value)}>{opt.label}</button>
                 {/each}
               </div>
             {:else if f.kind === "boolean"}
-              <label class="check"><input type="checkbox" bind:checked={values[f.name] as boolean} /> {f.description || f.name}</label>
+              <label class="check"><input disabled={busy} type="checkbox" bind:checked={values[f.name] as boolean} /> {f.description || f.name}</label>
             {:else if f.kind === "number"}
-              <input type="number" bind:value={values[f.name] as number} placeholder={f.description || f.name} onkeydown={(e) => onInputKeydown(e, parsed.fields)} />
+              <input disabled={busy} type="number" bind:value={values[f.name] as number} placeholder={f.description || f.name} onkeydown={(e) => onInputKeydown(e, parsed.fields)} />
             {:else if f.multiline}
-              <textarea rows="3" bind:value={values[f.name] as string} placeholder={f.description || f.name}></textarea>
+              <textarea disabled={busy} rows="3" bind:value={values[f.name] as string} placeholder={f.description || f.name}></textarea>
             {:else}
-              <input bind:value={values[f.name] as string} placeholder={f.description || f.name} onkeydown={(e) => onInputKeydown(e, parsed.fields)} />
+              <input disabled={busy} bind:value={values[f.name] as string} placeholder={f.description || f.name} onkeydown={(e) => onInputKeydown(e, parsed.fields)} />
             {/if}
           </div>
         {/each}
         {#if !parsed.hasSchema}
           <div class="field">
             <label class="lbl">{t("自由输入（可选）")}</label>
-            <textarea rows="3" bind:value={values.__free as string} placeholder={t("想对 Agent 说的内容…")}></textarea>
+            <textarea disabled={busy} rows="3" bind:value={values.__free as string} placeholder={t("想对 Agent 说的内容…")}></textarea>
           </div>
         {/if}
       </div>
       <footer>
-        <button class="btn primary" onclick={() => void respond("accept", parsed.fields)}>{t("提交")}</button>
-        <button class="btn" onclick={() => void respond("decline")}>{t("不提供（decline）")}</button>
-        <button class="btn danger ghost" onclick={() => void respond("cancel")}>{t("取消（cancel）")}</button>
+        <button disabled={busy} class="btn primary" onclick={() => void respond("accept", parsed.fields)}>{t("提交")}</button>
+        <button disabled={busy} class="btn" onclick={() => void respond("decline")}>{t("不提供（decline）")}</button>
+        <button disabled={busy} class="btn danger ghost" onclick={() => void respond("cancel")}>{t("取消（cancel）")}</button>
       </footer>
     </div>
   </div>

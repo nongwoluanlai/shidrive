@@ -145,8 +145,8 @@ pub async fn binding_get(db: DbState<'_>, context_id: String, agent_type: String
 }
 
 #[tauri::command]
-pub async fn binding_unbind(db: DbState<'_>, context_id: String, agent_type: String) -> Result<(), String> {
-    db.unbind(&context_id, &agent_type).map_err(err)
+pub async fn binding_unbind(agents: AgentsState<'_>, context_id: String, agent_type: String) -> Result<(), String> {
+    agents.unbind(&context_id, &agent_type).await
 }
 
 // ---------- ACP ----------
@@ -170,9 +170,9 @@ pub async fn acp_disconnect(agents: AgentsState<'_>, agent_type: String) -> Resu
 }
 
 #[tauri::command]
-pub async fn acp_session_new(agents: AgentsState<'_>, context: Context, agent_type: String) -> Result<String, String> {
-    // ensure_session reuses the bound session (resuming it when needed);
-    // for a brand-new session the frontend unbinds first (except DeepSeek below).
+pub async fn acp_session_new(agents: AgentsState<'_>, context: Context, agent_type: String, fresh: Option<bool>) -> Result<String, String> {
+    if fresh.unwrap_or(false) { return agents.create_fresh_session(&context, &agent_type).await; }
+    // Without fresh, preserve the historical resume behavior.
     let (conn, sid) = agents.ensure_session(&context, &agent_type).await?;
     let _ = conn;
     Ok(sid)
@@ -190,11 +190,12 @@ pub async fn acp_prompt(
     agent_type: String,
     text: String,
     images: Option<Vec<PromptImage>>,
+    request_id: Option<String>,
 ) -> Result<Value, String> {
     if text.trim().is_empty() && images.as_ref().map_or(true, |i| i.is_empty()) {
         return Err("消息不能为空".into());
     }
-    agents.prompt(&context, &agent_type, &text, &images.unwrap_or_default()).await
+    agents.prompt_from_ui(&context, &agent_type, &text, &images.unwrap_or_default(), request_id.as_deref()).await
 }
 
 #[tauri::command]
@@ -214,8 +215,9 @@ pub async fn acp_set_config_option(
     agent_type: String,
     option_id: String,
     value: Value,
+    expected_session_id: Option<String>,
 ) -> Result<(), String> {
-    agents.set_config_option(&context_id, &agent_type, &option_id, value).await
+    agents.set_config_option(&context_id, &agent_type, &option_id, value, expected_session_id.as_deref()).await
 }
 
 #[tauri::command]

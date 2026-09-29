@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node compile-frontend.mjs && node run-frontend.mjs" },
+  "devDependencies": { "happy-dom": "20.14.5" }
+}

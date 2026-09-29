@@ -48,14 +48,14 @@ pub fn agent_specs() -> &'static [AgentSpec] {
         id: "cline".into(),
         name: "Cline".into(),
         npm: Some("cline".into()),
-        args: vec![],
+        args: vec!["--acp".into()],
         help: "Cline CLI（npm 包 cline）。启用后点「安装适配器」自动安装；按 Cline 官方方式登录（浏览器授权）。".into(),
     },
     AgentSpec {
         id: "codebuddy".into(),
         name: "Codebuddy".into(),
         npm: Some("@tencent-ai/codebuddy-code".into()),
-        args: vec![],
+        args: vec!["--acp".into()],
         help: "腾讯 CodeBuddy Code（npm 包 @tencent-ai/codebuddy-code）。安装适配器后按提示用腾讯账号登录。".into(),
     },
     AgentSpec {
@@ -69,7 +69,7 @@ pub fn agent_specs() -> &'static [AgentSpec] {
         id: "minimax".into(),
         name: "MiniMax".into(),
         npm: Some("@minimax-ai/code".into()),
-        args: vec![],
+        args: vec!["acp".into()],
         help: "MiniMax Code（npm 包 @minimax-ai/code）。安装适配器后按提示登录 MiniMax 账号。".into(),
     },
     AgentSpec {
@@ -83,14 +83,14 @@ pub fn agent_specs() -> &'static [AgentSpec] {
         id: "qoder".into(),
         name: "Qoder".into(),
         npm: Some("@qoder-ai/qodercli".into()),
-        args: vec![],
+        args: vec!["--acp".into()],
         help: "Qoder CLI（npm 包 @qoder-ai/qodercli）。安装适配器后按提示登录 Qoder 账号。".into(),
     },
     AgentSpec {
         id: "grok".into(),
         name: "Grok".into(),
         npm: Some("@xai-official/grok".into()),
-        args: vec![],
+        args: vec!["agent".into(), "stdio".into()],
         help: "xAI 官方 Grok CLI（npm 包 @xai-official/grok）。安装适配器后按提示登录 xAI 账号。".into(),
     },
     AgentSpec {

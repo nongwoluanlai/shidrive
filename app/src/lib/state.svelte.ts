@@ -47,8 +47,10 @@ export interface Toast {
   text: string;
 }
 
-let uid = 0;
-export const nextId = () => `i${++uid}`;
+// IDs are UI identities, not process-local counters stored across restarts.
+export const nextId = () => crypto.randomUUID();
+export interface DraftImage { data: string; mime: string; preview: string }
+export interface TurnIdentity { sessionId: string; turnId: string; connectionId?: string; source?: string }
 
 export const app = $state({
   ready: false,
@@ -81,11 +83,22 @@ export const app = $state({
   /** per-agent cached capability payload (models/configOptions) for pre-session display */
   agentCaps: {} as Record<string, { models?: unknown; configOptions?: unknown }>,
   /** config chosen before a session existed; applied on session-ready */
-  pendingCfg: {} as Record<string, { id: string; value: string }>,
+  pendingCfg: {} as Record<string, Record<string, string>>,
   /** 用户显式选择的会话配置（模型/模式等），key=agent:cfgId；跨会话/重启记住 */
   cfgPref: {} as Record<string, string>,
   /** 每个会话未发送的输入草稿，key=ctxId:agent；切页/切会话不丢 */
   drafts: {} as Record<string, string>,
+  draftImages: {} as Record<string, DraftImage[]>,
+  draftImageRev: {} as Record<string, number>,
+  /** Generation guards for binding reads and async UI operations. */
+  bindingRev: {} as Record<string, number>,
+  sessionBusy: {} as Record<string, boolean>,
+  sessionOccupied: {} as Record<string, boolean>,
+  chatLoadId: {} as Record<string, string>,
+  chatSession: {} as Record<string, string | null>,
+  promptRequests: {} as Record<string, string>,
+  pendingMessage: {} as Record<string, DisplayItem>,
+  activeTurn: {} as Record<string, TurnIdentity>,
   chat: {} as Record<string, DisplayItem[]>,
   /** bumped whenever a chat key is (re)loaded/cleared — scroll anchoring reads it */
   chatRev: {} as Record<string, number>,
@@ -149,8 +162,8 @@ function ensureChat(key: string): DisplayItem[] {
 // signal，persistChat 的 JSON.stringify 又会把整棵树读一遍——工具调用的命令输出 /
 // 整文件 diff / MCP 结果（content、rawInput、rawOutput 三份）一旦进来，WebView 内存
 // 就按历史体量成倍放大并随聊天一直驻留。MessageItem 只用 toolCallId/title/kind/
-// status/locations/rawInput/rawOutput，展开详情最多显示 4000 字符，因此这里与后端
-// (acp::compact_tool_update) 同口径：丢弃 content、超限字段截断。后端已瘦身过的负载
+// status/locations/content/rawInput/rawOutput，展开详情限长，因此这里与后端
+// (acp::compact_tool_update) 同口径：保留标准 content，并对超限字段截断。后端已瘦身过的负载
 // 再过一遍是常数开销；实时 acp://update 与旧版本落库的本地快照则靠这里兜底。
 const TOOL_OUTPUT_MAX_CHARS = 16 * 1024;
 const TOOL_INPUT_MAX_CHARS = 64 * 1024;
@@ -170,8 +183,8 @@ export function compactTool<T extends Partial<ToolCallUpdate>>(t: T): T {
   if (!t || typeof t !== "object") return t;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(t)) {
-    if (k === "content") continue;
-    if (k === "rawInput") out[k] = capToolField(v, TOOL_INPUT_MAX_CHARS);
+    if (k === "content") out[k] = capToolField(v, TOOL_OUTPUT_MAX_CHARS);
+    else if (k === "rawInput") out[k] = capToolField(v, TOOL_INPUT_MAX_CHARS);
     else if (k === "rawOutput") out[k] = capToolField(v, TOOL_OUTPUT_MAX_CHARS);
     else if (k === "locations") out[k] = Array.isArray(v) ? v.slice(0, TOOL_LOCATIONS_MAX) : v;
     else out[k] = v;
@@ -216,85 +229,134 @@ export function historyToItems(rows: TranscriptRow[]): DisplayItem[] {
   return items;
 }
 
-/** Apply rows replayed from the bound ACP session (chat history is not stored locally). */
-export function setChatRows(key: string, rows: TranscriptRow[]) {
-  app.chat[key] = historyToItems(rows);
-  app.chatRev[key] = (app.chatRev[key] ?? 0) + 1;
-  void persistChat(key);
+/** Change binding identity before accepting snapshots/notifications for it. */
+export function adoptBinding(key: string, sessionId: string | null) {
+  const previous = app.bindingSession[key];
+  if (previous === sessionId) return;
+  app.bindingRev[key] = (app.bindingRev[key] ?? 0) + 1;
+  if ((previous !== undefined && previous !== sessionId)
+      || (app.chatSession[key] !== undefined && app.chatSession[key] !== sessionId)) {
+    // A first prompt can create a session. Retain only its just-submitted user
+    // message, not a transcript from the previous binding.
+    const pending = app.promptRequests[key] ? app.pendingMessage[key] : undefined;
+    clearChat(key);
+    if (pending) app.chat[key] = [pending];
+    delete app.sessionInfo[key];
+    delete app.activeTurn[key];
+    markTurn(key, false);
+    if (!pending) app.streaming[key] = false;
+  }
+  app.bindingSession[key] = sessionId;
+  app.chatSession[key] = sessionId;
 }
 
-export function pushLocal(key: string, item: Omit<DisplayItem, "id">) {
-  ensureChat(key).push({ id: nextId(), ...item });
-  void persistChat(key);
+export function invalidateBindingRead(key: string) {
+  app.bindingRev[key] = (app.bindingRev[key] ?? 0) + 1;
+}
+
+export function setChatRows(key: string, rows: TranscriptRow[], sessionId = app.bindingSession[key] ?? null) {
+  cancelPersist(key);
+  app.chat[key] = historyToItems(rows);
+  app.chatSession[key] = sessionId;
+  app.chatRev[key] = (app.chatRev[key] ?? 0) + 1;
+  if (rows.length) persistChat(key);
+  else void queueStore(key, () => api.chatStoreDelete(key));
+}
+
+export function pushLocal(key: string, item: Omit<DisplayItem, "id">): DisplayItem {
+  const message = { id: nextId(), ...item };
+  ensureChat(key).push(message);
+  app.chatSession[key] ??= app.bindingSession[key] ?? null;
+  persistChat(key);
+  return message;
 }
 
 export function clearChat(key: string) {
+  cancelPersist(key);
   app.chat[key] = [];
+  app.chatSession[key] = app.bindingSession[key] ?? null;
   app.chatRev[key] = (app.chatRev[key] ?? 0) + 1;
-  void api.chatStoreDelete(key).catch(() => {});
+  void queueStore(key, () => api.chatStoreDelete(key));
+}
+
+export function addDraftImage(key: string, image: DraftImage, revision = app.draftImageRev[key] ?? 0) {
+  if (revision !== (app.draftImageRev[key] ?? 0)) return;
+  app.draftImages[key] ??= [];
+  app.draftImages[key].push(image);
+}
+export function clearDraftImages(key: string) {
+  app.draftImageRev[key] = (app.draftImageRev[key] ?? 0) + 1;
+  app.draftImages[key] = [];
 }
 
 // ---------- 会话本地持久化 ----------
-// 每回合结束（finishTurn）或历史装载（setChatRows）时把整份条目快照到 SQLite，
-// 打开聊天页先读本地立即渲染；适配器 session/load 全量重放只在本地为空时兜底。
+// Version 2 snapshots are bound to a SID. Legacy arrays are read once against a
+// known binding, get fresh UI IDs, then migrate without changing their content.
 const SNAPSHOT_MAX_CHARS = 8 * 1024 * 1024;
-let persistTimers: Record<string, ReturnType<typeof setTimeout>> = {};
-function persistNow(key: string) {
+const persistTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+const storeQueues = new Map<string, Promise<void>>();
+function queueStore(key: string, operation: () => Promise<unknown>): Promise<void> {
+  const task = (storeQueues.get(key) ?? Promise.resolve()).then(operation).then(() => {}, () => {});
+  storeQueues.set(key, task);
+  void task.then(() => { if (storeQueues.get(key) === task) storeQueues.delete(key); });
+  return task;
+}
+function cancelPersist(key: string) {
   clearTimeout(persistTimers[key]);
   delete persistTimers[key];
+}
+function snapshotJson(sessionId: string | null, items: DisplayItem[]) {
+  return JSON.stringify({ version: 2, sessionId, items });
+}
+function persistNow(key: string) {
+  cancelPersist(key);
   const list = app.chat[key];
-  // 定时器触发时条目可能已被清空/淘汰：不要用空数组覆盖本地快照（清空走 clearChat）
-  if (!list || !list.length) return;
+  if (!list?.length) return;
+  const sid = app.chatSession[key] ?? app.bindingSession[key] ?? null;
   let snapshot = list.map((it) => ({ ...it, streaming: false }));
-  let json: string;
   try {
-    json = JSON.stringify(snapshot);
-    // 超大快照：巨型会话整份 stringify+IPC 会造成数倍内存放大。工具负载已瘦身，正常
-    // 会话远达不到上限；真到了也只丢最旧的一段而不是整份不落库（不支持重放的适配器
-    // ——如 DeepSeek——本地快照就是唯一的历史）
+    let json = snapshotJson(sid, snapshot);
     while (json.length > SNAPSHOT_MAX_CHARS && snapshot.length > 20) {
       snapshot = snapshot.slice(Math.ceil(snapshot.length / 4));
-      json = JSON.stringify(snapshot);
+      json = snapshotJson(sid, snapshot);
     }
-  } catch {
-    return;
-  }
-  if (json.length > SNAPSHOT_MAX_CHARS) {
-    console.info("[chat] snapshot too large, skip persist");
-    return;
-  }
-  void api.chatStoreSet(key, json).catch(() => {});
+    if (json.length <= SNAPSHOT_MAX_CHARS) void queueStore(key, () => api.chatStoreSet(key, json));
+  } catch { /* invalid/oversized state must not overwrite the last good snapshot */ }
 }
 export function persistChat(key: string) {
-  const list = app.chat[key];
-  if (!list || !list.length) return;
-  clearTimeout(persistTimers[key]);
+  if (!app.chat[key]?.length) return;
+  cancelPersist(key);
   persistTimers[key] = setTimeout(() => persistNow(key), 400);
 }
 
-/** 从本地库载入某会话的历史（无记录返回 null）。
- * 旧版本快照可能带着完整工具负载：进内存前先瘦身；瘦身后仍超限的（极少）才丢弃，
- * 否则把瘦身结果写回，下次秒开。 */
-export async function loadChatLocal(key: string): Promise<DisplayItem[] | null> {
+export async function loadChatLocal(key: string, sessionId = app.bindingSession[key] ?? null): Promise<DisplayItem[] | null> {
   try {
+    await storeQueues.get(key);
     const raw = await api.chatStoreGet(key);
     if (!raw) return null;
-    const rows = JSON.parse(raw) as DisplayItem[];
+    const saved = JSON.parse(raw);
+    const legacy = Array.isArray(saved);
+    if (legacy && !sessionId) return null; // an unbound context cannot own an old session's history
+    if (!legacy && (saved?.version !== 2 || saved.sessionId !== sessionId)) return null;
+    const rows: DisplayItem[] = legacy ? saved : saved.items;
     if (!Array.isArray(rows) || !rows.length) return null;
-    const items = rows.map(compactItem);
-    if (raw.length > SNAPSHOT_MAX_CHARS) {
-      const json = JSON.stringify(items);
-      if (json.length > SNAPSHOT_MAX_CHARS) {
-        void api.chatStoreDelete(key).catch(() => {});
-        console.info("[chat] local snapshot too large even after compaction, dropped");
-        return null;
-      }
-      void api.chatStoreSet(key, json).catch(() => {});
+    const items = rows.map((row) => ({ ...compactItem(row), id: nextId(), streaming: false }));
+    const json = snapshotJson(sessionId, items);
+    if (json.length > SNAPSHOT_MAX_CHARS) return null;
+    if (legacy || raw.length > SNAPSHOT_MAX_CHARS) {
+      void queueStore(key, () => api.chatStoreSet(key, json));
     }
     return items;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
+}
+
+/** Shared lists only: never reuse another session's current model/mode value. */
+export function capabilityLists(caps: { models?: any; configOptions?: any }): { models?: any; configOptions?: any } {
+  return {
+    models: caps.models ? { ...caps.models, currentModelId: "", currentModel: "" } : undefined,
+    configOptions: Array.isArray(caps.configOptions)
+      ? caps.configOptions.map((o: any) => ({ ...o, currentValue: "" })) : undefined,
+  };
 }
 
 // ---------- 内存中聊天条目的数量上限（LRU） ----------
@@ -328,6 +390,14 @@ export function touchChat(key: string) {
     }
     if (persistTimers[k]) persistNow(k);
     delete app.chat[k];
+    // 同步清理该 key 的会话元数据：重进此会话时走完整加载路径
+    // （否则 bindingSession 残留旧值导致 adoptBinding 认为无变化而跳过刷新）
+    delete app.bindingSession[k];
+    delete app.chatSession[k];
+    delete app.sessionInfo[k];
+    delete app.bindingTitleMap[k];
+    delete app.chatLoading[k];
+    delete app.streaming[k];
     chatLru.splice(j, 1);
   }
 }
@@ -381,8 +451,15 @@ function upsertTool(list: DisplayItem[], raw: ToolCallUpdate) {
 }
 
 /** Apply one ACP session/update notification to the transcript. */
-export function applySessionUpdate(agentType: AgentType, contextId: string | null, sessionId: string, update: { sessionUpdate?: string } & Record<string, unknown>) {
+export function applySessionUpdate(agentType: AgentType, contextId: string | null, sessionId: string, update: { sessionUpdate?: string } & Record<string, unknown>, route?: Partial<TurnIdentity>) {
   const key = chatKey(contextId, agentType);
+  if (!contextId || !sessionId || app.bindingSession[key] !== sessionId || route?.source === "workflow") return;
+  const connectionId = app.sessionInfo[key]?.connectionId;
+  if (route?.connectionId && connectionId && route.connectionId !== connectionId) return;
+  if (route?.turnId) {
+    const active = app.activeTurn[key];
+    if (!active || active.turnId !== route.turnId || (route.connectionId && active.connectionId !== route.connectionId)) return;
+  }
   const list = ensureChat(key);
   const type = update.sessionUpdate ?? "";
   const textOf = (content: unknown): string => {
@@ -422,12 +499,17 @@ export function applySessionUpdate(agentType: AgentType, contextId: string | nul
       // render plan as a special tools block keyed by "plan"
       upsertTool(list, {
         sessionUpdate: "tool_call_update",
-        toolCallId: "__plan__",
+        toolCallId: `__plan__:${route?.turnId ?? app.activeTurn[key]?.turnId ?? "legacy"}`,
         title: "计划",
         kind: "plan",
         status: "in_progress",
         rawOutput: update.entries ?? [],
       });
+      break;
+    }
+    case "config_option_update": {
+      const info = app.sessionInfo[key];
+      if (info && Array.isArray(update.configOptions)) info.response.configOptions = update.configOptions as NonNullable<typeof info.response.configOptions>;
       break;
     }
     case "current_mode_update": {
@@ -440,13 +522,37 @@ export function applySessionUpdate(agentType: AgentType, contextId: string | nul
   }
 }
 
-/** Mark streaming turns as finished (stop stream merging). */
-export function finishTurn(agentType: AgentType, contextId: string | null) {
+/** Return true only for the accepted completion (after-action must fire once). */
+export function applyBindingStatus(p: TurnIdentity & { contextId: string; agentType: string; status: string }): boolean {
+  const key = chatKey(p.contextId, p.agentType);
+  if (p.source === "workflow" || !p.turnId || app.bindingSession[key] !== p.sessionId) return false;
+  if (app.promptRequests[key] && app.promptRequests[key] !== p.turnId) return false;
+  if (p.status === "running") {
+    app.activeTurn[key] = p;
+    app.promptRequests[key] ??= p.turnId;
+    app.streaming[key] = true;
+    markTurn(key, true);
+  } else if (p.status === "completed" || p.status === "interrupted") {
+    const active = app.activeTurn[key];
+    if (!active || active.turnId !== p.turnId || active.connectionId !== p.connectionId) return false;
+    finishTurn(p.agentType, p.contextId, p.turnId);
+    return true;
+  }
+  return false;
+}
+
+/** Never let an old IPC finally/completion finish a newer request. */
+export function finishTurn(agentType: AgentType, contextId: string | null, requestId?: string) {
   const key = chatKey(contextId, agentType);
+  if (requestId && app.promptRequests[key] !== requestId) return;
   const list = app.chat[key];
   if (list) for (const it of list) it.streaming = false;
   app.streaming[key] = false;
-  void persistChat(key);
+  delete app.promptRequests[key];
+  delete app.pendingMessage[key];
+  delete app.activeTurn[key];
+  markTurn(key, false);
+  persistChat(key);
 }
 
 // ---------- settings persistence ----------

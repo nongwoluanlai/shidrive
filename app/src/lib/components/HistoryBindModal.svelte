@@ -2,7 +2,7 @@
   import { t, localeTag } from "../i18n";
   // 绑定历史会话: pick an existing adapter session and bind it to the current context.
   // 表格形式：可按 工作目录/时间 排序（默认时间倒序），搜索覆盖标题/ID/目录。
-  import { app, currentContext, toast, setChatRows, chatKey } from "../state.svelte";
+  import { app, currentContext, toast, setChatRows, chatKey, adoptBinding, invalidateBindingRead } from "../state.svelte";
   import { api } from "../ipc";
   import Icon from "./Icon.svelte";
   import type { AgentType, Context, SessionInfo } from "../types";
@@ -61,17 +61,27 @@
   async function bind(s: SessionInfo) {
     if (!ctx || !agent || binding) return;
     const a: string = agent; // capture before clearing historyBind (derived becomes null)
-    const c: Context = ctx;
+    const c: Context = { ...ctx };
+    const key = chatKey(c.id, a);
+    if (app.streaming[key] || app.sessionBusy[key] || app.chatLoading[key]) {
+      toast("warn", t("会话正在进行中，请先停止"));
+      return;
+    }
+    app.sessionBusy[key] = true;
+    invalidateBindingRead(key);
     binding = s.session_id;
     try {
       const rows = await api.acpSessionBind(c, a, s.session_id, s.title ?? undefined);
-      setChatRows(chatKey(c.id, a), rows);
-      app.historyBind = null;
+      adoptBinding(key, s.session_id);
+      app.bindingTitleMap[key] = s.title ?? null;
+      setChatRows(key, rows, s.session_id);
+      if (app.historyBind === a && currentContext()?.id === c.id) app.historyBind = null;
       toast("ok", rows.length ? t("已绑定并加载会话历史（{p0} 条）", { p0: rows.length }) : t("已绑定会话（该会话暂无历史记录）"));
     } catch (e) {
       toast("error", t("绑定失败: {p0}", { p0: String(e) }));
     } finally {
       binding = null;
+      app.sessionBusy[key] = false;
     }
   }
 </script>

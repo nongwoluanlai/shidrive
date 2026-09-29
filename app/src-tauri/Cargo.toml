@@ -1,7 +1,8 @@
 [package]
 name = "shidrive"
-version = "0.3.14"
+version = "0.3.15"
 edition = "2021"
+rust-version = "1.88"
 description = "使驾 ShiDrive — AI 开发工作台"
 default-run = "shidrive"
 
@@ -13,6 +14,9 @@ custom-protocol = ["tauri/custom-protocol"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# Official ACP SDK; keep stable protocol v1 and pin the audited API.
+agent-client-protocol = { version = "=2.2.0", default-features = false }
+tokio-util = { version = "0.7", features = ["codec"] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-autostart = "2"
 # 单实例：重复启动（任务栏再点一次 / 双击安装目录）只唤出已运行的主窗口，不再后台多开
