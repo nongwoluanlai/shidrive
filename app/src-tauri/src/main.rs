@@ -8,6 +8,7 @@ mod db;
 mod engine;
 mod fsops;
 mod mcp;
+mod wf_graph;
 mod manager;
 mod models;
 mod child_job;

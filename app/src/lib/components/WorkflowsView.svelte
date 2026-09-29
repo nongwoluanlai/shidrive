@@ -239,6 +239,10 @@
       return;
     }
     if (w.edges.some((e) => e.from === from && e.to === to)) return;
+    // 没有显式连线时引擎按顺序执行（画布以虚线展示）；用户第一次手动连线前先把
+    // 隐式顺序链落成真实连线，否则一连线，原来的整条执行顺序就悄悄消失了
+    if (!w.edges.length) autoChain(w);
+    if (w.edges.some((e) => e.from === from && e.to === to)) return;
     w.edges.push({ from, to });
   }
 
@@ -372,6 +376,12 @@
     return `M ${x1} ${y1} L ${x1} ${my} L ${x2} ${my} L ${x2} ${y2}`;
   }
 
+  // 引擎在 edges 为空时按数组顺序执行：画布用虚线把这条隐式顺序画出来，
+  // 避免「看起来没有连线、实际却会依次执行」的错觉（Agent 创建的工作流常见）
+  const implicitEdges = $derived.by(() => {
+    if (!selected || selected.edges.length || selected.steps.length < 2) return [];
+    return selected.steps.slice(1).map((st, k) => edgePath(selected.steps[k], st));
+  });
   const edges = $derived.by(() => {
     if (!selected) return [];
     return selected.edges
@@ -711,6 +721,9 @@
                 <div class="empty">{t("画布为空：从上方添加第一个节点")}</div>
               {/if}
               <svg class="edges">
+                {#each implicitEdges as d, k (k)}
+                  <path class="edge implicit" {d}><title>{t("未设置连线：按节点顺序执行（手动连线后以连线为准）")}</title></path>
+                {/each}
                 {#each edges as e, i (i)}
                   <path
                     class="edge-hit"
@@ -1155,6 +1168,11 @@
     stroke-linecap: round;
     opacity: 0.7;
     pointer-events: none;
+  }
+  .edge.implicit {
+    stroke-dasharray: 6 6;
+    opacity: 0.55;
+    pointer-events: stroke;
   }
   .edge-hit {
     fill: none;

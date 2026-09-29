@@ -747,9 +747,11 @@ fn token_endpoint(db: &Arc<Db>, oauth: &OAuthState, body: &str, stream: &mut std
             let new_access = format!("sdo1_{}", rand_hex(1));
             let new_refresh = format!("sdr1_{}", rand_hex(1));
             let now = now_epoch();
-            db.with(|c| {
+            // 条件更新：并发用同一个 refresh_token 刷新时只允许一个成功（轮换语义），
+            // 否则两次请求都拿到新令牌、其中一对在库里已被覆盖却返回给了客户端。
+            let rotated = db.with(|c| {
                 c.execute(
-                    "UPDATE remote_oauth_tokens SET access_hash=?2, refresh_hash=?3, access_expires_epoch=?4, refresh_expires_epoch=?5, created_at=?6 WHERE id=?1",
+                    "UPDATE remote_oauth_tokens SET access_hash=?2, refresh_hash=?3, access_expires_epoch=?4, refresh_expires_epoch=?5, created_at=?6 WHERE id=?1 AND refresh_hash=?7 AND revoked_at IS NULL",
                     rusqlite::params![
                         id,
                         sha256_hex(&new_access),
@@ -757,10 +759,13 @@ fn token_endpoint(db: &Arc<Db>, oauth: &OAuthState, body: &str, stream: &mut std
                         now + ACCESS_TTL_SECS,
                         now + REFRESH_TTL_SECS,
                         now_str(),
+                        hash,
                     ],
                 )
-                .map(|_| ())
             })?;
+            if rotated != 1 {
+                return err(400, "invalid_grant", "refresh_token 已被使用或已撤销");
+            }
             let resp = json!({
                 "access_token": new_access,
                 "token_type": "Bearer",

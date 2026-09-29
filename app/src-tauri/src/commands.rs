@@ -437,7 +437,7 @@ pub async fn workflow_delete(db: DbState<'_>, id: String) -> Result<(), String> 
 
 #[tauri::command]
 pub async fn workflow_run(engine: EngineState<'_>, id: String) -> Result<(), String> {
-    engine.run_now(&id)
+    engine.run_now(&id).map(|_| ())
 }
 
 #[tauri::command]

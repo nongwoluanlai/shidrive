@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
 use crate::db::Db;
-use crate::models::{Edge, ScheduleConfig, ScEntry, ScSnapshot, Workflow, WorkflowStep};
+use crate::models::{ScheduleConfig, ScEntry, ScSnapshot, Workflow, WorkflowStep};
 
 const MAX_OVERVIEW: usize = 2000;
 const MAX_CONSTRAINTS: usize = 2000;
@@ -106,11 +106,27 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, state: Arc<McpState>, ap
         )
     };
     let mut content_length = 0usize;
+    let mut origin = String::new();
+    let mut host = String::new();
     for line in lines {
         let lower = line.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
+        } else if lower.starts_with("origin:") {
+            origin = line[7..].trim().to_string();
+        } else if lower.starts_with("host:") {
+            host = line[5..].trim().to_string();
         }
+    }
+    // 安全：本服务无鉴权且可创建/运行工作流（= 执行命令）。浏览器里任意网页都能向
+    // 127.0.0.1 发「简单请求」（text/plain POST 无需预检，body 照样被解析执行），
+    // DNS 重绑定还能绕过同源读取响应。Agent/CLI 客户端不带 Origin，且 Host 为本机，
+    // 因此拒绝「非本机 Origin」与「非本机 Host」即可挡住浏览器侧攻击而不影响正常接入。
+    if !local_host_ok(&host) || (!origin.is_empty() && !local_origin_ok(&origin)) {
+        let body = "forbidden: non-local Origin/Host";
+        let resp = format!("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let _ = stream.write_all(resp.as_bytes()).await;
+        return Ok(());
     }
     while buf.len() < header_end + content_length {
         let n = stream.read(&mut chunk).await.map_err(|e| e.to_string())?;
@@ -157,6 +173,30 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, state: Arc<McpState>, ap
     Ok(())
 }
 
+/// Host 头必须是本机（防 DNS 重绑定）。缺失 Host 的 HTTP/1.0 简易客户端放行。
+pub(crate) fn local_host_ok(host: &str) -> bool {
+    if host.is_empty() { return true; }
+    let h = host.to_ascii_lowercase();
+    let name = if let Some(rest) = h.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        h.rsplit_once(':').map(|(n, p)| if p.chars().all(|c| c.is_ascii_digit()) { n } else { h.as_str() }).unwrap_or(&h)
+    };
+    matches!(name, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// 浏览器来源只允许本机页面（含使驾自身 WebView）；"null"（沙箱 iframe / file://）拒绝。
+pub(crate) fn local_origin_ok(origin: &str) -> bool {
+    let o = origin.trim().to_ascii_lowercase();
+    if o == "tauri://localhost" { return true; }
+    let rest = match o.strip_prefix("http://").or_else(|| o.strip_prefix("https://")) {
+        Some(r) => r,
+        None => return false,
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    host == "tauri.localhost" || local_host_ok(host)
+}
+
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
@@ -197,7 +237,8 @@ fn skills_document(query: &str, port: u16) -> String {
 | `context_search` | 按关键词搜索历史提交的摘要 / 涉及文件 / 内容 |
 | `workflow_list` | 列出项目的工作流（默认「无项目」；可用 project_name 或 context_id 定位项目） |
 | `workflow_get` / `workflow_create` / `workflow_update` / `workflow_delete` | 查看/创建/更新/删除项目工作流。把用户常跑的命令（打包、构建、git 提交等）沉淀为工作流，用户可在使驾界面一键运行 |
-| `workflow_run` | 立即运行某个工作流 |
+| `workflow_run` | 立即运行某个工作流，返回 run_id |
+| `workflow_run_status` | 按 run_id 查询运行状态与日志末尾（运行后用它确认结果） |
 
 ## 工作规范
 
@@ -349,11 +390,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "workflow_create",
-            "description": "在项目中创建工作流。steps 为节点数组，按数组顺序自动连线（或用 edges 自由连线）。适合把常用命令（打包/构建/git 提交等）沉淀为可复用工作流。",
+            "description": "在项目中创建工作流。返回 graph（最终索引与连线的简明结构）和 auto_adjustments（自动做了什么），请据此核对。连线写错（越界/自环/成环/连到注释）会直接报错而不是静默丢弃。",
             "inputSchema": { "type":"object", "required":["name","steps"], "properties":{
                 "name": {"type":"string","description":"工作流名称"},
-                "steps": {"type":"array","description":"节点数组。类型：start(开始,可选) / shell(命令) / agent(AI) / delay(等待) / env(变量)。shell 形如 {\"type\":\"shell\",\"name\":\"构建\",\"command\":\"pnpm build\",\"cwd\":\"\",\"shell\":\"cmd|powershell|python\",\"timeout_sec\":null,\"continue_on_error\":false}；agent 形如 {\"type\":\"agent\",\"name\":\"\",\"context_id\":\"<上下文id>\",\"agent_type\":\"codex|zcode\",\"prompt\":\"...\",\"session_id\":null,\"timeout_sec\":null,\"continue_on_error\":false}；env 形如 {\"type\":\"env\",\"name\":\"\",\"vars\":{\"KEY\":\"value\"}}；delay 形如 {\"type\":\"delay\",\"name\":\"\",\"seconds\":5}","items": {"type":"object"}},
-                "edges": {"type":"array","description":"连线 [{\"from\":0,\"to\":1}]，索引指向 steps；省略则按顺序链接","items": {"type":"object"}},
+                "steps": {"type":"array","description":"节点数组，数组下标即节点索引（连线用它）。可省略 start：会自动插入到最前（此时你的索引整体 +1，返回的 graph 字段会给出最终索引）。类型：\n- shell：{\"type\":\"shell\",\"name\":\"构建\",\"command\":\"pnpm build\",\"cwd\":\"\",\"shell\":\"cmd|powershell|python\",\"timeout_sec\":600,\"continue_on_error\":false}（cwd 留空=项目根目录）\n- agent：{\"type\":\"agent\",\"name\":\"审查\",\"context_id\":\"<上下文id>\",\"agent_type\":\"codex|zcode\",\"prompt\":\"...\",\"session_id\":null}（session_id 为空=临时会话）\n- env：{\"type\":\"env\",\"name\":\"\",\"vars\":{\"KEY\":\"value\"}}\n- delay：{\"type\":\"delay\",\"seconds\":5}\n- balloon（系统气泡通知）：{\"type\":\"balloon\",\"title\":\"完成\",\"message\":\"...\",\"click_action\":\"none|open|url\",\"click_target\":\"\",\"sound\":false}\n- note（画布注释，不执行、不要连线）：{\"type\":\"note\",\"text\":\"...\"}\n模板：{{env.KEY}}、{{date:%Y%m%d}}；shell 节点结束后产出 {{env.<节点名>_stdout}} / _stderr / _exit（无名时为 step<序号>）。坐标 x/y 可省略——会按连线自动分层布局。","items": {"type":"object"}},
+                "edges": {"type":"array","description":"有向连线（无环）。写法任选：{\"from\":0,\"to\":1}、{\"source\":\"构建\",\"target\":\"测试\"}、[0,1]；端点可用索引或唯一的节点名。索引基于你传入的 steps。省略或 [] = 按顺序串联。所有无前驱节点会自动从开始节点并行起跑。并行示例（打包后同时上传和通知）：steps=[打包,上传,通知] edges=[[0,1],[0,2]]。"},
+                "auto_layout": {"type":"boolean","description":"强制按连线重新布局（默认仅在有节点未给坐标时布局）"},
                 "env": {"type":"object","description":"工作流级环境变量（值支持 {{date:格式}} 插值）"},
                 "schedule": {"type":"object","description":"定时调度 {\"kind\":\"interval|daily|weekly|once\", ...}；省略为手动"},
                 "description": {"type":"string"},
@@ -364,13 +406,14 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "workflow_update",
-            "description": "更新工作流（可改名称/描述/步骤/连线/环境变量/调度/启用）。未提供的字段保持不变。",
+            "description": "更新工作流（可改名称/描述/步骤/连线/环境变量/调度/启用）。未提供的字段保持不变。传 steps 即整体替换节点（规则同 workflow_create）；只传 edges 时索引基于当前节点（先用 workflow_get 查看 graph）；只想整理画布可仅传 auto_layout=true。",
             "inputSchema": { "type":"object", "required":["name"], "properties":{
                 "name": {"type":"string","description":"要更新的工作流名称或 id"},
                 "new_name": {"type":"string"},
                 "description": {"type":"string"},
-                "steps": {"type":"array"},
-                "edges": {"type":"array"},
+                "steps": {"type":"array","description":"整体替换节点，格式同 workflow_create.steps","items":{"type":"object"}},
+                "edges": {"type":"array","description":"格式同 workflow_create.edges"},
+                "auto_layout": {"type":"boolean","description":"按连线重新自动布局"},
                 "env": {"type":"object"},
                 "schedule": {"type":"object"},
                 "enabled": {"type":"boolean"},
@@ -389,11 +432,19 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "workflow_run",
-            "description": "立即运行工作流（异步启动，日志见使驾界面）",
+            "description": "立即运行工作流（异步启动），返回 run_id；随后用 workflow_run_status 轮询结果与日志",
             "inputSchema": { "type":"object", "required":["name"], "properties":{
                 "name": {"type":"string"},
                 "project_name": {"type":"string"},
                 "context_id": {"type":"string"}
+            }}
+        },
+        {
+            "name": "workflow_run_status",
+            "description": "查询一次工作流运行的状态（running/success/failed/stopped）与日志末尾",
+            "inputSchema": { "type":"object", "required":["run_id"], "properties":{
+                "run_id": {"type":"string","description":"workflow_run 返回的 run_id"},
+                "tail_lines": {"type":"integer","description":"返回日志末尾行数，默认 80"}
             }}
         }
     ])
@@ -403,7 +454,7 @@ fn tool_error(msg: String) -> Result<Value, String> {
     Err(msg)
 }
 
-const KNOWN_TOOLS: [&str; 11] = [
+const KNOWN_TOOLS: [&str; 12] = [
     "context_get",
     "context_get_version",
     "context_update",
@@ -415,6 +466,7 @@ const KNOWN_TOOLS: [&str; 11] = [
     "workflow_update",
     "workflow_delete",
     "workflow_run",
+    "workflow_run_status",
 ];
 
 pub(crate) fn call_tool(state: &McpState, _app: &AppHandle, name: &str, args: &Value) -> Result<Value, String> {
@@ -668,7 +720,9 @@ fn call_workflow_tool(state: &McpState, name: &str, args: &Value) -> Result<Valu
             }
             let w = find_workflow_by_name_or_id(state, &project_id, key)?
                 .ok_or_else(|| format!("工作流「{key}」不存在于该项目。可用 workflow_list 查看。"))?;
-            Ok(json_bytes(&wf_public(&w)))
+            let mut v = wf_public(&w);
+            v["graph"] = json!(crate::wf_graph::describe(&w.steps, &w.edges));
+            Ok(json_bytes(&v))
         }
         "workflow_create" => {
             let wname = args.get("name").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string();
@@ -682,11 +736,11 @@ fn call_workflow_tool(state: &McpState, name: &str, args: &Value) -> Result<Valu
                 Some(raw) => parse_steps(raw)?,
                 None => Vec::new(),
             };
-            let edges: Vec<Edge> = args.get("edges").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
-            let n = steps.len();
-            if edges.iter().any(|e| e.from as usize >= n || e.to as usize >= n) {
-                return tool_error(format!("edges 引用了不存在的步骤索引（共 {n} 个步骤）。"));
-            }
+            let raw_edges = match args.get("edges") {
+                Some(raw) if !raw.is_null() => Some(crate::wf_graph::parse_edges(raw, &steps)?),
+                _ => None,
+            };
+            let relayout = args.get("auto_layout").and_then(|v| v.as_bool()).unwrap_or(false);
             let env: std::collections::BTreeMap<String, String> = args
                 .get("env")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -695,31 +749,15 @@ fn call_workflow_tool(state: &McpState, name: &str, args: &Value) -> Result<Valu
             let trigger_type = args.get("trigger_type").and_then(|v| v.as_str()).unwrap_or(if schedule.is_some() { "schedule" } else { "manual" });
             let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
             let description = args.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            // 自动补「开始」节点：首节点不是 start 时插入
-            let mut steps = steps;
-            let mut edges = edges;
-            if !steps.first().map(|s| s.is_start()).unwrap_or(false) {
-                steps.insert(0, WorkflowStep::Start { name: String::new(), x: 60.0, y: 30.0 });
-                for e in edges.iter_mut() {
-                    e.from += 1;
-                    e.to += 1;
-                }
-                // 开始节点连到原首节点
-                edges.insert(0, Edge { from: 0, to: 1 });
-            }
-            // 未显式给连线时按顺序成链
-            if args.get("edges").is_none() {
-                edges = (0..steps.len().saturating_sub(1)).map(|i| Edge { from: i as i64, to: (i + 1) as i64 }).collect();
-            }
-            // 自动布局：无坐标时按索引排一列
-            for (i, st) in steps.iter_mut().enumerate() {
-                let m = st.meta();
-                if m.x == 0.0 && m.y == 0.0 {
-                    st.set_pos(60.0, 30.0 + i as f64 * 100.0);
-                }
-            }
+            let norm = crate::wf_graph::normalize(steps, raw_edges, relayout)?;
+            let (steps, edges) = (norm.steps, norm.edges);
             let w = state.db.create_workflow(&project_id, &wname, &description, enabled, trigger_type, schedule.as_ref(), &steps, &env, &edges)?;
-            Ok(json_bytes(&json!({ "created": true, "workflow": wf_public(&w) })))
+            Ok(json_bytes(&json!({
+                "created": true,
+                "auto_adjustments": norm.notes,
+                "graph": crate::wf_graph::describe(&w.steps, &w.edges),
+                "workflow": wf_public(&w),
+            })))
         }
         "workflow_update" => {
             let key = args.get("name").or_else(|| args.get("id")).and_then(|v| v.as_str()).unwrap_or_default();
@@ -735,35 +773,22 @@ fn call_workflow_tool(state: &McpState, name: &str, args: &Value) -> Result<Valu
                 w.description = v.to_string();
             }
             let steps_given = args.get("steps").map(|raw| parse_steps(raw)).transpose()?;
-            let edges_given = match args.get("edges") {
-                Some(raw) => Some(serde_json::from_value::<Vec<Edge>>(raw.clone()).map_err(|e| format!("edges 格式不正确：{e}"))?),
-                None => None,
-            };
-            if let Some(mut steps) = steps_given {
-                let mut edges = edges_given.clone().unwrap_or_default();
-                if !steps.first().map(|s| s.is_start()).unwrap_or(false) {
-                    steps.insert(0, WorkflowStep::Start { name: String::new(), x: 60.0, y: 30.0 });
-                    for e in edges.iter_mut() {
-                        e.from += 1;
-                        e.to += 1;
-                    }
-                    edges.insert(0, Edge { from: 0, to: 1 });
-                }
-                if edges_given.is_none() {
-                    edges = (0..steps.len().saturating_sub(1)).map(|i| Edge { from: i as i64, to: (i + 1) as i64 }).collect();
-                }
-                let n = steps.len();
-                if edges.iter().any(|e| e.from as usize >= n || e.to as usize >= n) {
-                    return tool_error(format!("edges 引用了不存在的步骤索引（共 {n} 个步骤）。"));
-                }
-                w.steps = steps;
-                w.edges = edges;
-            } else if let Some(edges) = edges_given {
-                let n = w.steps.len();
-                if edges.iter().any(|e| e.from as usize >= n || e.to as usize >= n) {
-                    return tool_error(format!("edges 引用了不存在的步骤索引（共 {n} 个步骤）。"));
-                }
-                w.edges = edges;
+            let relayout = args.get("auto_layout").and_then(|v| v.as_bool()).unwrap_or(false);
+            let mut adjustments: Vec<String> = Vec::new();
+            let graph_touched = steps_given.is_some() || args.get("edges").is_some() || relayout;
+            if graph_touched {
+                // 只改连线时，端点索引基于现有 steps（含已有的开始节点）
+                let steps = steps_given.unwrap_or_else(|| w.steps.clone());
+                let raw_edges = match args.get("edges") {
+                    Some(raw) if !raw.is_null() => Some(crate::wf_graph::parse_edges(raw, &steps)?),
+                    // 只重排布局：沿用现有连线
+                    _ if args.get("steps").is_none() => Some(w.edges.iter().map(|e| (e.from as usize, e.to as usize)).collect()),
+                    _ => None,
+                };
+                let norm = crate::wf_graph::normalize(steps, raw_edges, relayout)?;
+                w.steps = norm.steps;
+                w.edges = norm.edges;
+                adjustments = norm.notes;
             }
             if let Some(raw) = args.get("env") {
                 w.env = serde_json::from_value(raw.clone()).map_err(|e| format!("env 格式不正确：{e}"))?;
@@ -781,7 +806,12 @@ fn call_workflow_tool(state: &McpState, name: &str, args: &Value) -> Result<Valu
                 w.enabled = v;
             }
             let w = state.db.update_workflow(&w)?;
-            Ok(json_bytes(&json!({ "updated": true, "workflow": wf_public(&w) })))
+            Ok(json_bytes(&json!({
+                "updated": true,
+                "auto_adjustments": adjustments,
+                "graph": crate::wf_graph::describe(&w.steps, &w.edges),
+                "workflow": wf_public(&w),
+            })))
         }
         "workflow_delete" => {
             let key = args.get("name").or_else(|| args.get("id")).and_then(|v| v.as_str()).unwrap_or_default();
@@ -801,11 +831,35 @@ fn call_workflow_tool(state: &McpState, name: &str, args: &Value) -> Result<Valu
             let w = find_workflow_by_name_or_id(state, &project_id, key)?
                 .ok_or_else(|| format!("工作流「{key}」不存在。"))?;
             if let Some(engine) = state.engine.get() {
-                engine.run_now(&w.id)?;
-                Ok(json_bytes(&json!({ "started": true, "name": w.name, "hint": "运行日志见使驾「工作流」页的运行历史，或右上角「运行中任务」。" })))
+                let run_id = engine.run_now(&w.id)?;
+                Ok(json_bytes(&json!({
+                    "started": true,
+                    "name": w.name,
+                    "run_id": run_id,
+                    "hint": "用 workflow_run_status 传入 run_id 查看状态与日志（status: running/success/failed/stopped）。",
+                })))
             } else {
                 tool_error("工作流引擎尚未就绪。".into())
             }
+        }
+        "workflow_run_status" => {
+            let run_id = args.get("run_id").and_then(|v| v.as_str()).unwrap_or_default();
+            if run_id.is_empty() {
+                return tool_error("缺少参数 run_id（workflow_run 的返回值）。".into());
+            }
+            let r = state.db.get_run(run_id)?.ok_or_else(|| format!("运行记录 {run_id} 不存在。"))?;
+            let tail_lines = args.get("tail_lines").and_then(|v| v.as_u64()).unwrap_or(80).clamp(1, 1000) as usize;
+            let lines: Vec<&str> = r.log.lines().collect();
+            let tail = lines[lines.len().saturating_sub(tail_lines)..].join("\n");
+            Ok(json_bytes(&json!({
+                "run_id": r.id,
+                "status": r.status,
+                "trigger": r.trigger,
+                "started_at": r.started_at,
+                "finished_at": r.finished_at,
+                "log_tail": tail,
+                "log_lines_total": lines.len(),
+            })))
         }
         _ => tool_error(format!("未知工具 {name}。")),
     }

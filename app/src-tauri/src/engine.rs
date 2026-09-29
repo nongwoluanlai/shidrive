@@ -130,7 +130,7 @@ impl Engine {
                     }
                 }
                 Some(due) if due <= now => {
-                    if self.active.lock().unwrap().contains_key(&w.id) {
+                    if self.active.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&w.id) {
                         continue;
                     }
                     // Consume the slot *before* enqueueing: a one-shot is retired here no
@@ -182,13 +182,9 @@ impl Engine {
             .collect()
     }
 
-    pub fn run_now(self: &Arc<Self>, workflow_id: &str) -> Result<(), String> {
+    pub fn run_now(self: &Arc<Self>, workflow_id: &str) -> Result<String, String> {
         let w = self.db.get_workflow(workflow_id)?.ok_or("工作流不存在")?;
-        if self.active.lock().unwrap().contains_key(workflow_id) {
-            return Err("该工作流正在运行".into());
-        }
-        self.spawn_run(&w, "manual");
-        Ok(())
+        self.spawn_run(&w, "manual").ok_or_else(|| "该工作流正在运行".to_string())
     }
 
     pub fn stop_run(&self, run_id: &str) {
@@ -202,15 +198,26 @@ impl Engine {
         }
     }
 
-    fn spawn_run(self: &Arc<Self>, w: &Workflow, trigger: &str) {
-        let run_id = match self.db.create_run(&w.id, trigger) {
-            Ok(id) => id,
-            Err(e) => {
-                log::error!("create_run failed: {e}");
-                return;
+    /// 返回本次运行 id；None 表示该工作流已在运行（未启动新实例）或建档失败。
+    fn spawn_run(self: &Arc<Self>, w: &Workflow, trigger: &str) -> Option<String> {
+        // 「检查是否在运行」与「登记为运行中」必须在同一把锁内完成：此前 run_now/调度
+        // 先 contains_key 再在这里 insert，UI 与 MCP（或调度 tick）并发触发时会起两个实例，
+        // 后者覆盖 active 条目；先结束的那个把条目删掉后，另一个便无法再被停止。
+        let run_id = {
+            let mut active = self.active.lock().unwrap();
+            if active.contains_key(&w.id) {
+                return None;
             }
+            let run_id = match self.db.create_run(&w.id, trigger) {
+                Ok(id) => id,
+                Err(e) => {
+                    log::error!("create_run failed: {e}");
+                    return None;
+                }
+            };
+            active.insert(w.id.clone(), run_id.clone());
+            run_id
         };
-        self.active.lock().unwrap().insert(w.id.clone(), run_id.clone());
 
         let ctrl = Arc::new(RunControl {
             stop: Arc::new(AtomicBool::new(false)),
@@ -223,15 +230,30 @@ impl Engine {
         let run_id2 = run_id.clone();
         tauri::async_runtime::spawn(async move {
             let _ = eng.app.emit(EVT_WF_STATUS, json!({ "runId": run_id2, "workflowId": wf.id, "status": "running" }));
-            let status = eng.execute(&wf, &run_id2, ctrl).await;
+            // 执行过程中任何 panic（例如模板/第三方库异常）都不能跳过下面的收尾：
+            // 否则 active 条目永不释放，该工作流会一直显示「正在运行」直到重启。
+            let status = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(eng.execute(&wf, &run_id2, ctrl.clone())))
+                .await
+            {
+                Ok(s) => s,
+                Err(_) => {
+                    ctrl.stop.store(true, Ordering::SeqCst);
+                    for pid in ctrl.shell_pids.lock().unwrap_or_else(|p| p.into_inner()).drain(..) {
+                        kill_tree(pid);
+                    }
+                    eng.log(&run_id2, "✕ 工作流执行时发生内部错误，已中止");
+                    "failed".to_string()
+                }
+            };
             let _ = eng.db.finish_run(&run_id2, &status);
             let _ = eng.app.emit(EVT_WF_STATUS, json!({ "runId": run_id2, "workflowId": wf.id, "status": status }));
-            eng.controls.lock().unwrap().remove(&run_id2);
-            eng.active.lock().unwrap().remove(&wf.id);
+            eng.controls.lock().unwrap_or_else(|p| p.into_inner()).remove(&run_id2);
+            eng.active.lock().unwrap_or_else(|p| p.into_inner()).remove(&wf.id);
             // One-shot schedules are retired when the run is *claimed* (tick_once), not
             // here: doing it on success only made failed/stopped runs repeat forever, and
             // writing back the stale `wf` copy clobbered edits made during the run.
         });
+        Some(run_id)
     }
 
     /// Execute the workflow graph. Nodes whose predecessors finished run in parallel.
@@ -283,9 +305,11 @@ impl Engine {
         }
         let mut failed_at: Option<usize> = None;
         let mut stopped = false;
+        let mut finished = vec![false; n];
 
         // drains naturally: successors are pushed as predecessors complete
         while let Some((idx, ok)) = futures.next().await {
+            finished[idx] = true;
             if ctrl.stop.load(Ordering::SeqCst) && failed_at.is_none() {
                 stopped = true;
             }
@@ -315,6 +339,15 @@ impl Engine {
         if let Some(i) = failed_at {
             self.log(run_id, &format!("✕ 工作流在节点「{}」失败后中止", step_name(&w.steps[i], i)));
             return "failed".into();
+        }
+        // 与开始节点不连通的节点永远不会被调度：以前静默跳过仍报「全部完成」，
+        // 用户（或写工作流的 Agent）无从得知漏跑了哪些节点。
+        let skipped: Vec<String> = (0..n)
+            .filter(|&i| !finished[i] && !matches!(w.steps[i], WorkflowStep::Note { .. }))
+            .map(|i| step_name(&w.steps[i], i))
+            .collect();
+        if !skipped.is_empty() {
+            self.log(run_id, &format!("⚠ 以下节点未与开始节点连通，未执行：{}", skipped.join("、")));
         }
         self.log(run_id, "✔ 全部节点完成");
         "success".into()
@@ -758,7 +791,15 @@ fn substitute(text: &str, env: &BTreeMap<String, String>) -> String {
             break;
         }
         let fmt = &out[start + 7..start + end_rel];
-        let rendered = chrono::Local::now().format(fmt).to_string();
+        // 非法格式（如 {{date:%Q}}）时 chrono 的 to_string() 会 panic，进而中断整个运行；
+        // 用 write! 捕获格式错误，保留原模板文本。
+        let mut rendered = String::new();
+        {
+            use std::fmt::Write as _;
+            if write!(rendered, "{}", chrono::Local::now().format(fmt)).is_err() {
+                break;
+            }
+        }
         out.replace_range(start..start + end_rel + 2, &rendered);
     }
     for (k, v) in env {

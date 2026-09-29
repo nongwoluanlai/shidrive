@@ -233,14 +233,28 @@ pub fn open_default(path: &str) -> Result<(), String> {
 }
 
 /// 写文本到系统剪贴板（PowerShell Set-Clipboard）。
+/// 文本经 stdin（UTF-8）传入：放在 -Command 命令行里会受 Windows 32767 字符
+/// 命令行上限约束，长消息「复制全文」直接失败。
 pub fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write;
     let cleaned: String = text.chars().filter(|ch| *ch != '\r').collect();
-    let script = format!("Set-Clipboard -Value '{}'", cleaned.replace('\'', "''"));
     let mut c = std::process::Command::new("powershell");
-    let out = hide_window(&mut c)
-        .args(["-NoProfile", "-Command", &script])
-        .output()
+    let mut child = hide_window(&mut c)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); $t=[Console]::In.ReadToEnd(); Set-Clipboard -Value $t",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("执行失败: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(cleaned.as_bytes()).map_err(|e| format!("写入失败: {e}"))?;
+    } // drop → EOF
+    let out = child.wait_with_output().map_err(|e| format!("执行失败: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {

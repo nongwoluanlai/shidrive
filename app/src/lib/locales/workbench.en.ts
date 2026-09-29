@@ -26,7 +26,7 @@ export const workbenchEn: Record<string, string> = {
   "请先创建上下文，Agent 节点需要绑定上下文": "Create a context first. Agent nodes require a context.",
   "说明…": "Add a note…",
   "提醒": "Reminder",
-  "不能创建循环连线": "Connections cannot create a cycle",
+  "不能创建循环连线": "Connections cannot create a cycle", "未设置连线：按节点顺序执行（手动连线后以连线为准）": "No edges set: steps run in order (manual edges take over once added)",
   "节点已复制，画布空白处右键粘贴或 Ctrl+V": "Node copied. Right-click an empty area of the canvas to paste, or press Ctrl+V.",
   "下次触发": "Next trigger",
   "下次 {time}": "Next: {time}",

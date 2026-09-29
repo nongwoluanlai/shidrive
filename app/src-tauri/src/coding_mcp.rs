@@ -152,15 +152,28 @@ fn handle_conn(mut stream: TcpStream, cfg: &Cfg) -> std::io::Result<()> {
     let mut content_length = 0usize;
     let mut authorization = String::new();
     let mut origin = String::new();
+    let mut host = String::new();
     for line in lines {
         let lower = line.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
         } else if let Some(v) = lower.strip_prefix("authorization:") {
             authorization = line[15..].trim().to_string();
-        } else if let Some(v) = lower.strip_prefix("origin:") {
+        } else if lower.starts_with("origin:") {
             origin = line[7..].trim().to_string();
+        } else if lower.starts_with("host:") {
+            host = line[5..].trim().to_string();
         }
+    }
+    // 鉴权前就按 Content-Length 读 body：必须设上限，否则一个请求即可耗尽内存
+    if content_length > 8 * 1024 * 1024 {
+        return write_resp(&mut stream, 413, "text/plain", "", b"payload too large");
+    }
+    // 无凭据（open）模式下，浏览器网页可借 CORS 反射/简单请求/DNS 重绑定驱动本服务
+    // 读写文件乃至执行命令：此时只接受非浏览器客户端或本机来源。
+    let open_mode = cfg.token.is_empty() && cfg.auth_user.is_empty();
+    if open_mode && (!crate::mcp::local_host_ok(&host) || (!origin.is_empty() && !crate::mcp::local_origin_ok(&origin))) {
+        return write_resp(&mut stream, 403, "text/plain", "", b"forbidden: set --token for remote/browser access");
     }
     while buf.len() < header_end + content_length {
         let n = stream.read(&mut chunk)?;
@@ -178,7 +191,8 @@ fn handle_conn(mut stream: TcpStream, cfg: &Cfg) -> std::io::Result<()> {
     // CORS（浏览器端 MCP 客户端需要）
     let cors = format!(
         "Access-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, MCP-Protocol-Version\r\nAccess-Control-Max-Age: 86400\r\n",
-        if origin.is_empty() { "*".to_string() } else { origin }
+        // 不反射任意 Origin：有凭据时 "*" 足够（不带 cookie）；open 模式上面已限制为本机来源
+        if origin.is_empty() || open_mode { "*".to_string() } else { origin }
     );
 
     if method == "OPTIONS" {
@@ -233,7 +247,9 @@ fn write_resp(stream: &mut TcpStream, status: u16, ctype: &str, extra_headers: &
         204 => "No Content",
         401 => "Unauthorized",
         404 => "Not Found",
+        403 => "Forbidden",
         405 => "Method Not Allowed",
+        413 => "Payload Too Large",
         _ => "Error",
     };
     let head = format!(
