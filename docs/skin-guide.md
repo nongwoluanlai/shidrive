@@ -200,3 +200,47 @@
 - 系统开启"减少动态效果"时，完整自动降为轻量。
 - 关闭，或 WebGL 不可用时，看板显示 `body` 静态图。
 - 窗口隐藏时暂停渲染。
+
+## 用 AI 技能包制作动态皮肤
+
+如果不想手写 `skin.json`、手动切图层和画 mask，可以使用 **动态皮肤制作技能包**（`shidrive-dynamic-skin-skill.zip`）——它是一个完整的 AI Agent 技能，让编程 Agent（ZCode / Codex 等）自动帮你完成从素材到可导入 zip 的全流程。
+
+### 获取
+
+技能包随仓库分发：`docs/shidrive-dynamic-skin-skill.zip`。
+
+### 安装
+
+把 zip 解压到你的 Agent 技能目录（例如 ZCode 的 `~/.zcode/cli/plugins/` 下或项目 `.zcode/` 中），解压后得到 `shidrive-dynamic-skin/` 目录，包含：
+
+```
+shidrive-dynamic-skin/
+├── SKILL.md                          # Agent 读的技能说明（协作流程 + 构建步骤）
+├── templates/
+│   ├── prompts.md                    # 生图提示词模板（发给用户改角色描述）
+│   └── skin.config.example.json     # 皮肤配置示例（配色 / 表情 / 特效 / 事件映射）
+├── scripts/
+│   ├── build_skin.py                 # 素材检查(inspect) + 自动定位脸部 → 构建 zip(build)
+│   ├── preview/record.py             # 用客户端真实渲染器冒烟测试 + 录制预览视频
+│   ├── preview/engine.js             # 从客户端 scene.ts + global-fx.ts 打包的离线引擎
+│   └── verify/verify_import.sh       # 调用客户端 Rust 导入代码做最终校验
+├── references/schema.md              # skin.json 完整 schema
+└── examples/kurisu5/                 # 完整示例（配置 + SVG 时间线 + 交互式预览页）
+```
+
+### 使用流程（四步）
+
+1. **要提示词**：让 Agent 执行技能 → Agent 发给你一段生图提示词模板 → 你只需改【角色描述】部分，然后自己去生图（透明底立绘 + 同构图表情图 + 可选背景）。
+2. **发素材**：把素材图发给 Agent → Agent 运行 `build_skin.py inspect` 自动定位脸部、检查素材 → 运行 `build_skin.py build` 产出可导入的 zip → 附上预览图/视频。
+3. **导入核验**：在使驾 设置 → 皮肤插件 → 导入皮肤包（zip）导入，看板立刻生效。
+4. **反馈调整**：告诉 Agent 要改什么（"表情幅度小一点"、"加一个回复完成的特效"）→ Agent 改 `skin.config.json` 后重新 build → 删除旧版再导入同 id 新包。
+
+### 技能包依赖
+
+- 构建：`pip install pillow numpy scipy`
+- 预览录制（可选）：`pip install playwright imageio imageio-ffmpeg` + `python -m playwright install --with-deps chromium`
+- 最终校验（可选）：需要本地有 ShiDrive 源码仓库（`scripts/verify/verify_import.sh` 会调用 Rust 导入代码做真实校验）
+
+### 旧版静态皮肤
+
+不需要动态效果的静态皮肤（背景 + 立绘 + 配色）继续按本文上半部分的格式手工制作即可，两者互不影响。
