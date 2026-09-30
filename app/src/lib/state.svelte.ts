@@ -553,7 +553,8 @@ export function finishTurn(agentType: AgentType, contextId: string | null, reque
   if (list) for (const it of list) it.streaming = false;
   const wasStreaming = !!app.streaming[key];
   app.streaming[key] = false;
-  if (wasStreaming && key === chatKey(app.contextId, app.agent)) emitSkinEvent("agent.done");
+  // A failed turn already reported agent.error; don't follow it with a "done" reaction.
+  if (wasStreaming && key === chatKey(app.contextId, app.agent) && list?.[list.length - 1]?.kind !== "error") emitSkinEvent("agent.done");
   delete app.promptRequests[key];
   delete app.pendingMessage[key];
   delete app.activeTurn[key];

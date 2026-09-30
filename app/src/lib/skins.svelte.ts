@@ -17,6 +17,8 @@ export interface SkinManifest {
   scene?: unknown;
   /** Full-window effect timelines bound to app events. */
   globalFx?: unknown;
+  /** Chat timeline decoration: { art?: svg/png, mark?: svg/png, height?: px, railColor?: #hex }. */
+  timeline?: { art?: string; mark?: string; height?: number; railColor?: string };
 }
 export const builtinSkins = [
   { id: "steins-gate", name: "命运石之门", en: "Steins;Gate", description: "琥珀暖光 · 复古实验室", descriptionEn: "Amber lab light · retro terminal", preview: "/skins/steins-gate/bg.png" },
@@ -32,6 +34,9 @@ export const dynamicSkin = $state({
   scene: null as SceneSpec | null,
   urls: null as { body: string; mask: string; layers: string[] } | null,
 });
+
+/** Chat-timeline decoration of the active custom skin (built-in skins keep their inline SVG art). */
+export const skinTimeline = $state({ art: "", height: 130 });
 
 let globalFx: GlobalFx | null = null;
 onSkinEvent((event) => globalFx?.handle(event));
@@ -77,11 +82,13 @@ function clearSkin() {
   delete document.body.dataset.skinCharacter;
   startGlobalFx(null);
   dynamicSkin.id = ""; dynamicSkin.scene = null; dynamicSkin.urls = null;
+  skinTimeline.art = ""; skinTimeline.height = 130;
+  delete document.body.dataset.skinTlMark;
   for (const url of objectUrls.splice(0)) URL.revokeObjectURL(url);
   // Keep --skin-opacity: the user preference outlives skin switches.
 }
 
-const IMAGE_MIME: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", gif: "image/gif" };
+const IMAGE_MIME: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", gif: "image/gif", svg: "image/svg+xml" };
 /**
  * Load a declared skin image as a `blob:` URL. The previous implementation inlined the file as a
  * base64 `data:` URL inside a CSS custom property; Chromium (WebView2 included) treats any URL longer
@@ -138,6 +145,11 @@ export function activateSkin(id: string, onError: (message: string) => void): ()
         const scene = manifest.scene === undefined ? null : sanitizeScene(manifest.scene);
         if (manifest.scene !== undefined && !scene) console.warn("[skin] scene ignored: invalid description");
         const fx = manifest.globalFx === undefined ? null : sanitizeGlobalFx(manifest.globalFx);
+        const tl = manifest.timeline && typeof manifest.timeline === "object" ? manifest.timeline : {};
+        const [tlArt, tlMark] = await Promise.all([
+          typeof tl.art === "string" ? assetUrl(manifest.dir, tl.art).catch(() => "") : "",
+          typeof tl.mark === "string" ? assetUrl(manifest.dir, tl.mark).catch(() => "") : "",
+        ]);
         const [background, character, sceneUrls] = await Promise.all([
           manifest.background ? assetUrl(manifest.dir, manifest.background) : "",
           manifest.character ? assetUrl(manifest.dir, manifest.character) : "",
@@ -149,7 +161,7 @@ export function activateSkin(id: string, onError: (message: string) => void): ()
         ]);
         if (version !== generation) {
           // a newer activation won: free the bitmaps we just created
-          for (const url of [background, character, ...(sceneUrls ? [sceneUrls[0], sceneUrls[1], ...sceneUrls[2]] : [])]) {
+          for (const url of [tlArt, tlMark, background, character, ...(sceneUrls ? [sceneUrls[0], sceneUrls[1], ...sceneUrls[2]] : [])]) {
             if (!url) continue;
             URL.revokeObjectURL(url);
             const i = objectUrls.indexOf(url);
@@ -177,6 +189,9 @@ export function activateSkin(id: string, onError: (message: string) => void): ()
           dynamicSkin.id = id;
           document.body.dataset.skinCharacter = "true";
         }
+        if (tlArt) { skinTimeline.art = tlArt; skinTimeline.height = Math.min(480, Math.max(40, Number(tl.height) || 130)); }
+        if (tlMark) { setToken("--skin-tl-mark", `url("${tlMark}")`); document.body.dataset.skinTlMark = "true"; }
+        if (typeof tl.railColor === "string" && /^#[\da-f]{3}([\da-f]{3})?$/i.test(tl.railColor)) setToken("--skin-tl-rail", tl.railColor);
         startGlobalFx(fx);
         document.body.dataset.skin = id;
       } catch (error) {

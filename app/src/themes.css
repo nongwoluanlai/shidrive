@@ -97,3 +97,14 @@ body[data-skin-character="true"] .skin-character-stage {
     scroll-behavior: auto !important;
   }
 }
+
+/* 自定义皮肤的时间轴节点图（skin.json timeline.mark） */
+body[data-skin-tl-mark="true"] .timeline .mark {
+  width: 12px;
+  height: 12px;
+  right: -1px;
+  border: none;
+  border-radius: 0;
+  background: var(--skin-tl-mark) center / contain no-repeat;
+  filter: drop-shadow(0 0 3px var(--accent));
+}

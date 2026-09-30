@@ -1,11 +1,15 @@
 <script lang="ts">
   import { app } from "../state.svelte";
+  import { skinTimeline } from "../skins.svelte";
   // 时间轴的皮肤装饰（纯展示，pointer-events: none，位于导航点下方）：
   // 命运石之门 = 时钟 + 世界线分叉 + 门；地狱乐 = 蓬莱仙岛桃花藤（枝头群花，大小深浅不一）。
   const skin = $derived(app.skin);
 </script>
 
-{#if skin === "steins-gate"}
+{#if skinTimeline.art}
+  <!-- 自定义皮肤：skin.json timeline.art（经 Rust 校验的静态 SVG/位图，仅以 <img> 渲染） -->
+  <img class="skin-tl-art custom" src={skinTimeline.art} alt="" aria-hidden="true" style="height:{skinTimeline.height}px" />
+{:else if skin === "steins-gate"}
   <svg class="skin-tl-art" viewBox="0 0 18 130" aria-hidden="true">
     <!-- 时钟 -->
     <circle class="sg-stroke" cx="11.5" cy="13" r="6" />
@@ -57,6 +61,7 @@
     pointer-events: none;
     opacity: 0.85;
   }
+  .skin-tl-art.custom { width: 18px; object-fit: contain; opacity: 0.95; }
   .sg-stroke {
     stroke: var(--accent);
     stroke-width: 1.5;

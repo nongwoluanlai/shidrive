@@ -92,65 +92,111 @@
 
 请遵守各皮肤素材的版权许可；人物立绘等素材请使用你有权分发的文件。
 
-## 动态皮肤（scene / globalFx）
+## 动态皮肤（scene / globalFx / timeline）
 
-v0.3.18 起 `skin.json` 可声明两个可选块，**都是纯数据，皮肤包里不允许任何脚本**：
+`skin.json` 可声明三个可选块，**全部是纯数据，皮肤包里不允许任何脚本**。引擎不认识具体角色、表情或特效，所有表演都写在皮肤包里；新增皮肤不需要改代码。
+
+### 事件
+
+| 事件 | 触发时机 |
+|---|---|
+| `message.send` | 用户发送消息 |
+| `agent.streaming` | 当前可见会话开始回复 |
+| `agent.done` | 回复完成（失败的回合不会触发） |
+| `agent.error` | 回合失败 |
+| `character.click` | 点击人物的不透明区域（点在按钮、输入框等控件上时不算） |
+| `skin.enter` | 皮肤刚启用 |
 
 ### `scene`：分层动态看板
 
-替代左下角静态人物图：身体网格按遮罩飘动（头发 / 衣摆 / 呼吸），自动眨眼、视线跟随鼠标，并在事件时切换表情。
-
-```json
+```jsonc
 "scene": {
-  "body": { "src": "body.png", "size": [768, 1376], "grid": [40, 72] },
+  "body": { "src": "body.png", "size": [1024, 1536], "grid": [40, 72] },
   "mask": "mask.png",
-  "pivot": { "neck": [370, 330], "chest": [400, 480] },
+  "pivot": { "neck": [484, 379], "chest": [484, 609] },
   "layers": [
-    { "id": "closed", "src": "face_closed.png", "rect": [266,146,194,172], "bind": "blink" },
-    { "id": "talk",   "src": "face_talk.png",   "rect": [266,126,168,193], "bind": "talk" }
+    { "id": "closed", "src": "face_closed.png", "rect": [372,101,225,263], "bind": "blink" },
+    { "id": "talk",   "src": "face_talk.png",   "rect": [372,101,225,263], "bind": "talk" }
   ],
-  "idle":  { "wind": 1, "breath": 1, "blink": { "every": [2, 6], "double": 0.15 }, "gaze": { "maxRot": 0.045 } },
-  "clips": {
-    "talk":  { "dur": 2400, "keys": { "talk": "flap(100..170)" } },
-    "smug":  { "dur": 1700, "keys": { "smug": [[0,0],[150,1],[1400,1],[1700,0]], "nod": [[0,0],[180,1],[520,0]] } }
+  "idle": {
+    "wind": 1, "breath": 1,
+    "hairAmp": 32, "coatAmp": 20,        // 飘动幅度（0–90 / 0–60）
+    "gust": 0.6,                         // 阵风强度 0–1：风力会慢慢起伏，偶尔来一阵强风
+    "lag": 1.2,                          // 发梢滞后 0–3：值越大，波浪沿发丝传得越明显
+    "windDir": 0.3,                      // 风向偏置 -1..1
+    "blink": { "every": [2, 6], "double": 0.15 }, "gaze": { "maxRot": 0.04 },
+    "actions": { "every": [35, 80], "clips": ["rest", "smirk"] }   // 空闲时随机做一个小动作
   },
-  "on": { "message.send": "smug", "agent.streaming": "talk" }
+  "clips": {
+    "talk":  { "dur": 2400, "maxDur": 30000,
+               "keys": { "talk": { "flap": [90, 170], "burst": [900, 2400], "rest": [500, 1400] } } },
+    "smug":  { "dur": 2200, "keys": { "smug": [[0,0],[160,1],[1800,1],[2200,0]], "nod": [[0,0],[200,1],[560,0]] } },
+    "poke":  { "dur": 1500, "cooldown": 2500, "keys": { "surprise": [[0,0],[60,1],[1200,1],[1500,0]], "jolt": [[0,0],[50,1],[300,0]] } }
+  },
+  "on": { "agent.streaming": "talk", "agent.done": "smug", "character.click": "poke", "message.send": ["ack", "smirk"] }
 }
 ```
 
-- `size`：坐标系（设计尺寸）；`rect` 与 `pivot` 都用这个坐标。贴图实际像素可以更小，按比例采样。
-- `mask.png`：R = 头发风力、G = 衣摆风力、B = 呼吸、A = 头部跟随。
-- `layers`：表情补丁，`bind` 为参数名，参数 0→1 控制不透明度（`slide` 可选位移）。
-- 内置参数：`blink`（自动眨眼驱动）、`nod`、`jolt`、`blinkHold`（>0.3 时暂停眨眼）。
-- `clips.keys`：`[[毫秒, 值]]` 关键帧（值 -1..1），或 `"flap(最短..最长)"` 口型开合。
-- 事件：`message.send`、`agent.streaming`（回复开始，flap 片段会持续到 `agent.done`）、`agent.done`、`agent.error`、`skin.enter`。
-- 上限：图层 16、片段 16、贴图单张 8 MiB / 总计 32 MiB。所有被引用文件必须在包内且是真实图片。
-- **贴图尺寸**：按显示尺寸的 1.2–1.5 倍出图（看板约 300×540 CSS 像素 → body 约 450×800 即可）；不生成 mipmap，过大反而发糊、占显存。
-- 可用 `tools/make_scene.py`（动态皮肤工具包）从一张立绘 + 表情图生成 mask 与 scene.json。
+- `size` 是坐标系（原图像素），`rect` 和 `pivot` 都按这个坐标写；贴图本身可以更小，渲染时按比例采样。
+- `mask.png` 的四个通道：R = 头发风力，G = 衣摆风力，B = 呼吸，A = 头部跟随。
+- 内置参数：`blink`（自动眨眼）、`nod`（点头）、`jolt`（受惊一抖）、`blinkHold`（>0.3 时暂停眨眼）。
+- **口型** `{"flap":[开合间隔ms], "burst":[连续说话时长], "rest":[停顿时长]}`：说一阵、停一阵，不会一直张嘴；`burst: null` 表示不停顿。旧写法 `"flap(100..170)"` 也会自动带上默认停顿。
+- `until: "<事件>"` 让片段持续到该事件发生（上限 `maxDur`）；绑定在 `agent.streaming` 上的口型片段默认持续到 `agent.done`。
+- `cooldown`：同一片段两次触发之间的最短间隔（例如防止连续点击时不停惊吓）。
+- `on` 的值可以是片段名，也可以是数组（随机挑一个）。多个表情同时生效时，最后开始的片段决定显示哪张脸；有表情时隐藏眨眼层。
+- 上限：图层 16，片段 24，每个片段 16 个参数；贴图单张 8 MiB，总计 32 MiB。
+- **贴图尺寸**：按显示尺寸的 1.2–1.5 倍出图即可（看板约 340×600 CSS 像素）。
 
 ### `globalFx`：全局特效
 
-```json
+```jsonc
 "globalFx": {
-  "presets": { "frost": [ { "at": 0, "fx": "vignette", "color": "#7fc4ff", "opacity": 0.35, "dur": 900 } ] },
-  "on": { "agent.done": "frost" }
+  "presets": {
+    "worldline": [
+      { "at": 0,    "fx": "tint", "color": "#ff9a3c", "opacity": 0.18, "blend": "overlay", "dur": 1500 },
+      { "at": 0,    "fx": "slices", "n": 10, "dur": 1000, "color": "#ffb347" },
+      { "at": 0,    "fx": "rgbSplit", "px": 7, "dur": 1000 },
+      { "at": 80,   "fx": "divergence", "values": ["1.048596", "0.571024"], "roll": 900, "lock": 110, "dur": 3000 },
+      { "at": 1050, "fx": "ring", "x": 0.5, "y": 0.2, "size": 0.8, "dur": 900 }
+    ]
+  },
+  "on": { "agent.done": "worldline", "agent.error": ["glitch"] },
+  "ambient": { "every": [150, 360], "play": "flicker" }      // 空闲时偶尔播放（窗口需在前台）
 }
 ```
 
-原语：`shake`、`flash`、`slices`、`rgbSplit`、`hueShift`、`vignette`、`overlayText`。**引擎不内置任何预设**，`on` 只能引用本皮肤 `presets` 里定义的名字。例如“世界线跳跃”：
+| 原语 | 参数 |
+|---|---|
+| `shake` | px, steps, dur |
+| `flash` | color, opacity, dur（每秒最多 3 次） |
+| `slices` | n, color, dur：横向撕裂条 |
+| `rgbSplit` | px, dur：RGB 错位 |
+| `hueShift` | deg, dur |
+| `vignette` | color, opacity, dur |
+| `overlayText` | text, style(nixie/plain), roll, color, dur |
+| `divergence` | values[], roll, lock, size, y, color, dur：辉光管读数，先滚动，再从左到右逐位定格 |
+| `scanlines` | color, opacity, gap, dur |
+| `noise` | opacity, dur：胶片颗粒 |
+| `tint` | color, opacity, blend(color/overlay/multiply/screen/soft-light/…), dur：整体调色 |
+| `ring` | x, y (0–1), size, width, color, dur：扩散光环 |
+| `particles` | shape(dot/spark/digit), n ≤40, dir(up/down), color, dur |
+
+**引擎不内置任何预设**。上限：每个皮肤 12 个预设，每个预设 24 步，`at` ≤3000ms；同一预设 1.2s 冷却。
+
+### `timeline`：会话时间轴装饰
 
 ```json
-"worldline": [
-  { "at": 0, "fx": "slices", "n": 9, "dur": 1100, "color": "#ffb347" },
-  { "at": 0, "fx": "rgbSplit", "px": 7, "dur": 1100 },
-  { "at": 0, "fx": "shake", "px": 6, "dur": 1100, "steps": true },
-  { "at": 0, "fx": "overlayText", "style": "nixie", "roll": 1100, "dur": 2600 },
-  { "at": 1100, "fx": "flash", "color": "#ffb347", "opacity": 0.28, "dur": 300 }
-]
+"timeline": { "art": "timeline_art.svg", "mark": "timeline_mark.svg", "height": 160, "railColor": "#6b5039" }
 ```
 
-每个预设 ≤16 步、`at` ≤2000ms；同一预设 1.2s 冷却，闪光每秒最多 3 次。
+- `art`：时间轴背后的竖条装饰，宽 18px，`height` 可设 40–480（默认 130）。
+- `mark`：替换消息节点圆点的图标（显示为 12×12）。
+- 支持 PNG/JPEG/WebP/GIF/**SVG**。SVG 只作为 `<img>` 渲染，导入时会被拒绝的内容：脚本、事件属性、`foreignObject`、`<use>`、实体声明、外链（`http(s):`），文件不得超过 512 KiB。
 
 ### 动效档位
 
-设置 → 皮肤插件 → 皮肤动效：**完整 / 轻量 / 关闭**。轻量：关闭飘动与呼吸（仍眨眼/换表情），全局特效只保留 `vignette`、`overlayText`；系统开启“减少动态效果”时完整自动降为轻量。关闭或 WebGL 不可用时看板回退为 `body` 静态图。窗口隐藏时暂停渲染。
+设置 → 皮肤插件 → 皮肤动效：**完整 / 轻量 / 关闭**。
+- 轻量：关闭飘动和呼吸，仍然眨眼、换表情；全局特效只保留 `vignette`、`overlayText`、`divergence`、`tint`。
+- 系统开启"减少动态效果"时，完整自动降为轻量。
+- 关闭，或 WebGL 不可用时，看板显示 `body` 静态图。
+- 窗口隐藏时暂停渲染。

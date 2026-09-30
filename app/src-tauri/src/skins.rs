@@ -88,6 +88,48 @@ fn bounded_read(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     }
     Ok(bytes)
 }
+const MAX_SVG: usize = 512 * 1024;
+
+/// SVG is only ever shown through `<img>` (where scripts never run), but packages are checked
+/// anyway so a blob URL opened some other way cannot become active content: static markup only,
+/// no scripts, handlers, foreign HTML, entities or external references.
+fn safe_svg(bytes: &[u8]) -> bool {
+    if bytes.len() > MAX_SVG {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let lower = text.trim_start_matches('\u{feff}').trim_start().to_ascii_lowercase();
+    if !(lower.starts_with("<svg") || lower.starts_with("<?xml")) {
+        return false;
+    }
+    let cleaned = lower
+        .replace("http://www.w3.org/2000/svg", "")
+        .replace("http://www.w3.org/1999/xlink", "");
+    const BANNED: [&str; 10] = ["<script", "javascript:", "foreignobject", "<!entity", "<!doctype", "@import", "http:", "https:", "<iframe", "<use"];
+    if BANNED.iter().any(|b| cleaned.contains(b)) {
+        return false;
+    }
+    // inline event handlers: whitespace + on[a-z]+ =
+    let b = cleaned.as_bytes();
+    for i in 1..b.len().saturating_sub(3) {
+        if b[i - 1].is_ascii_whitespace() && b[i] == b'o' && b[i + 1] == b'n' {
+            let mut j = i + 2;
+            while j < b.len() && b[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j > i + 2 && j < b.len() && b[j] == b'=' {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn image_mime(path: &Path, bytes: &[u8]) -> Result<&'static str, String> {
     let ext = path
         .extension()
@@ -101,7 +143,8 @@ fn image_mime(path: &Path, bytes: &[u8]) -> Result<&'static str, String> {
             Ok("image/webp")
         }
         "gif" if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") => Ok("image/gif"),
-        _ => Err("皮肤图片仅支持 PNG、JPEG、WebP、GIF，文件内容必须匹配扩展名".into()),
+        "svg" if safe_svg(bytes) => Ok("image/svg+xml"),
+        _ => Err("皮肤图片仅支持 PNG、JPEG、WebP、GIF、SVG（静态、无脚本、无外链），文件内容必须匹配扩展名".into()),
     }
 }
 fn parse_manifest(bytes: &[u8]) -> Result<Value, String> {
@@ -150,6 +193,14 @@ fn parse_manifest(bytes: &[u8]) -> Result<Value, String> {
     if let Some(fx) = obj.get("globalFx") {
         if !fx.is_object() {
             return Err("globalFx 必须是对象".into());
+        }
+    }
+    if let Some(tl) = obj.get("timeline") {
+        let tl = tl.as_object().ok_or("timeline 必须是对象")?;
+        for key in ["art", "mark"] {
+            if let Some(file) = tl.get(key) {
+                safe_relative(file.as_str().ok_or("timeline 图片路径必须为字符串")?)?;
+            }
         }
     }
     obj.remove("dir");
@@ -209,6 +260,11 @@ fn declared_assets(manifest: &Value) -> Vec<String> {
         .flatten()
     {
         files.push(name.to_string());
+    }
+    for key in ["art", "mark"] {
+        if let Some(name) = manifest["timeline"][key].as_str() {
+            files.push(name.to_string());
+        }
     }
     if let Some(layers) = scene["layers"].as_array() {
         files.extend(
@@ -713,6 +769,31 @@ mod tests {
             assert!(import(&root, &zip).is_err(), "{}", String::from_utf8_lossy(&manifest));
             assert!(!root.exists());
         }
+    }
+    #[test]
+    fn timeline_svg_assets_are_sanitized() {
+        let ok = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 130"><path d="M1 1L2 2" stroke="#fa0"/></svg>"##;
+        assert!(safe_svg(ok));
+        assert!(safe_svg(b"\xef\xbb\xbf<?xml version=\"1.0\"?><svg></svg>"));
+        for bad in [
+            &br#"<svg><script>alert(1)</script></svg>"#[..],
+            br#"<svg onload="x()"></svg>"#,
+            br#"<svg><image href="https://evil/x.png"/></svg>"#,
+            br#"<svg><foreignObject><div/></foreignObject></svg>"#,
+            br#"<svg><a href="javascript:x()"/></svg>"#,
+            br#"<html><svg/></html>"#,
+        ] {
+            assert!(!safe_svg(bad), "{}", String::from_utf8_lossy(bad));
+        }
+        let tmp = Temp::new();
+        let root = tmp.0.join("skins");
+        let manifest = br##"{"id":"tl","timeline":{"art":"tl/art.svg","mark":"tl/mark.svg"}}"##;
+        let zip = package(&tmp.0, &[("skin.json", manifest), ("tl/art.svg", ok), ("tl/mark.svg", ok)]);
+        import(&root, &zip).unwrap();
+        let (mime, _) = asset_bytes(&root, "tl", "tl/art.svg").unwrap();
+        assert_eq!(mime, "image/svg+xml");
+        let bad = package(&tmp.0, &[("skin.json", br##"{"id":"tl2","timeline":{"art":"a.svg"}}"##), ("a.svg", br#"<svg onload="x()"/>"#)]);
+        assert!(import(&root, &bad).is_err());
     }
     #[test]
     fn base64_padding() {

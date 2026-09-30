@@ -79,7 +79,7 @@
     top: 0;
     bottom: 0;
     width: 2px;
-    background: var(--border);
+    background: var(--skin-tl-rail, var(--border));
     border-radius: 2px;
     opacity: 0.6;
   }
