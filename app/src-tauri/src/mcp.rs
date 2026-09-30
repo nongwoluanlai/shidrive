@@ -162,9 +162,20 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, state: Arc<McpState>, ap
         _ => (404, "text/plain; charset=utf-8", "not found".to_string()),
     };
 
+    // initialize 响应附带 Mcp-Session-Id（Streamable HTTP MCP 规范），
+    // 部分客户端（rmcp）依赖它维持会话
+    let session_header = if payload.contains("\"initialize\"") && status == 200 {
+        format!("Mcp-Session-Id: {}\r\n", uuid::Uuid::new_v4())
+    } else {
+        String::new()
+    };
+    let status_text = match status {
+        200 => "OK",
+        202 => "Accepted",
+        _ => "Not Found",
+    };
     let resp = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        if status == 200 { "OK" } else { "Not Found" },
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{session_header}Connection: close\r\n\r\n",
         payload.len()
     );
     stream.write_all(resp.as_bytes()).await.map_err(|e| e.to_string())?;
