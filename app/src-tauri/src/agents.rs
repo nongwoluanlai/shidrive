@@ -100,6 +100,13 @@ pub fn agent_specs() -> &'static [AgentSpec] {
         args: vec!["--profile".into(), "acp".into()],
         help: "DeepSeek Harness CLI（npm 包 @deepseek-ai/dsh），以 `dsh --profile acp` 提供 ACP stdio 服务。安装适配器后需配置 DeepSeek API Key：展开本行点「填充 API Key」，或在环境变量里加 DEEPSEEK_API_KEY=<key>（也可用系统环境变量）。支持 session/list 与 session/resume（不支持 session/load，恢复不回放历史，由使驾侧补齐）。".into(),
     },
+    AgentSpec {
+        id: "pi".into(),
+        name: "Pi".into(),
+        npm: Some(PI_ACP_PKG.into()),
+        args: vec![],
+        help: "pi coding agent（@earendil-works/pi-coding-agent）经 ACP 适配器 pi-acp 接入（与 Zed ACP Registry 的「pi ACP」同一实现：适配器以 `pi --mode rpc` 驱动 pi）。「安装适配器」会把 pi-acp 与 pi CLI 一起装到用户数据目录，需 Node 22.19+；已全局安装 pi 时也可直接使用。首次使用点「登录 / 配置 pi」在终端里执行 /login 或配置模型提供商 API Key（配置保存在 ~/.pi/agent，与终端 pi 共用）。可在环境变量里用 PI_ACP_PI_COMMAND 指定 pi 可执行文件，PI_ACP_ENABLE_EMBEDDED_CONTEXT=true 开启嵌入上下文。支持 session/load 与 session/list。".into(),
+    },
     ])
 }
 
@@ -140,6 +147,40 @@ pub fn managed_acp_dir() -> Option<PathBuf> {
 }
 
 const DEEPSEEK_PKG: &str = "@deepseek-ai/dsh";
+
+/// pi 的 ACP 适配器（Zed ACP Registry 中 `pi-acp` 条目的 npx 包）。
+pub const PI_ACP_PKG: &str = "pi-acp";
+/// pi-acp 通过 `pi --mode rpc` 驱动的 pi CLI；随适配器一并装入托管目录。
+pub const PI_CLI_PKG: &str = "@earendil-works/pi-coding-agent";
+
+/// 与某适配器一起安装 / 卸载的伴随包。
+fn companion_packages(npm_pkg: &str) -> &'static [&'static str] {
+    if npm_pkg == PI_ACP_PKG { &[PI_CLI_PKG] } else { &[] }
+}
+
+/// 托管安装的 pi CLI 入口脚本（node 直接运行，用于登录终端）。
+pub fn pi_cli_script(tools: &Tools) -> Option<PathBuf> {
+    acp_roots(tools).iter().find_map(|root| adapter_script_in(root, PI_CLI_PKG))
+}
+
+/// 托管安装的 pi 启动器（npm 生成的 .bin/pi(.cmd)），供 PI_ACP_PI_COMMAND 使用。
+/// 仅当同一根下 CLI 包本身也完整时才返回，避免残留 shim 指向已删除的包。
+pub fn pi_cli_command(tools: &Tools) -> Option<PathBuf> {
+    let shim = if cfg!(windows) { "pi.cmd" } else { "pi" };
+    acp_roots(tools).into_iter().find_map(|root| {
+        adapter_script_in(&root, PI_CLI_PKG)?;
+        let p = root.join(".bin").join(shim);
+        p.is_file().then_some(p)
+    })
+}
+
+/// PATH 上用户自行安装的 pi（npm i -g @earendil-works/pi-coding-agent）。
+pub fn pi_global_command() -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) { &["pi.cmd", "pi.exe", "pi.bat"] } else { &["pi"] };
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| names.iter().map(|n| dir.join(n)).find(|p| p.is_file()))
+}
+
 const DEEPSEEK_VERIFIED: &str = ".shidrive-verified-version";
 
 /// dsh 的 Windows 原生依赖（Koffi）不能 --omit=optional；独立 npm 根
@@ -319,6 +360,8 @@ pub fn bootstrap_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> R
     let deepseek = npm_pkg == DEEPSEEK_PKG;
     if deepseek {
         crate::node_rt::require_deepseek_node(tools)?;
+    } else if npm_pkg == PI_ACP_PKG {
+        crate::node_rt::require_node_22_19(tools, "pi")?;
     }
     let acp_dir = if deepseek { managed_deepseek_dir() } else { managed_acp_dir() }
         .ok_or("无法确定用户数据目录（APPDATA）")?;
@@ -358,7 +401,11 @@ pub fn bootstrap_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> R
         }
         // @latest：安装/重装都取最新版（旧版适配器缺少新版 CLI 需要的
         // ZCODE_BUILTIN_PROVIDER_CONFIG_FILE 注入，会导致 provider 配置报错）
-        out.arg(format!("{npm_pkg}@latest")).current_dir(&acp_dir).output()
+        out.arg(format!("{npm_pkg}@latest"));
+        for extra in companion_packages(npm_pkg) {
+            out.arg(format!("{extra}@latest"));
+        }
+        out.current_dir(&acp_dir).output()
     };
     let out = run(None, false).map_err(|e| format!("npm 启动失败: {e}"))?;
     // 镜像源重试；DeepSeek 保持原生依赖和 postinstall，否则可能成功安装却无法建会话。
@@ -369,7 +416,12 @@ pub fn bootstrap_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> R
             .map_err(|e| format!("npm 启动失败: {e}"))?
     };
     if out.status.success() {
-        Ok(format!("已安装 {npm_pkg}"))
+        let extras = companion_packages(npm_pkg);
+        if extras.is_empty() {
+            Ok(format!("已安装 {npm_pkg}"))
+        } else {
+            Ok(format!("已安装 {npm_pkg} + {}", extras.join(" + ")))
+        }
     } else {
         Err(format!(
             "npm install 失败: {}",
@@ -381,6 +433,17 @@ pub fn bootstrap_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> R
 /// 卸载 npm 适配器：在托管目录与 .tools/acp 中所有存在该包的位置执行
 /// npm uninstall（--ignore-scripts 防卸载钩子联网）。返回可读结果。
 pub fn uninstall_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> Result<String, String> {
+    let res = uninstall_package(tools, npm_pkg, proxy);
+    if res.is_ok() {
+        // 伴随包（如 pi CLI）一并清理；它本身失败不影响主结果。
+        for extra in companion_packages(npm_pkg) {
+            let _ = uninstall_package(tools, extra, proxy);
+        }
+    }
+    res
+}
+
+fn uninstall_package(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> Result<String, String> {
     let node = tools.node_exe();
     let npm_cli = tools.npm_cli();
     if npm_cli.as_os_str() == "npm" || !npm_cli.exists() {
@@ -469,6 +532,10 @@ pub fn registry_status(db: &Arc<Db>, tools: &Tools) -> Vec<AgentEnvStatus> {
         .map(|sp| {
             let (adapter_ready, adapter_path) = if let Some(pkg) = &sp.npm {
                 match adapter_script(tools, pkg) {
+                    // pi-acp 只是桥：没有可运行的 pi CLI 时不能显示「就绪」。
+                    Some(_) if pkg == PI_ACP_PKG && pi_cli_command(tools).is_none() && pi_global_command().is_none() => {
+                        (false, String::new())
+                    }
                     Some(p) => (true, p.to_string_lossy().to_string()),
                     None => (false, String::new()),
                 }
@@ -499,6 +566,11 @@ pub fn registry_status(db: &Arc<Db>, tools: &Tools) -> Vec<AgentEnvStatus> {
                     let node = tools.node_exe();
                     if node.exists() {
                         auto_env.insert("ZCODE_NODE".to_string(), node.to_string_lossy().to_string());
+                    }
+                }
+                "pi" => {
+                    if let Some(cli) = pi_cli_command(tools).or_else(pi_global_command) {
+                        auto_env.insert("PI_ACP_PI_COMMAND".into(), cli.to_string_lossy().to_string());
                     }
                 }
                 "deepseek" => {

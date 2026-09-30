@@ -154,6 +154,15 @@
     }
   }
 
+  async function piLogin() {
+    try {
+      await api.acpPiLogin();
+      toast("info", t("已打开 pi 终端：执行 /login 或配置 API Key，完成后退出并重新连接 Pi"));
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
   async function uninstall(r: AgentEnvStatusItem) {
     if (!r.npm) return;
     busy = r.id;
@@ -283,6 +292,12 @@
                   </button>
                 {/if}
                 <span class="pend">{t("卸载后需重新安装才能连接")}</span>
+              </div>
+            {/if}
+            {#if r.id === "pi" && r.adapter_ready}
+              <div class="cfg-line">
+                <button class="btn sm" onclick={piLogin}>{t("登录 / 配置 pi")}</button>
+                <span class="pend">{t("在新终端运行 pi（/login 或配置模型提供商），配置与终端 pi 共用 ~/.pi/agent")}</span>
               </div>
             {/if}
             {#if DIR_ENV_TARGETS[r.id]}

@@ -178,6 +178,12 @@ pub async fn acp_session_new(agents: AgentsState<'_>, context: Context, agent_ty
     Ok(sid)
 }
 
+/// 打开交互式 pi 终端（/login、配置模型提供商）。
+#[tauri::command]
+pub async fn acp_pi_login(agents: AgentsState<'_>, cwd: Option<String>) -> Result<(), String> {
+    agents.open_pi_login(cwd).await
+}
+
 #[tauri::command]
 pub async fn acp_deepseek_new(agents: AgentsState<'_>, context: Context) -> Result<String, String> {
     agents.create_fresh_deepseek_session(&context).await

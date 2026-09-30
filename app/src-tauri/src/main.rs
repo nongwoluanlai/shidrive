@@ -233,6 +233,7 @@ fn main() {
             commands::acp_disconnect,
             commands::acp_session_new,
             commands::acp_deepseek_new,
+            commands::acp_pi_login,
             commands::acp_prompt,
             commands::acp_cancel,
             commands::acp_set_mode,

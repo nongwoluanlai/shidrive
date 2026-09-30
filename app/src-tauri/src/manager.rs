@@ -407,6 +407,25 @@ impl AgentManager {
                 }
                 args = vec!["--disable-warning=ExperimentalWarning".into(), adapter.to_string_lossy().to_string()];
             }
+            "pi" => {
+                let script = crate::agents::adapter_script(&self.tools, crate::agents::PI_ACP_PKG)
+                    .ok_or("未安装 pi-acp 适配器：请在「设置 → Agent 管理」展开 Pi 后点「安装适配器」。")?;
+                args = vec!["--disable-warning=ExperimentalWarning".into(), script.to_string_lossy().to_string()];
+                if !manual.env.contains_key("PI_ACP_PI_COMMAND") {
+                    if let Some(cli) = crate::agents::pi_cli_command(&self.tools) {
+                        // 托管 pi 的 npm shim 通过 PATH 找 node：前置实际使用的 Node，
+                        // 确保不装系统 Node 也能跑，且与版本检查的是同一份 Node。
+                        crate::node_rt::require_node_22_19(&self.tools, "pi")?;
+                        env.insert("PI_ACP_PI_COMMAND".into(), cli.to_string_lossy().to_string());
+                        let dirs = [node.parent(), cli.parent()].into_iter().flatten().map(|p| p.to_path_buf());
+                        if let Ok(path) = std::env::join_paths(dirs) {
+                            env.insert("PATH".into(), path.to_string_lossy().to_string());
+                        }
+                    } else if crate::agents::pi_global_command().is_none() {
+                        return Err("未找到 pi CLI：请在「设置 → Agent 管理」展开 Pi 点「安装适配器」（会同时安装 pi），或自行 npm i -g @earendil-works/pi-coding-agent，或在环境变量里配置 PI_ACP_PI_COMMAND。".into());
+                    }
+                }
+            }
             _ => {
                 let pkg = sp
                     .npm
@@ -421,6 +440,55 @@ impl AgentManager {
         args.extend(manual.args); // automatic executable + additional user arguments
         env.extend(manual.env);
         Ok(AgentLaunch { command: node_str, args, env: env.into_iter().collect() })
+    }
+
+    /// 打开新控制台运行交互式 pi，供 /login 或配置模型提供商（等价于 ACP
+    /// Terminal Auth 的 `pi-acp --terminal-login`，但直接用 node 运行 CLI 脚本，
+    /// 避免 shell 模式下带空格的用户目录路径被拆开）。
+    pub async fn open_pi_login(&self, cwd: Option<String>) -> Result<(), String> {
+        let launch = self.launch_for("pi").await?;
+        let mut cmd = match self.tools_pi_login_target(&launch) {
+            Some((program, args)) => {
+                let mut c = std::process::Command::new(program);
+                c.args(args);
+                c
+            }
+            None => return Err("未找到 pi CLI：请先安装适配器或配置 PI_ACP_PI_COMMAND。".into()),
+        };
+        for (key, value) in &launch.env {
+            if key.eq_ignore_ascii_case("PATH") {
+                let mut paths: Vec<_> = std::env::split_paths(value).collect();
+                if let Some(current) = std::env::var_os("PATH") {
+                    paths.extend(std::env::split_paths(&current));
+                }
+                if let Ok(p) = std::env::join_paths(paths) { cmd.env("PATH", p); }
+            } else {
+                cmd.env(key, value);
+            }
+        }
+        if let Some(dir) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
+            cmd.current_dir(dir);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0000_0010); // CREATE_NEW_CONSOLE
+        }
+        cmd.spawn().map(|_| ()).map_err(|e| format!("启动 pi 终端失败: {e}"))
+    }
+
+    /// 登录终端要运行的程序：用户指定的 PI_ACP_PI_COMMAND > 托管 CLI 脚本（node 运行）> PATH 上的 pi。
+    fn tools_pi_login_target(&self, launch: &AgentLaunch) -> Option<(std::path::PathBuf, Vec<String>)> {
+        let configured = launch.env.iter().find(|(k, _)| k.as_str() == "PI_ACP_PI_COMMAND").map(|(_, v)| v.clone());
+        let managed = crate::agents::pi_cli_command(&self.tools).map(|p| p.to_string_lossy().to_string());
+        match configured {
+            // 自动注入的托管 shim → 直接 node 跑脚本；用户自定义的命令原样执行。
+            Some(cmd) if Some(&cmd) != managed.as_ref() => Some((cmd.into(), vec![])),
+            _ => match crate::agents::pi_cli_script(&self.tools) {
+                Some(script) => Some((self.tools.node_exe(), vec![script.to_string_lossy().to_string()])),
+                None => crate::agents::pi_global_command().map(|p| (p, vec![])),
+            },
+        }
     }
 
     pub async fn status(&self, agent_type: &str) -> String {

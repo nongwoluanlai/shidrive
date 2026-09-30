@@ -105,6 +105,19 @@ pub fn require_deepseek_node(tools: &Tools) -> Result<PathBuf, String> {
     ))
 }
 
+/// 其他同样要求 Node 22.19+ 的托管 CLI（如 pi：engines ">=22.19.0"）。
+pub fn require_node_22_19(tools: &Tools, who: &str) -> Result<PathBuf, String> {
+    let node = tools.node_exe();
+    let version = detect_version(&node).map(|(v, _)| v).unwrap_or_else(|| "无法运行".into());
+    if supports_deepseek_node(&version) {
+        return Ok(node);
+    }
+    Err(format!(
+        "{who} 需要可用的 Node 22.19+（推荐内置 Node 22）；实际使用 {}，版本 {}。请到「设置 → 环境与路径」下载 Node22；若配置了旧版自定义 Node，请清除自定义 Node 路径、保存并重启使驾。",
+        node.display(), version
+    ))
+}
+
 #[cfg(test)]
 mod deepseek_tests {
     use super::supports_deepseek_node;
