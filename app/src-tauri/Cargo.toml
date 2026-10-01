@@ -1,6 +1,6 @@
 [package]
 name = "shidrive"
-version = "0.3.20"
+version = "0.3.21"
 edition = "2021"
 rust-version = "1.88"
 description = "使驾 ShiDrive — AI 开发工作台"

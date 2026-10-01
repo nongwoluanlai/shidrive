@@ -145,12 +145,26 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, state: Arc<McpState>, ap
         None => (path.clone(), String::new()),
     };
 
+    // 按「请求」判定（而非响应体）：通知 / 客户端回包只回 202 空体；initialize 才下发会话头。
+    let mut is_initialize = false;
     let (status, content_type, payload) = match (method.as_str(), path_only.as_str()) {
         ("GET", "/skills") => (200, "text/markdown; charset=utf-8", skills_document(&query, port)),
         ("POST", "/mcp") => {
             let parsed: Result<Value, _> = serde_json::from_slice(&body);
             match parsed {
-                Ok(msg) => (200, "application/json", handle_mcp(&state, &app, msg).to_string()),
+                Ok(msg) => match classify_mcp_message(&msg) {
+                    McpMessageKind::NoReply => {
+                        // 通知 / 客户端回包不产生副作用（当前的通知均为 initialized、cancelled 等），
+                        // 不调用 handle_mcp，免得无 id 的 tools/call 被当作通知静默执行。
+                        // Streamable HTTP 规范要求回 202 Accepted + 空体，返回 JSON 会让 rmcp 判定通道关闭。
+                        (202, "application/json", String::new())
+                    }
+                    McpMessageKind::Initialize => {
+                        is_initialize = true;
+                        (200, "application/json", handle_mcp(&state, &app, msg).to_string())
+                    }
+                    McpMessageKind::Request => (200, "application/json", handle_mcp(&state, &app, msg).to_string()),
+                },
                 Err(e) => (
                     200,
                     "application/json",
@@ -164,7 +178,7 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, state: Arc<McpState>, ap
 
     // initialize 响应附带 Mcp-Session-Id（Streamable HTTP MCP 规范），
     // 部分客户端（rmcp）依赖它维持会话
-    let session_header = if payload.contains("\"initialize\"") && status == 200 {
+    let session_header = if is_initialize && status == 200 {
         format!("Mcp-Session-Id: {}\r\n", uuid::Uuid::new_v4())
     } else {
         String::new()
@@ -182,6 +196,44 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, state: Arc<McpState>, ap
     stream.write_all(payload.as_bytes()).await.map_err(|e| e.to_string())?;
     stream.flush().await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+enum McpMessageKind {
+    /// 有 id 的 initialize 请求：响应附带 Mcp-Session-Id
+    Initialize,
+    /// 其他有 id 的请求：正常返回 JSON-RPC 响应
+    Request,
+    /// 通知（有 method 无 id）或客户端回包（无 method）：202 空体
+    NoReply,
+}
+
+fn classify_mcp_message(msg: &Value) -> McpMessageKind {
+    let has_id = msg.get("id").is_some_and(|id| !id.is_null());
+    match msg.get("method").and_then(Value::as_str) {
+        Some(_) if !has_id => McpMessageKind::NoReply,
+        Some("initialize") => McpMessageKind::Initialize,
+        Some(_) => McpMessageKind::Request,
+        // 无 method：客户端对服务器请求的 result/error 回包
+        None if msg.get("result").is_some() || msg.get("error").is_some() => McpMessageKind::NoReply,
+        None => McpMessageKind::Request,
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn notifications_get_202_and_only_initialize_gets_session() {
+        assert_eq!(classify_mcp_message(&json!({"jsonrpc":"2.0","method":"notifications/initialized"})), McpMessageKind::NoReply);
+        assert_eq!(classify_mcp_message(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{}})), McpMessageKind::NoReply);
+        assert_eq!(classify_mcp_message(&json!({"jsonrpc":"2.0","id":1,"result":{}})), McpMessageKind::NoReply);
+        assert_eq!(classify_mcp_message(&json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}})), McpMessageKind::Initialize);
+        assert_eq!(classify_mcp_message(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})), McpMessageKind::Request);
+        // 畸形消息（无 method 无 result）仍走正常路径，由 handle_mcp 返回错误
+        assert_eq!(classify_mcp_message(&json!({"jsonrpc":"2.0","id":3})), McpMessageKind::Request);
+    }
 }
 
 /// Host 头必须是本机（防 DNS 重绑定）。缺失 Host 的 HTTP/1.0 简易客户端放行。

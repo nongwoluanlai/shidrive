@@ -107,7 +107,9 @@ fn safe_svg(bytes: &[u8]) -> bool {
     let cleaned = lower
         .replace("http://www.w3.org/2000/svg", "")
         .replace("http://www.w3.org/1999/xlink", "");
-    const BANNED: [&str; 10] = ["<script", "javascript:", "foreignobject", "<!entity", "<!doctype", "@import", "http:", "https:", "<iframe", "<use"];
+    // `&#` blocks character-reference obfuscation (e.g. `&#106;avascript:`); `<set` / `<animate`
+    // can assign `on*` / `href` attributes at runtime without matching the inline-handler scan.
+    const BANNED: [&str; 14] = ["<script", "javascript:", "foreignobject", "<!entity", "<!doctype", "@import", "http:", "https:", "<iframe", "<use", "&#", "<set", "<animate", "attributename"];
     if BANNED.iter().any(|b| cleaned.contains(b)) {
         return false;
     }
@@ -782,6 +784,9 @@ mod tests {
             br#"<svg><foreignObject><div/></foreignObject></svg>"#,
             br#"<svg><a href="javascript:x()"/></svg>"#,
             br#"<html><svg/></html>"#,
+            br#"<svg><a href="&#106;avascript:x()"/></svg>"#,
+            br#"<svg><set attributeName="onclick" to="x()"/></svg>"#,
+            br#"<svg><animate attributeName="href" values="x"/></svg>"#,
         ] {
             assert!(!safe_svg(bad), "{}", String::from_utf8_lossy(bad));
         }

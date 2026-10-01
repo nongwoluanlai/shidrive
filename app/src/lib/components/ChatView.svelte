@@ -445,20 +445,6 @@ import type { DisplayItem } from "../state.svelte";
       stickToBottom = true;
       input = app.drafts[k] ?? "";
       touchChat(k);
-      // DeepSeek：连接前就注入已知模型，避免上一个 Agent 的选项残留
-      if (agent === "deepseek" && !app.agentCaps["deepseek"]?.configOptions?.length) {
-        app.agentCaps["deepseek"] = {
-          configOptions: [{
-            id: "model",
-            name: "model",
-            currentValue: "deepseek-flash",
-            options: [
-              { value: "deepseek-flash", name: "deepseek-flash" },
-              { value: "deepseek-v4-pro", name: "deepseek-v4-pro" },
-            ],
-          }],
-        };
-      }
       // 显式初始化新 key 的 chat 数组：Svelte 5 的动态属性访问
       // (app.chat[key]) 在 key 变化时可能不触发 $derived 失效——
       // 写入空数组强制 items 重算，清掉上一个 key 的残留渲染
@@ -873,7 +859,8 @@ import type { DisplayItem } from "../state.svelte";
   // 通用会话配置条：codex models + zcode configOptions(select)
   // raw：适配器原始值（dsh 的 model 是 ["provider","model"] 复合数组，须原样回传）
   type CfgOpt = { value: string; name: string; raw?: unknown };
-  type CfgItem = { id: string; label: string; value: string; options: CfgOpt[] };
+  // placeholder：仅占位显示（如 DeepSeek 连接前），不可选择、不发给适配器
+  type CfgItem = { id: string; label: string; value: string; options: CfgOpt[]; placeholder?: boolean };
 
   // 适配器给出的 id/name 多为英文，这里映射为中文；未收录的原样展示
   const OPT_LABELS: Record<string, string> = {
@@ -963,18 +950,6 @@ import type { DisplayItem } from "../state.svelte";
   const caps = $derived.by(() => {
     const c = app.agentCaps[app.agent];
     if (c) return c as { models?: SessionReadyInfo["response"]["models"]; configOptions?: any[] };
-    // DeepSeek 无缓存时提供内置模型（deepseek-chat/reasoner 已弃用）
-    if (app.agent === "deepseek") {
-      return {
-        configOptions: [{
-          id: "model", name: "model", currentValue: "deepseek-flash",
-          options: [
-            { value: "deepseek-flash", name: "deepseek-flash" },
-            { value: "deepseek-v4-pro", name: "deepseek-v4-pro" },
-          ],
-        }],
-      } as { models?: SessionReadyInfo["response"]["models"]; configOptions?: any[] };
-    }
     return {} as { models?: SessionReadyInfo["response"]["models"]; configOptions?: any[] };
   });
 
@@ -1010,21 +985,6 @@ import type { DisplayItem } from "../state.svelte";
       if (!opts.length) continue;
       out.push({ id: o.id, label: zhLabel(o.id, o.name ?? o.id), value: String(o.currentValue ?? ""), options: opts });
     }
-    // DeepSeek 兜底：无 caps 缓存、或 dsh 只回出无法解析的通用项时注入已知模型
-    // （deepseek-chat/reasoner 已于 2026-07 弃用）。纯计算，不写共享 caps 对象——
-    // 在 $derived 里改 $state 会破坏信号图，配置栏会冻结在上一个 Agent 的内容上。
-    if (app.agent === "deepseek" && !out.some((x) => x.id === "model" && x.options.length > 1)) {
-      if (out.some((x) => x.id === "model")) out.splice(out.findIndex((x) => x.id === "model"), 1);
-      out.push({
-        id: "model",
-        label: t("模型"),
-        value: "deepseek-flash",
-        options: [
-          { value: "deepseek-flash", name: "deepseek-flash" },
-          { value: "deepseek-v4-pro", name: "deepseek-v4-pro" },
-        ],
-      });
-    }
     // 回退：适配器没提供 model 配置项时才用 models 能力
     const models = liveModels;
     if (!out.some((x) => x.id === "model") && models?.availableModels?.length) {
@@ -1036,12 +996,25 @@ import type { DisplayItem } from "../state.svelte";
         options: models.availableModels.map((m) => ({ value: m.modelId, name: m.name })),
       });
     }
+    // DeepSeek 连接前没有模型列表：只占位提示，不伪造可选项。dsh 的模型值是
+    // ["provider","model"] 复合数组，写死的字符串值发过去会被拒绝（且被静默吞掉），
+    // 写进 agentCaps 还会被 session-ready 合并后持久化成假的能力缓存。
+    if (app.agent === "deepseek" && !out.some((x) => x.id === "model")) {
+      out.push({
+        id: "model",
+        label: t("模型"),
+        value: "",
+        options: [{ value: "", name: t("连接后加载模型列表") }],
+        placeholder: true,
+      });
+    }
     return out;
   });
 
   function setCfg(id: string, value: string) {
     const agent = app.agent, cfgKey = key, contextId = ctx?.id, sid = sessionId;
     if (sessionBusy || loadingHere) return;
+    if (cfgItems.find((x) => x.id === id)?.placeholder) return;
     // 记住用户选择：跨会话/重启生效（session-ready 后自动回放）
     saveCfgPref(agent, id, value);
     // 回传适配器原始值（dsh 的复合数组值不能压成逗号串）
@@ -1102,6 +1075,7 @@ import type { DisplayItem } from "../state.svelte";
     cfgAppliedKey = sig;
     cfgAppliedSession = sid;
     for (const item of cfgItems) {
+      if (item.placeholder) continue;
       const remembered = app.cfgPref[`${app.agent}:${item.id}`];
       const desired = remembered ?? (item.id === "model" ? undefined : fullAccessDefault(item.id, item.options.map((o) => o.value)));
       if (!desired || desired === item.value) continue;
@@ -1514,7 +1488,7 @@ import type { DisplayItem } from "../state.svelte";
       {#each cfgItems as c (c.id)}
           <label class="cfg">
             <span class="cfg-label">{c.label}</span>
-            <select class="cfg-select" disabled={sessionBusy || loadingHere} value={c.value} onchange={(e) => setCfg(c.id, (e.target as HTMLSelectElement).value)}>
+            <select class="cfg-select" disabled={sessionBusy || loadingHere || c.placeholder} title={c.placeholder ? t("连接后加载模型列表") : undefined} value={c.value} onchange={(e) => setCfg(c.id, (e.target as HTMLSelectElement).value)}>
               {#each c.options as o (o.value)}
                 <option value={o.value}>{o.name}</option>
               {/each}

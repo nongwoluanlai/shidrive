@@ -360,6 +360,13 @@ export function capabilityLists(caps: { models?: any; configOptions?: any }): { 
   };
 }
 
+/** v0.3.20 写入的 DeepSeek 假能力缓存：model 选项恰好是两个写死的纯字符串值。 */
+export function isFakeDeepseekCaps(caps: any): boolean {
+  const model = Array.isArray(caps?.configOptions) ? caps.configOptions.find((o: any) => o?.id === "model") : null;
+  const values = Array.isArray(model?.options) ? model.options.map((o: any) => o?.value) : [];
+  return values.length === 2 && values.includes("deepseek-flash") && values.includes("deepseek-v4-pro");
+}
+
 // ---------- 内存中聊天条目的数量上限（LRU） ----------
 // app.chat 以 context:agent 为键，从不释放：每打开一个会话就多驻留一份完整历史，
 // 用得越久 WebView 越大。本地库里有全量快照（persistChat），切回来时秒开，因此内存中

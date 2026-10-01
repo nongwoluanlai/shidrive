@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { app, loadProjects, currentProject, currentContext, loadPrompts, isNoProject, loadCfgPrefs, capabilityLists } from "./lib/state.svelte";
+  import { app, loadProjects, currentProject, currentContext, loadPrompts, isNoProject, loadCfgPrefs, capabilityLists, isFakeDeepseekCaps } from "./lib/state.svelte";
   import { api } from "./lib/ipc";
   import { applyTheme } from "./lib/theme";
   import { activateSkin, loadSkinOpacity } from "./lib/skins.svelte";
@@ -108,7 +108,14 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
       const raw = await api.settingsGet("caps." + r.id).catch(() => null);
       if (raw) {
         try {
-          app.agentCaps[r.id] = capabilityLists(JSON.parse(raw));
+          const parsed = JSON.parse(raw);
+          // v0.3.20 可能把写死的 DeepSeek 兜底模型（纯字符串值）持久化成了能力缓存；
+          // dsh 真实模型值是复合数组，丢弃这份假缓存，等下次连接重新获取
+          if (r.id === "deepseek" && isFakeDeepseekCaps(parsed)) {
+            void api.settingsSet("caps.deepseek", "").catch(() => {});
+            continue;
+          }
+          app.agentCaps[r.id] = capabilityLists(parsed);
         } catch {
           /* ignore */
         }
