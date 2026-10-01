@@ -259,6 +259,7 @@ export const workbenchEn: Record<string, string> = {
   "不提供（decline）": "Decline",
   "取消（cancel）": "Cancel",
   "自定义穿透 / 反向代理时按需指定；修改后重启服务生效": "Set as needed for your own tunnel/reverse proxy; restart the service to apply",
+  "DeepSeek API Key（platform.deepseek.com 获取）": "DeepSeek API key (from platform.deepseek.com)",
   "该选项在当前会话不可用（列表已过期）。请点「重新连接」刷新后重试。": "This option is unavailable in the current session (stale list). Click Reconnect to refresh and retry.",
   // v0.3.4-oauth：MCP 标准握手
   "OAuth 授权（MCP 标准握手）": "OAuth authorization (MCP standard handshake)",

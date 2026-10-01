@@ -210,8 +210,25 @@
   const DIR_ENV_TARGETS: Record<string, { env: string; rel: string; api?: boolean }> = {
     zcode: { env: "ZCODE_BIN", rel: "resources\\glm\\zcode.cjs" },
     codex: { env: "CODEX_PATH", rel: "codex.exe" },
-    deepseek: { env: "DEEPSEEK_API_KEY", rel: "", api: true },
+    deepseek: { env: "DSH_CMD", rel: "resources\\runtime\\cli\\bin\\dsh.cmd" },
   };
+
+  async function fillDeepseekApiKey(r: AgentEnvStatusItem) {
+    const NL = "\n";
+    const initial = (() => {
+      const line = draftOf(r).env.split(NL).find((l) => l.startsWith("DEEPSEEK_API_KEY="));
+      return line ? line.slice("DEEPSEEK_API_KEY=".length) : "";
+    })();
+    const key = await import("../dialog.svelte").then((m) =>
+      m.promptDialog({ title: t("API Key"), label: t("DeepSeek API Key（platform.deepseek.com 获取）"), initial }),
+    );
+    if (key === null || !key.trim()) return;
+    const d = draftOf(r);
+    const lines = d.env.split(NL).filter((l) => l.trim() && !l.startsWith("DEEPSEEK_API_KEY="));
+    lines.push(`DEEPSEEK_API_KEY=${key.trim()}`);
+    drafts[r.id] = { ...d, env: lines.join(NL) };
+    toast("ok", t("已填充 {key}，确认后点「保存配置」", { key: "DEEPSEEK_API_KEY" }));
+  }
 
   async function fillFromInstallDir(r: AgentEnvStatusItem) {
     const target = DIR_ENV_TARGETS[r.id];
@@ -302,13 +319,14 @@
             {/if}
             {#if DIR_ENV_TARGETS[r.id]}
               <div class="cfg-line">
-                <button class="btn sm" onclick={() => fillFromInstallDir(r)}>
-                  {DIR_ENV_TARGETS[r.id].api ? t("填充 API Key") : t("从安装目录填充")}
-                </button>
-                <span class="pend">{DIR_ENV_TARGETS[r.id].api ? t("填入后保存配置，连接时注入环境变量") : t("输入软件安装目录，自动推导环境变量")}</span>
-                {#if DIR_ENV_TARGETS[r.id].api && r.auto_env?.[DIR_ENV_TARGETS[r.id].env] === "set"}
-                  <span class="badge ok">{t("已检测到 {key}（系统环境）", { key: DIR_ENV_TARGETS[r.id].env })}</span>
-                {/if}
+                <button class="btn sm" onclick={() => fillFromInstallDir(r)}>{t("从安装目录填充")}</button>
+                <span class="pend">{t("输入软件安装目录，自动推导环境变量")}</span>
+              </div>
+            {/if}
+            {#if r.id === "deepseek"}
+              <div class="cfg-line">
+                <button class="btn sm" onclick={() => void fillDeepseekApiKey(r)}>{t("填充 API Key")}</button>
+                <span class="pend">{t("填入后保存配置，连接时注入环境变量")}</span>
               </div>
             {/if}
             <div class="field"><label>{t("命令（{hint}）", { hint: r.npm ? t("覆盖自动检测，留空=自动") : t("必填：可执行文件完整路径") })}</label>

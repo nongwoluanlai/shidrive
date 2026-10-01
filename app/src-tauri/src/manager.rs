@@ -352,7 +352,21 @@ impl AgentManager {
             return Ok(manual);
         }
         if agent_type == "deepseek" {
-            // DeepSeek Harness Desktop 自带的 dsh.cmd：优先使用（无需 npm 安装 520MB）
+            // 用户手动指定的 DSH_CMD（从安装目录填充）优先
+            if let Some(cmd) = configured_env_path(&manual.env, "DSH_CMD") {
+                if cmd.is_file() {
+                    let mut env: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+                    for (k, v) in &manual.env {
+                        env.insert(k.clone(), v.clone());
+                    }
+                    return Ok(AgentLaunch {
+                        command: cmd.to_string_lossy().to_string(),
+                        args: vec!["--profile".into(), "acp".into()],
+                        env,
+                    });
+                }
+            }
+            // 自动检测 DeepSeek Harness Desktop 自带的 dsh.cmd
             if let Some(dsh) = crate::agents::deepseek_desktop_dsh() {
                 let mut env: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
                 for (k, v) in &manual.env {
