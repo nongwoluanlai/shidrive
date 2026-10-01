@@ -178,6 +178,61 @@ pub async fn acp_session_new(agents: AgentsState<'_>, context: Context, agent_ty
     Ok(sid)
 }
 
+/// 重新扫描 DeepSeek Harness Desktop（忽略缓存）。返回检测到的 dsh.cmd。
+#[tauri::command]
+pub async fn deepseek_redetect() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        crate::agents::detect_deepseek_desktop(true).map(|p| p.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| format!("检测任务失败: {e}"))
+}
+
+/// 把用户选择 / 输入的路径解析为 dsh.cmd（安装根、子目录、上级目录、exe 或 dsh.cmd 均可）。
+#[tauri::command]
+pub async fn deepseek_resolve_dsh(path: String) -> Result<String, String> {
+    let input = std::path::PathBuf::from(path.trim().trim_matches('"'));
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::agents::resolve_dsh_path(&input)
+            .map(|p| p.to_string_lossy().to_string())
+            .ok_or_else(|| format!(
+                "在「{}」中没有找到 dsh.cmd。请选择 DeepSeek Harness 的安装目录（包含 DeepSeek Harness.exe 与 resources 文件夹）。",
+                input.display()
+            ))
+    })
+    .await
+    .map_err(|e| format!("解析任务失败: {e}"))?
+}
+
+/// 系统原生文件夹选择器（Windows 资源管理器风格），以当前窗口为父窗口。取消返回 None。
+#[tauri::command]
+pub async fn pick_folder(window: tauri::WebviewWindow, title: Option<String>, initial: Option<String>) -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        tauri::async_runtime::spawn_blocking(move || {
+            let mut dlg = rfd::FileDialog::new().set_parent(&window);
+            if let Some(t) = title.filter(|t| !t.trim().is_empty()) {
+                dlg = dlg.set_title(t);
+            }
+            // 初始目录：给的是文件就取其所在目录；不存在则逐级向上找到存在的目录。
+            if let Some(init) = initial.filter(|s| !s.trim().is_empty()) {
+                let p = std::path::PathBuf::from(init.trim().trim_matches('"'));
+                if let Some(dir) = p.ancestors().find(|a| a.is_dir()) {
+                    dlg = dlg.set_directory(dir);
+                }
+            }
+            dlg.pick_folder().map(|p| p.to_string_lossy().to_string())
+        })
+        .await
+        .map_err(|e| format!("打开文件夹选择器失败: {e}"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, title, initial);
+        Err("文件夹选择器仅支持 Windows".into())
+    }
+}
+
 /// 打开交互式 pi 终端（/login、配置模型提供商）。
 #[tauri::command]
 pub async fn acp_pi_login(agents: AgentsState<'_>, cwd: Option<String>) -> Result<(), String> {

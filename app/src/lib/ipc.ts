@@ -64,6 +64,9 @@ export const api = {
   acpConnect: (agent_type: string) => invoke<unknown>("acp_connect", { agentType: agent_type }),
   acpDisconnect: (agent_type: string) => invoke<void>("acp_disconnect", { agentType: agent_type }),
   acpSessionNew: (context: Context, agent_type: string, fresh = false) => invoke<string>("acp_session_new", { context, agentType: agent_type, fresh }),
+  deepseekRedetect: () => invoke<string | null>("deepseek_redetect"),
+  deepseekResolveDsh: (path: string) => invoke<string>("deepseek_resolve_dsh", { path }),
+  pickFolder: (title?: string, initial?: string) => invoke<string | null>("pick_folder", { title: title ?? null, initial: initial ?? null }),
   acpPiLogin: (cwd?: string) => invoke<void>("acp_pi_login", { cwd: cwd ?? null }),
   acpDeepseekNew: (context: Context) => invoke<string>("acp_deepseek_new", { context }),
   acpPrompt: (context: Context, agent_type: string, text: string, images?: { data: string; mime: string }[], requestId?: string) =>

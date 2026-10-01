@@ -15,6 +15,17 @@ export interface AgentEnvStatusItem {
   node_ready: boolean;
   node_path: string;
   auto_env: Record<string, string>;
+  /** 仅 DeepSeek：dsh 来源 */
+  deepseek?: DeepseekSource | null;
+}
+
+export interface DeepseekSource {
+  /** manual | desktop | npm | invalid | none */
+  kind: string;
+  path: string;
+  manual: string | null;
+  desktop: string | null;
+  npm: string | null;
 }
 
 export interface OAuthPending {

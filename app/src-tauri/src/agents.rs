@@ -98,7 +98,7 @@ pub fn agent_specs() -> &'static [AgentSpec] {
         name: "DeepSeek".into(),
         npm: Some("@deepseek-ai/dsh".into()),
         args: vec!["--profile".into(), "acp".into()],
-        help: "DeepSeek Harness CLI（npm 包 @deepseek-ai/dsh），以 `dsh --profile acp` 提供 ACP stdio 服务。自动检测已安装的 DeepSeek Harness Desktop（优先使用其自带的 dsh 命令，无需重复下载 520MB）；也可展开本行点「从安装目录填充」手动指定。需配置 DEEPSEEK_API_KEY。⚠ 由于官方 ACP 功能限制：暂不支持会话历史重放（绑定旧会话后历史为空），也不显示会话标题与时间。如需迁移旧对话内容，可新建会话后让旧会话接入共享上下文来转移关键信息；后续官方 ACP 功能更新时使驾将同步更新。".into(),
+        help: "DeepSeek Harness CLI，以 `dsh --profile acp` 提供 ACP stdio 服务。dsh 有三种来源，按优先级：①手动指定（「选择安装目录…」写入 DSH_CMD）；②自动检测已安装的 DeepSeek Harness Desktop（使用其自带 dsh.cmd，无需下载）；③独立安装 npm 包 @deepseek-ai/dsh（约 520MB，含原生依赖，需 Node 22.19+）。需配置 DEEPSEEK_API_KEY（点「填充 API Key」或用系统环境变量）。模型：deepseek-flash（V4.1 快速版，默认）与 deepseek-v4-pro（旗舰版），可用 DEEPSEEK_MODEL 环境变量切换（旧的 deepseek-chat/reasoner 已弃用）。⚠ 官方 ACP 当前限制：不支持会话历史重放（绑定旧会话后历史为空），也不提供会话标题与时间；如需迁移旧对话，可新建会话并通过共享上下文转移关键信息。".into(),
     },
     AgentSpec {
         id: "pi".into(),
@@ -196,70 +196,195 @@ fn deepseek_package_version(dir: &std::path::Path) -> Option<String> {
     parsed.get("version")?.as_str().map(|v| v.to_string())
 }
 
-/// 安装完成后须通过 ACP initialize + session/new + session/close，
-/// 再写入标记。一个仅包含 bin.js 的残缺安装不再显示「适配器就绪」。
-/// Auto-detect the dsh.cmd bundled with DeepSeek Harness Desktop.
-// Search order: common install dirs, then registry uninstall keys.
-pub fn deepseek_desktop_dsh() -> Option<PathBuf> {
-    let rel = |root: &std::path::Path| {
-        let p = root.join("resources").join("runtime").join("cli").join("bin").join("dsh.cmd");
-        if p.is_file() && root.join("DeepSeek Harness.exe").is_file() {
-            Some(p)
-        } else {
-            None
+// ───────────── DeepSeek dsh 来源 ─────────────
+// 三种来源互相独立，按优先级：手动指定（DSH_CMD）> 自动检测 Desktop > 独立 npm 包。
+// 自动检测只负责「找路径」，与 npm 独立包的安装 / 校验完全分开。
+
+/// DeepSeek Harness Desktop 安装根目录下 dsh.cmd 的相对位置。
+const DSH_DESKTOP_REL: [&str; 5] = ["resources", "runtime", "cli", "bin", "dsh.cmd"];
+const DSH_DESKTOP_EXE: &str = "DeepSeek Harness.exe";
+const DSH_DESKTOP_DIR: &str = "DeepSeek Harness";
+/// 自动检测结果缓存时长：registry_status 每次刷新都会用到，避免反复 reg query。
+const DSH_DETECT_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn dsh_under_root(root: &Path) -> PathBuf {
+    DSH_DESKTOP_REL.iter().fold(root.to_path_buf(), |acc, seg| acc.join(seg))
+}
+
+/// 自动检测用的严格判定：dsh.cmd 与 Desktop 主程序同时存在。
+fn desktop_root_dsh(root: &Path) -> Option<PathBuf> {
+    let p = dsh_under_root(root);
+    (p.is_file() && root.join(DSH_DESKTOP_EXE).is_file()).then_some(p)
+}
+
+/// 把用户选择的路径解析成 dsh.cmd。接受：dsh.cmd 本身、DeepSeek Harness.exe、
+/// 安装根目录、根目录内任意子目录（向上回溯），或安装根的上一级目录
+/// （如 `C:\Program Files`，向下查一层 `DeepSeek Harness`）。
+pub fn resolve_dsh_path(input: &Path) -> Option<PathBuf> {
+    let start = if input.is_file() {
+        let name = input.file_name()?.to_string_lossy().to_ascii_lowercase();
+        if name == "dsh.cmd" {
+            return Some(input.to_path_buf());
         }
+        input.parent()?.to_path_buf()
+    } else if input.is_dir() {
+        input.to_path_buf()
+    } else {
+        return None;
     };
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(pf) = std::env::var("ProgramFiles") {
-        candidates.push(PathBuf::from(&pf).join("DeepSeek Harness"));
+    for dir in start.ancestors().take(6) {
+        let nested = dsh_under_root(dir);
+        if nested.is_file() {
+            return Some(nested);
+        }
+        let direct = dir.join("dsh.cmd");
+        if direct.is_file() {
+            return Some(direct);
+        }
     }
-    if let Ok(lad) = std::env::var("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(&lad).join("Programs").join("DeepSeek Harness"));
+    let named = dsh_under_root(&start.join(DSH_DESKTOP_DIR));
+    if named.is_file() {
+        return Some(named);
+    }
+    std::fs::read_dir(&start).ok()?.flatten().take(300).find_map(|e| {
+        let p = dsh_under_root(&e.path());
+        p.is_file().then_some(p)
+    })
+}
+
+/// 常见安装目录 + 卸载注册表 InstallLocation（每个键一次 `reg query /s`，不再逐键起进程）。
+fn scan_deepseek_desktop() -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for var in ["LOCALAPPDATA"] {
+        if let Ok(v) = std::env::var(var) {
+            roots.push(PathBuf::from(v).join("Programs").join(DSH_DESKTOP_DIR));
+        }
+    }
+    for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        if let Ok(v) = std::env::var(var) {
+            roots.push(PathBuf::from(v).join(DSH_DESKTOP_DIR));
+        }
     }
     if let Ok(d) = std::env::var("SystemDrive") {
-        candidates.push(PathBuf::from(format!("{}\\tools\\dsh", d)));
-        candidates.push(PathBuf::from(format!("{}\\dsh", d)));
+        roots.push(PathBuf::from(format!("{d}\\tools\\dsh")));
+        roots.push(PathBuf::from(format!("{d}\\dsh")));
     }
-    for c in &candidates {
-        if let Some(p) = rel(c) {
-            return Some(p);
-        }
+    if let Some(p) = roots.iter().find_map(|r| desktop_root_dsh(r)) {
+        return Some(p);
     }
-    // Registry fallback: Inno Setup uninstall key InstallLocation
-    for hive in ["HKCU", "HKLM"] {
-        for sub in [
-            "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
-            "Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
-        ] {
-            let output = crate::setup::hide_console(&mut std::process::Command::new("reg"))
-                .args(["query", &format!("{hive}\\{sub}")])
-                .output();
-            let Ok(out) = output else { continue };
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                let line = line.trim();
-                if !line.contains("HKEY_") || !line.ends_with("_is1") {
-                    continue;
-                }
-                let lo = crate::setup::hide_console(&mut std::process::Command::new("reg"))
-                    .args(["query", line, "/v", "InstallLocation"])
-                    .output();
-                let Ok(lo) = lo else { continue };
-                let lt = String::from_utf8_lossy(&lo.stdout);
-                if let Some(pos) = lt.find("REG_SZ") {
-                    let dir = lt[pos + 6..].trim().trim_end_matches('\\').to_string();
-                    if dir.len() > 3 {
-                        if let Some(p) = rel(Path::new(&dir)) {
-                            return Some(p);
-                        }
-                    }
+    registry_install_locations().iter().find_map(|r| desktop_root_dsh(r))
+}
+
+#[cfg(windows)]
+fn registry_install_locations() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for key in [
+        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        "HKLM\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+    ] {
+        let Ok(o) = hide_console(&mut std::process::Command::new("reg"))
+            .args(["query", key, "/s", "/v", "InstallLocation"])
+            .output()
+        else {
+            continue;
+        };
+        out.extend(parse_install_locations(&String::from_utf8_lossy(&o.stdout)));
+    }
+    out
+}
+#[cfg(not(windows))]
+fn registry_install_locations() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// 解析 `reg query` 输出中的 `InstallLocation    REG_SZ    <dir>` 行。
+fn parse_install_locations(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with("InstallLocation") {
+                return None;
+            }
+            let pos = line.find("REG_SZ")?;
+            let dir = line[pos + 6..].trim().trim_matches('"').trim_end_matches('\\');
+            (dir.len() > 3).then(|| PathBuf::from(dir))
+        })
+        .collect()
+}
+
+static DSH_DETECT_CACHE: std::sync::Mutex<Option<(std::time::Instant, Option<PathBuf>)>> =
+    std::sync::Mutex::new(None);
+
+/// 自动检测 DeepSeek Harness Desktop 自带的 dsh.cmd。force=true 忽略缓存重新扫描
+/// （「重新检测」按钮）；缓存命中但文件已被卸载时也会重扫。
+pub fn detect_deepseek_desktop(force: bool) -> Option<PathBuf> {
+    if !force {
+        if let Ok(guard) = DSH_DETECT_CACHE.lock() {
+            if let Some((at, hit)) = guard.as_ref() {
+                let stale = hit.as_ref().is_some_and(|p| !p.is_file());
+                if at.elapsed() < DSH_DETECT_TTL && !stale {
+                    return hit.clone();
                 }
             }
         }
     }
-    None
+    let hit = scan_deepseek_desktop();
+    if let Ok(mut guard) = DSH_DETECT_CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), hit.clone()));
+    }
+    hit
 }
 
+/// 当前生效的 dsh 来源与各来源的状态（设置页展示 + 启动共用同一判定）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DeepseekSource {
+    /// manual | desktop | npm | invalid | none
+    pub kind: String,
+    /// 生效的启动路径（manual/desktop 为 dsh.cmd，npm 为 bin.js）
+    pub path: String,
+    /// 手动配置的 DSH_CMD 原值（设置项或系统环境变量）
+    pub manual: Option<String>,
+    /// 自动检测到的 Desktop dsh.cmd
+    pub desktop: Option<String>,
+    /// 已通过 ACP 自检的独立 npm 包入口
+    pub npm: Option<String>,
+}
+
+pub fn deepseek_source(manual_env: &std::collections::BTreeMap<String, String>) -> DeepseekSource {
+    let manual = manual_env
+        .get("DSH_CMD")
+        .cloned()
+        .or_else(|| std::env::var("DSH_CMD").ok())
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .filter(|v| !v.is_empty());
+    let desktop = detect_deepseek_desktop(false);
+    let npm = verified_deepseek_script();
+    let lossy = |p: &PathBuf| p.to_string_lossy().to_string();
+    let (kind, path) = if let Some(m) = &manual {
+        match resolve_dsh_path(Path::new(m)) {
+            Some(p) => ("manual", lossy(&p)),
+            // 用户明确指定了路径却无效：不静默回退，避免「以为用的 A 实际跑的 B」。
+            None => ("invalid", m.clone()),
+        }
+    } else if let Some(p) = &desktop {
+        ("desktop", lossy(p))
+    } else if let Some(p) = &npm {
+        ("npm", lossy(p))
+    } else {
+        ("none", String::new())
+    };
+    DeepseekSource {
+        kind: kind.into(),
+        path,
+        manual,
+        desktop: desktop.as_ref().map(lossy),
+        npm: npm.as_ref().map(lossy),
+    }
+}
+
+/// 安装完成后须通过 ACP initialize + session/new + session/close，
+/// 再写入标记。一个仅包含 bin.js 的残缺安装不再显示「适配器就绪」。
 pub fn deepseek_install_candidate() -> Option<PathBuf> {
     let dir = managed_deepseek_dir()?;
     adapter_script_in(&dir.join("node_modules"), DEEPSEEK_PKG)
@@ -377,6 +502,32 @@ mod audit_tests {
         std::fs::write(root.join(DEEPSEEK_VERIFIED), "0.1.4").unwrap();
         assert_eq!(verified_deepseek_script_in(&root), None);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reg_install_locations_are_parsed() {
+        let text = "\r\nHKEY_CURRENT_USER\\Software\\X_is1\r\n    InstallLocation    REG_SZ    C:\\Apps\\DeepSeek Harness\\\r\n\r\nHKEY_CURRENT_USER\\Software\\Y\r\n    InstallLocation    REG_SZ    \r\n";
+        assert_eq!(parse_install_locations(text), vec![PathBuf::from("C:\\Apps\\DeepSeek Harness")]);
+    }
+
+    #[test]
+    fn dsh_path_resolves_from_root_child_parent_and_file() {
+        let base = std::env::temp_dir().join(format!("dsh-resolve-{}", uuid::Uuid::new_v4()));
+        let root = base.join(DSH_DESKTOP_DIR);
+        let dsh = dsh_under_root(&root);
+        std::fs::create_dir_all(dsh.parent().unwrap()).unwrap();
+        std::fs::write(&dsh, "").unwrap();
+        assert_eq!(resolve_dsh_path(&root), Some(dsh.clone()));
+        assert_eq!(resolve_dsh_path(&root.join("resources").join("runtime")), Some(dsh.clone()));
+        assert_eq!(resolve_dsh_path(&base), Some(dsh.clone()));
+        assert_eq!(resolve_dsh_path(&dsh), Some(dsh.clone()));
+        assert_eq!(resolve_dsh_path(dsh.parent().unwrap()), Some(dsh.clone()));
+        // 未带主程序：手动解析可用，但自动检测的严格判定不认
+        assert_eq!(desktop_root_dsh(&root), None);
+        std::fs::write(root.join(DSH_DESKTOP_EXE), "").unwrap();
+        assert_eq!(desktop_root_dsh(&root), Some(dsh.clone()));
+        assert_eq!(resolve_dsh_path(&base.join("missing")), None);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -582,6 +733,9 @@ pub struct AgentEnvStatus {
     pub node_path: String,
     /// 启动时自动注入的环境变量（只读展示：ZCODE_BIN / ZCODE_NODE / CODEX_PATH 等）
     pub auto_env: std::collections::BTreeMap<String, String>,
+    /// 仅 DeepSeek：dsh 来源（手动 / Desktop 自动检测 / 独立包）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deepseek: Option<DeepseekSource>,
 }
 
 /// 汇总所有 agent 的环境状态（设置页显示用）。
@@ -592,7 +746,16 @@ pub fn registry_status(db: &Arc<Db>, tools: &Tools) -> Vec<AgentEnvStatus> {
     agent_specs()
         .iter()
         .map(|sp| {
-            let (adapter_ready, adapter_path) = if let Some(pkg) = &sp.npm {
+            let manual_launch = db
+                .get_setting(&format!("agent.{}", sp.id))
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_str::<crate::models::AgentLaunch>(&raw).ok());
+            let deepseek = (sp.id == "deepseek")
+                .then(|| deepseek_source(&manual_launch.as_ref().map(|l| l.env.clone()).unwrap_or_default()));
+            let (adapter_ready, adapter_path) = if let Some(ds) = &deepseek {
+                (matches!(ds.kind.as_str(), "manual" | "desktop" | "npm"), ds.path.clone())
+            } else if let Some(pkg) = &sp.npm {
                 match adapter_script(tools, pkg) {
                     // pi-acp 只是桥：没有可运行的 pi CLI 时不能显示「就绪」。
                     Some(_) if pkg == PI_ACP_PKG && pi_cli_command(tools).is_none() && pi_global_command().is_none() => {
@@ -604,13 +767,7 @@ pub fn registry_status(db: &Arc<Db>, tools: &Tools) -> Vec<AgentEnvStatus> {
             } else {
                 (false, String::new())
             };
-            let manual = db
-                .get_setting(&format!("agent.{}", sp.id))
-                .ok()
-                .flatten()
-                .and_then(|raw| serde_json::from_str::<crate::models::AgentLaunch>(&raw).ok())
-                .map(|l| l.command)
-                .unwrap_or_default();
+            let manual = manual_launch.map(|l| l.command).unwrap_or_default();
             let mut auto_env = std::collections::BTreeMap::new();
             match sp.id.as_str() {
                 "codex" => {
@@ -661,6 +818,7 @@ pub fn registry_status(db: &Arc<Db>, tools: &Tools) -> Vec<AgentEnvStatus> {
                 node_ready,
                 node_path: node.to_string_lossy().to_string(),
                 auto_env,
+                deepseek,
             }
         })
         .collect()

@@ -352,35 +352,33 @@ impl AgentManager {
             return Ok(manual);
         }
         if agent_type == "deepseek" {
-            // 用户手动指定的 DSH_CMD（从安装目录填充）优先
-            if let Some(cmd) = configured_env_path(&manual.env, "DSH_CMD") {
-                if cmd.is_file() {
-                    let mut env: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-                    for (k, v) in &manual.env {
-                        env.insert(k.clone(), v.clone());
-                    }
-                    return Ok(AgentLaunch {
-                        command: cmd.to_string_lossy().to_string(),
-                        args: vec!["--profile".into(), "acp".into()],
-                        env,
-                    });
+            // 来源判定与设置页共用 agents::deepseek_source：手动 DSH_CMD > Desktop 自动检测 > 独立 npm 包。
+            // 不改写 DSH_HOME（那是 dsh 的数据目录，指向安装目录会把会话写进 Program Files）。
+            let src = crate::agents::deepseek_source(&manual.env);
+            match src.kind.as_str() {
+                "manual" | "desktop" => {
+                    let args = crate::agents::spec("deepseek").map(|sp| sp.args.clone()).unwrap_or_default();
+                    let mut env = manual.env;
+                    // 默认模型：用户未设时注入最新模型名（deepseek-flash 为 V4.1 快速版，
+                    // deepseek-v4-pro 为旗舰版；deepseek-chat/reasoner 已于 2026-07 弃用）
+                    env.entry("DEEPSEEK_MODEL".to_string())
+                        .or_insert_with(|| "deepseek-flash".to_string());
+                    return Ok(AgentLaunch { command: src.path, args, env });
+                }
+                "invalid" => {
+                    return Err(format!(
+                        "DSH_CMD 指向的路径无效（{}）。请在「设置 → Agent 管理 → DeepSeek」重新「选择安装目录…」，或「清除手动路径」改用自动检测 / 独立包。",
+                        src.path
+                    ));
+                }
+                "npm" => {
+                    // 检查将真正执行 dsh 的 Node；不能依赖仅查 major 的通用状态。
+                    crate::node_rt::require_deepseek_node(&self.tools)?;
+                }
+                _ => {
+                    return Err("未找到 DeepSeek dsh：请在「设置 → Agent 管理 → DeepSeek」点「重新检测」（已安装 DeepSeek Harness Desktop 时），或「选择安装目录…」手动指定，或安装独立包（npm）。".into());
                 }
             }
-            // 自动检测 DeepSeek Harness Desktop 自带的 dsh.cmd
-            if let Some(dsh) = crate::agents::deepseek_desktop_dsh() {
-                let mut env: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-                for (k, v) in &manual.env {
-                    env.insert(k.clone(), v.clone());
-                }
-                env.insert("DSH_HOME".into(), dsh.parent().unwrap_or(std::path::Path::new("/")).to_string_lossy().to_string());
-                return Ok(AgentLaunch {
-                    command: dsh.to_string_lossy().to_string(),
-                    args: vec!["--profile".into(), "acp".into()],
-                    env,
-                });
-            }
-            // 未检测到 Desktop 安装：走 npm 安装路径
-            crate::node_rt::require_deepseek_node(&self.tools)?;
         }
         let sp = crate::agents::spec(agent_type)
             .ok_or_else(|| format!("未知的 Agent 类型：{agent_type}（可在「设置 → Agent 管理」启用更多工具）"))?;

@@ -210,8 +210,108 @@
   const DIR_ENV_TARGETS: Record<string, { env: string; rel: string; api?: boolean }> = {
     zcode: { env: "ZCODE_BIN", rel: "resources\\glm\\zcode.cjs" },
     codex: { env: "CODEX_PATH", rel: "codex.exe" },
-    deepseek: { env: "DSH_CMD", rel: "resources\\runtime\\cli\\bin\\dsh.cmd" },
   };
+
+  // ── DeepSeek dsh 来源：检测 / 手动指定 / 独立包互相独立 ──
+  let dsBusy = $state(false);
+
+  function dsKindLabel(kind?: string): string {
+    switch (kind) {
+      case "manual": return t("手动指定");
+      case "desktop": return t("Desktop 自动检测");
+      case "npm": return t("独立包");
+      case "invalid": return t("手动路径无效");
+      default: return t("未找到 dsh");
+    }
+  }
+
+  function setEnvLine(r: AgentEnvStatusItem, key: string, value: string | null) {
+    const d = draftOf(r);
+    const lines = d.env.split("\n").filter((l) => l.trim() && !l.startsWith(key + "="));
+    if (value !== null) lines.push(`${key}=${value}`);
+    drafts[r.id] = { ...d, env: lines.join("\n") };
+  }
+
+  /** 草稿可能尚未从后端载入（刚展开）；写入前先拉一次完整配置，避免覆盖已有 API Key 等。 */
+  async function ensureDraft(r: AgentEnvStatusItem) {
+    if (drafts[r.id]) return;
+    const l = await api.agentConfigGet(r.id).catch(() => null);
+    drafts[r.id] = {
+      command: l?.command ?? r.manual_command ?? "",
+      args: (l?.args ?? []).join("\n"),
+      env: Object.entries(l?.env ?? {}).map(([k, v]) => `${k}=${v}`).join("\n"),
+    };
+  }
+
+  async function dsApplyPath(r: AgentEnvStatusItem, input: string) {
+    dsBusy = true;
+    try {
+      const dsh = await api.deepseekResolveDsh(input);
+      await ensureDraft(r);
+      setEnvLine(r, "DSH_CMD", dsh);
+      await saveConfig(r);
+      toast("ok", t("已指定 dsh：{path}", { path: dsh }));
+    } catch (e) {
+      toast("error", String(e));
+    } finally {
+      dsBusy = false;
+    }
+  }
+
+  async function dsPickDir(r: AgentEnvStatusItem) {
+    const ds = r.deepseek;
+    const initial = ds?.manual ?? ds?.desktop ?? "";
+    let dir: string | null;
+    try {
+      dir = await api.pickFolder(t("选择 DeepSeek Harness 安装目录"), initial);
+    } catch {
+      // 原生选择器不可用时退回手动输入
+      return dsTypePath(r);
+    }
+    if (dir) await dsApplyPath(r, dir);
+  }
+
+  async function dsTypePath(r: AgentEnvStatusItem) {
+    const { promptDialog } = await import("../dialog.svelte");
+    const v = await promptDialog({
+      title: t("DeepSeek Harness 安装目录"),
+      label: t("安装目录或 dsh.cmd 的完整路径"),
+      initial: r.deepseek?.manual ?? r.deepseek?.desktop ?? "",
+    });
+    if (v && v.trim()) await dsApplyPath(r, v.trim());
+  }
+
+  async function dsClear(r: AgentEnvStatusItem) {
+    await ensureDraft(r);
+    setEnvLine(r, "DSH_CMD", null);
+    await saveConfig(r);
+  }
+
+  async function dsRedetect(r: AgentEnvStatusItem) {
+    dsBusy = true;
+    let found: string | null = null;
+    try {
+      found = await api.deepseekRedetect();
+      await loadRegistry();
+    } catch (e) {
+      toast("error", String(e));
+      return;
+    } finally {
+      dsBusy = false;
+    }
+    if (found) {
+      toast("ok", t("已检测到 DeepSeek Harness Desktop：{path}", { path: found }));
+      return;
+    }
+    // 自动检测失败 → 引导用户手动选择目录
+    const { confirmDialog } = await import("../dialog.svelte");
+    const pick = await confirmDialog({
+      title: t("未检测到 DeepSeek Harness Desktop"),
+      message: t("常见安装目录和卸载注册表里都没有找到。若已安装在其他位置，可以手动选择安装目录；未安装也可以改用独立包。"),
+      confirmText: t("选择安装目录…"),
+    });
+    if (pick) await dsPickDir(r);
+  }
 
   async function fillDeepseekApiKey(r: AgentEnvStatusItem) {
     const NL = "\n";
@@ -239,7 +339,17 @@
       if (line) return line.slice(target.env.length + 1).replace(new RegExp("\\\\+(resources\\\\glm)?\\\\zcode\\.cjs$", "i"), "").replace(/\\codex\.exe$/i, "");
       return (r.auto_env?.[target.env] ?? "").replace(/\\(resources\\glm\\)?zcode\.cjs$/i, "").replace(/\\codex\.exe$/i, "");
     })();
-    const dir = await import("../dialog.svelte").then((m) =>
+    let dir: string | null = null;
+    let native = false;
+    if (!target.api) {
+      try {
+        dir = await api.pickFolder(t("{name} 的安装目录", { name: r.name }), initial);
+        native = true;
+      } catch {
+        native = false;
+      }
+    }
+    if (!native) dir = await import("../dialog.svelte").then((m) =>
       m.promptDialog({
         title: t(target.api ? "API Key" : "安装目录"),
         label: target.api ? t("填入 {name} 的 API Key", { name: r.name }) : t("{name} 的安装目录", { name: r.name }),
@@ -291,10 +401,68 @@
         {#if expanded === r.id}
           <div class="row-body">
 <p class="help-text">{t(r.help)}</p>
-            {#if r.npm && !r.adapter_ready}
+            {#if r.id === "deepseek"}
+              {@const ds = r.deepseek}
+              <div class="ds-box">
+                <div class="ds-head">
+                  <span class="ds-title">{t("dsh 来源")}</span>
+                  <span class="badge {ds && ['manual', 'desktop', 'npm'].includes(ds.kind) ? 'ok' : 'warn'}">{dsKindLabel(ds?.kind)}</span>
+                  {#if ds?.path}<code class="ds-path" title={ds.path}>{ds.path}</code>{/if}
+                </div>
+                <p class="pend">{t("优先级：手动指定 > 自动检测 Desktop > 独立包。三者互不影响，可随时切换。")}</p>
+
+                <div class="ds-step" class:active={ds?.kind === "desktop"}>
+                  <div class="ds-step-head">
+                    <span class="ds-no">1</span><span>{t("自动检测 DeepSeek Harness Desktop")}</span>
+                    <span class="spacer"></span>
+                    <button class="btn sm" disabled={dsBusy} onclick={() => dsRedetect(r)}>{dsBusy ? t("检测中…") : t("重新检测")}</button>
+                  </div>
+                  <p class="pend">
+                    {#if ds?.desktop}{t("已检测到：{path}", { path: ds.desktop })}{:else}{t("未检测到（检查了常见安装目录与卸载注册表）")}{/if}
+                  </p>
+                </div>
+
+                <div class="ds-step" class:active={ds?.kind === "manual"} class:bad={ds?.kind === "invalid"}>
+                  <div class="ds-step-head">
+                    <span class="ds-no">2</span><span>{t("手动指定安装目录")}</span>
+                    <span class="spacer"></span>
+                    <button class="btn sm primary" disabled={dsBusy} onclick={() => dsPickDir(r)}>{t("选择安装目录…")}</button>
+                    <button class="btn sm" disabled={dsBusy} onclick={() => dsTypePath(r)}>{t("输入路径")}</button>
+                    {#if ds?.manual}<button class="btn sm" disabled={dsBusy} onclick={() => dsClear(r)}>{t("清除手动路径")}</button>{/if}
+                  </div>
+                  <p class="pend">
+                    {#if ds?.kind === "invalid"}<span class="warn-text">{t("DSH_CMD 无效：{path}", { path: ds.manual ?? "" })}</span>
+                    {:else if ds?.manual}{t("使用：{path}", { path: ds.path })}
+                    {:else}{t("可选安装根目录、其子目录、上级目录，或直接选 dsh.cmd 所在目录，会自动定位 dsh.cmd")}{/if}
+                  </p>
+                </div>
+
+                <div class="ds-step" class:active={ds?.kind === "npm"}>
+                  <div class="ds-step-head">
+                    <span class="ds-no">3</span><span>{t("独立安装包（npm）")}</span>
+                    <span class="spacer"></span>
+                    {#if ds?.npm}
+                      <button class="btn sm" disabled={busy === r.id} onclick={() => install(r)}>{busy === r.id ? t("修复中…") : t("检查并修复")}</button>
+                      <button class="btn sm" disabled={busy === r.id} onclick={() => uninstall(r)}>{busy === r.id ? t("卸载中…") : t("卸载")}</button>
+                    {:else}
+                      <button class="btn sm" disabled={busy === r.id} onclick={() => install(r)}>{busy === r.id ? t("安装中…") : t("安装独立包")}</button>
+                    {/if}
+                  </div>
+                  <p class="pend">
+                    {#if ds?.npm}{t("已安装并通过自检：{path}", { path: ds.npm })}{:else}{t("{package}，约 520MB（含原生依赖，需 Node 22.19+）；未安装 Desktop 时使用", { package: r.npm ?? "" })}{/if}
+                  </p>
+                </div>
+
+                <div class="cfg-line">
+                  <button class="btn sm" onclick={() => void fillDeepseekApiKey(r)}>{t("填充 API Key")}</button>
+                  <span class="pend">{t("填入后保存配置，连接时注入环境变量")}</span>
+                  {#if r.auto_env?.DEEPSEEK_API_KEY === "set"}<span class="badge ok">{t("已检测到 {key}（系统环境）", { key: "DEEPSEEK_API_KEY" })}</span>{/if}
+                </div>
+              </div>
+            {:else if r.npm && !r.adapter_ready}
               <div class="cfg-line">
                 <button class="btn sm primary" disabled={busy === r.id} onclick={() => install(r)}>
-                  {busy === r.id ? t("安装中…") : t(r.id === "deepseek" ? "安装/修复 DeepSeek 适配器" : "安装适配器")}
+                  {busy === r.id ? t("安装中…") : t("安装适配器")}
                 </button>
                 <span class="pend">{t("安装后即可连接（npm：{package}）", { package: r.npm })}</span>
               </div>
@@ -303,11 +471,6 @@
                 <button class="btn sm" disabled={busy === r.id} onclick={() => uninstall(r)}>
                   {busy === r.id ? t("卸载中…") : t("卸载适配器")}
                 </button>
-                {#if r.id === "deepseek"}
-                  <button class="btn sm" disabled={busy === r.id} onclick={() => install(r)}>
-                    {busy === r.id ? t("修复中…") : t("检查并修复适配器")}
-                  </button>
-                {/if}
                 <span class="pend">{t("卸载后需重新安装才能连接")}</span>
               </div>
             {/if}
@@ -321,12 +484,6 @@
               <div class="cfg-line">
                 <button class="btn sm" onclick={() => fillFromInstallDir(r)}>{t("从安装目录填充")}</button>
                 <span class="pend">{t("输入软件安装目录，自动推导环境变量")}</span>
-              </div>
-            {/if}
-            {#if r.id === "deepseek"}
-              <div class="cfg-line">
-                <button class="btn sm" onclick={() => void fillDeepseekApiKey(r)}>{t("填充 API Key")}</button>
-                <span class="pend">{t("填入后保存配置，连接时注入环境变量")}</span>
               </div>
             {/if}
             <div class="field"><label>{t("命令（{hint}）", { hint: r.npm ? t("覆盖自动检测，留空=自动") : t("必填：可执行文件完整路径") })}</label>
@@ -454,6 +611,77 @@
   .mono {
     font-family: var(--mono);
     font-size: 0.9em;
+  }
+  .ds-box {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--bg-elev) 70%, transparent);
+  }
+  .ds-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .ds-title {
+    font-weight: 600;
+    font-size: 0.88em;
+  }
+  .ds-path {
+    font-family: var(--mono);
+    font-size: 0.78em;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    user-select: text;
+  }
+  .ds-step {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 6px 8px;
+    border-left: 3px solid var(--border-soft);
+    border-radius: 4px;
+  }
+  .ds-step.active {
+    border-left-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
+  }
+  .ds-step.bad {
+    border-left-color: var(--danger, #d9534f);
+  }
+  .ds-step-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.86em;
+  }
+  .ds-step .pend {
+    word-break: break-all;
+  }
+  .ds-no {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--border-soft);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.78em;
+    flex: none;
+  }
+  .ds-step.active .ds-no {
+    background: var(--accent);
+    color: var(--bg, #fff);
+  }
+  .warn-text {
+    color: var(--danger, #d9534f);
   }
   .rowbtns {
     display: flex;
