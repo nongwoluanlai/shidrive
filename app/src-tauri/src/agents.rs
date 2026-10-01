@@ -98,7 +98,7 @@ pub fn agent_specs() -> &'static [AgentSpec] {
         name: "DeepSeek".into(),
         npm: Some("@deepseek-ai/dsh".into()),
         args: vec!["--profile".into(), "acp".into()],
-        help: "DeepSeek Harness CLI，以 `dsh --profile acp` 提供 ACP stdio 服务。dsh 有三种来源，按优先级：①手动指定（「选择安装目录…」写入 DSH_CMD）；②自动检测已安装的 DeepSeek Harness Desktop（使用其自带 dsh.cmd，无需下载）；③独立安装 npm 包 @deepseek-ai/dsh（约 520MB，含原生依赖，需 Node 22.19+）。需配置 DEEPSEEK_API_KEY（点「填充 API Key」或用系统环境变量）。模型：deepseek-flash（V4.1 快速版，默认）与 deepseek-v4-pro（旗舰版），可用 DEEPSEEK_MODEL 环境变量切换（旧的 deepseek-chat/reasoner 已弃用）。⚠ 官方 ACP 当前限制：不支持会话历史重放（绑定旧会话后历史为空），也不提供会话标题与时间；如需迁移旧对话，可新建会话并通过共享上下文转移关键信息。".into(),
+        help: "DeepSeek 有三种接入方式（任选其一）：①三方 ACP（@openma/deepseek-harness-acp，推荐：支持历史重放、会话标题、计划模式）；②本地 dsh.cmd（DeepSeek Harness Desktop 自带，官方 ACP）；③官方完整包（npm @deepseek-ai/dsh，官方 ACP）。官方 ACP 不支持历史重放与会话标题。需配置 DEEPSEEK_API_KEY。".into(),
     },
     AgentSpec {
         id: "pi".into(),
@@ -147,6 +147,8 @@ pub fn managed_acp_dir() -> Option<PathBuf> {
 }
 
 const DEEPSEEK_PKG: &str = "@deepseek-ai/dsh";
+/// 三方 DeepSeek ACP 桥（openma-ai/deepseek-harness-acp），自带 dsh 运行时。
+pub const DSH_ACP_PKG: &str = "@openma/deepseek-harness-acp";
 
 /// pi 的 ACP 适配器（Zed ACP Registry 中 `pi-acp` 条目的 npx 包）。
 pub const PI_ACP_PKG: &str = "pi-acp";
@@ -189,6 +191,32 @@ pub fn managed_deepseek_dir() -> Option<PathBuf> {
     managed_acp_dir().map(|dir| dir.with_file_name("deepseek-acp"))
 }
 
+/// 三方 ACP 独立 npm 根，与官方包互不干扰（卸载 / 重装各管各的）。
+pub fn managed_dsh_acp_dir() -> Option<PathBuf> {
+    managed_acp_dir().map(|dir| dir.with_file_name("deepseek-harness-acp"))
+}
+
+fn dsh_acp_script() -> Option<PathBuf> {
+    adapter_script_in(&managed_dsh_acp_dir()?.join("node_modules"), DSH_ACP_PKG)
+}
+
+/// DeepSeek 接入方式（设置项 deepseek.source）：acp | dsh | harness。
+pub const DEEPSEEK_SOURCE_KEY: &str = "deepseek.source";
+
+pub fn deepseek_mode_setting(db: &Db) -> Option<String> {
+    db.get_setting(DEEPSEEK_SOURCE_KEY).ok().flatten()
+        .filter(|m| matches!(m.as_str(), "acp" | "dsh" | "harness"))
+}
+
+/// 当前方式对应的 npm 包（安装 / 卸载用）；dsh 方式无需安装返回 None。
+pub fn deepseek_mode_package(mode: &str) -> Option<&'static str> {
+    match mode {
+        "acp" => Some(DSH_ACP_PKG),
+        "harness" => Some(DEEPSEEK_PKG),
+        _ => None,
+    }
+}
+
 fn deepseek_package_version(dir: &std::path::Path) -> Option<String> {
     let pkg = dir.join("node_modules").join("@deepseek-ai").join("dsh").join("package.json");
     let raw = std::fs::read_to_string(pkg).ok()?;
@@ -197,7 +225,7 @@ fn deepseek_package_version(dir: &std::path::Path) -> Option<String> {
 }
 
 // ───────────── DeepSeek dsh 来源 ─────────────
-// 三种来源互相独立，按优先级：手动指定（DSH_CMD）> 自动检测 Desktop > 独立 npm 包。
+// 三种接入方式互斥，由设置项 deepseek.source 显式选择；未设置时按已有安装推断。
 // 自动检测只负责「找路径」，与 npm 独立包的安装 / 校验完全分开。
 
 /// DeepSeek Harness Desktop 安装根目录下 dsh.cmd 的相对位置。
@@ -339,7 +367,9 @@ pub fn detect_deepseek_desktop(force: bool) -> Option<PathBuf> {
 /// 当前生效的 dsh 来源与各来源的状态（设置页展示 + 启动共用同一判定）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DeepseekSource {
-    /// manual | desktop | npm | invalid | none
+    /// 生效的接入方式：acp | dsh | harness
+    pub mode: String,
+    /// acp | manual | desktop | npm | invalid | none
     pub kind: String,
     /// 生效的启动路径（manual/desktop 为 dsh.cmd，npm 为 bin.js）
     pub path: String,
@@ -349,9 +379,11 @@ pub struct DeepseekSource {
     pub desktop: Option<String>,
     /// 已通过 ACP 自检的独立 npm 包入口
     pub npm: Option<String>,
+    /// 已安装的三方 ACP 入口
+    pub acp: Option<String>,
 }
 
-pub fn deepseek_source(manual_env: &std::collections::BTreeMap<String, String>) -> DeepseekSource {
+pub fn deepseek_source(manual_env: &std::collections::BTreeMap<String, String>, mode: Option<&str>) -> DeepseekSource {
     let manual = manual_env
         .get("DSH_CMD")
         .cloned()
@@ -360,26 +392,44 @@ pub fn deepseek_source(manual_env: &std::collections::BTreeMap<String, String>) 
         .filter(|v| !v.is_empty());
     let desktop = detect_deepseek_desktop(false);
     let npm = verified_deepseek_script();
+    let acp = dsh_acp_script();
     let lossy = |p: &PathBuf| p.to_string_lossy().to_string();
-    let (kind, path) = if let Some(m) = &manual {
-        match resolve_dsh_path(Path::new(m)) {
-            Some(p) => ("manual", lossy(&p)),
-            // 用户明确指定了路径却无效：不静默回退，避免「以为用的 A 实际跑的 B」。
-            None => ("invalid", m.clone()),
-        }
-    } else if let Some(p) = &desktop {
-        ("desktop", lossy(p))
-    } else if let Some(p) = &npm {
-        ("npm", lossy(p))
-    } else {
-        ("none", String::new())
+    // 未显式选择时按已有安装推断（兼容旧配置），全新环境默认推荐三方 ACP。
+    let mode = match mode {
+        Some(m) => m.to_string(),
+        None if manual.is_some() || desktop.is_some() => "dsh".into(),
+        None if npm.is_some() => "harness".into(),
+        None => "acp".into(),
+    };
+    // 方式之间不相互回退，避免「以为用的 A 实际跑的 B」。
+    let (kind, path) = match mode.as_str() {
+        "acp" => match &acp {
+            Some(p) => ("acp", lossy(p)),
+            None => ("none", String::new()),
+        },
+        "harness" => match &npm {
+            Some(p) => ("npm", lossy(p)),
+            None => ("none", String::new()),
+        },
+        _ => if let Some(m) = &manual {
+            match resolve_dsh_path(Path::new(m)) {
+                Some(p) => ("manual", lossy(&p)),
+                None => ("invalid", m.clone()),
+            }
+        } else if let Some(p) = &desktop {
+            ("desktop", lossy(p))
+        } else {
+            ("none", String::new())
+        },
     };
     DeepseekSource {
+        mode,
         kind: kind.into(),
         path,
         manual,
         desktop: desktop.as_ref().map(lossy),
         npm: npm.as_ref().map(lossy),
+        acp: acp.as_ref().map(lossy),
     }
 }
 
@@ -458,6 +508,9 @@ fn adapter_script_in(nm: &std::path::Path, npm_pkg: &str) -> Option<PathBuf> {
 pub fn adapter_script(tools: &Tools, npm_pkg: &str) -> Option<PathBuf> {
     if npm_pkg == DEEPSEEK_PKG {
         return verified_deepseek_script();
+    }
+    if npm_pkg == DSH_ACP_PKG {
+        return dsh_acp_script();
     }
     acp_roots(tools).iter().find_map(|root| adapter_script_in(root, npm_pkg))
 }
@@ -576,7 +629,11 @@ pub fn bootstrap_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> R
     } else if npm_pkg == PI_ACP_PKG {
         crate::node_rt::require_node_22_19(tools, "pi")?;
     }
-    let acp_dir = if deepseek { managed_deepseek_dir() } else { managed_acp_dir() }
+    let dsh_acp = npm_pkg == DSH_ACP_PKG;
+    if dsh_acp {
+        crate::node_rt::require_deepseek_node(tools)?;
+    }
+    let acp_dir = if deepseek { managed_deepseek_dir() } else if dsh_acp { managed_dsh_acp_dir() } else { managed_acp_dir() }
         .ok_or("无法确定用户数据目录（APPDATA）")?;
     std::fs::create_dir_all(&acp_dir).map_err(|e| format!("创建目录失败: {e}"))?;
     if deepseek {
@@ -585,7 +642,7 @@ pub fn bootstrap_adapter(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> R
     }
     let pj = acp_dir.join("package.json");
     if !pj.exists() {
-        let name = if deepseek { "shidrive-deepseek-acp" } else { "shidrive-acp" };
+        let name = if deepseek { "shidrive-deepseek-acp" } else if dsh_acp { "shidrive-dsh-acp" } else { "shidrive-acp" };
         std::fs::write(&pj, format!("{{\"name\":\"{name}\",\"private\":true}}\n"))
             .map_err(|e| e.to_string())?;
     }
@@ -672,6 +729,11 @@ fn uninstall_package(tools: &Tools, npm_pkg: &str, proxy: Option<&str>) -> Resul
             targets.push(dir);
         }
     }
+    if npm_pkg == DSH_ACP_PKG {
+        if let Some(dir) = managed_dsh_acp_dir() {
+            targets.push(dir);
+        }
+    }
     let mut removed = 0usize;
     let mut last_err = String::new();
     for dir in targets {
@@ -751,10 +813,12 @@ pub fn registry_status(db: &Arc<Db>, tools: &Tools) -> Vec<AgentEnvStatus> {
                 .ok()
                 .flatten()
                 .and_then(|raw| serde_json::from_str::<crate::models::AgentLaunch>(&raw).ok());
-            let deepseek = (sp.id == "deepseek")
-                .then(|| deepseek_source(&manual_launch.as_ref().map(|l| l.env.clone()).unwrap_or_default()));
+            let deepseek = (sp.id == "deepseek").then(|| {
+                let mode = deepseek_mode_setting(db);
+                deepseek_source(&manual_launch.as_ref().map(|l| l.env.clone()).unwrap_or_default(), mode.as_deref())
+            });
             let (adapter_ready, adapter_path) = if let Some(ds) = &deepseek {
-                (matches!(ds.kind.as_str(), "manual" | "desktop" | "npm"), ds.path.clone())
+                (matches!(ds.kind.as_str(), "acp" | "manual" | "desktop" | "npm"), ds.path.clone())
             } else if let Some(pkg) = &sp.npm {
                 match adapter_script(tools, pkg) {
                     // pi-acp 只是桥：没有可运行的 pi CLI 时不能显示「就绪」。

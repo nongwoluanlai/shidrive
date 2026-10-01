@@ -188,6 +188,17 @@ pub async fn deepseek_redetect() -> Result<Option<String>, String> {
     .map_err(|e| format!("检测任务失败: {e}"))
 }
 
+/// 切换 DeepSeek 接入方式（acp | dsh | harness），并断开旧连接以便下次按新方式启动。
+#[tauri::command]
+pub async fn deepseek_set_source(agents: AgentsState<'_>, db: DbState<'_>, mode: String) -> Result<(), String> {
+    if !matches!(mode.as_str(), "acp" | "dsh" | "harness") {
+        return Err(format!("未知的 DeepSeek 接入方式：{mode}"));
+    }
+    db.set_setting(crate::agents::DEEPSEEK_SOURCE_KEY, &mode)?;
+    agents.disconnect("deepseek").await;
+    Ok(())
+}
+
 /// 把用户选择 / 输入的路径解析为 dsh.cmd（安装根、子目录、上级目录、exe 或 dsh.cmd 均可）。
 #[tauri::command]
 pub async fn deepseek_resolve_dsh(path: String) -> Result<String, String> {
@@ -562,13 +573,19 @@ pub async fn agents_bootstrap(agents: AgentsState<'_>, db: DbState<'_>, id: Stri
         .flatten()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let deepseek = id == "deepseek";
-    if deepseek {
+    let mut pkg = pkg.as_str().to_owned();
+    if id == "deepseek" {
         // 旧 ACP 桥可能已 disposed；修复前先结束连接，避免继续复用或安装时占用文件。
         agents.disconnect("deepseek").await;
+        // 安装当前选择方式对应的包（三方 ACP / 官方完整包）；dsh.cmd 方式无需安装。
+        let mode = crate::agents::deepseek_source(&Default::default(), crate::agents::deepseek_mode_setting(&db).as_deref()).mode;
+        pkg = crate::agents::deepseek_mode_package(&mode)
+            .ok_or("当前 DeepSeek 方式为本地 dsh.cmd，无需安装")?
+            .to_owned();
     }
+    // 只有官方完整包需要 ACP 建会话自检（原生依赖懒加载）。
+    let deepseek = pkg == "@deepseek-ai/dsh";
     let tools = agents.tools.clone();
-    let pkg = pkg.as_str().to_owned();
     let installed = tauri::async_runtime::spawn_blocking(move || {
         crate::agents::bootstrap_adapter(&tools, &pkg, proxy.as_deref())
     }).await.map_err(|e| format!("安装任务失败: {e}"))??;
@@ -1032,8 +1049,13 @@ pub async fn fs_open_vscode(agents: AgentsState<'_>, path: String) -> Result<(),
 pub async fn agents_uninstall(agents: AgentsState<'_>, db: DbState<'_>, id: String) -> Result<String, String> {
     let sp = crate::agents::spec(&id).ok_or_else(|| format!("未知的 Agent：{id}"))?;
     let pkg = sp.npm.as_ref().ok_or_else(|| format!("{} 为二进制发行，无需卸载适配器。", sp.name))?;
+    let mut pkg = pkg.clone();
     if id == "deepseek" {
         agents.disconnect("deepseek").await;
+        let mode = crate::agents::deepseek_source(&Default::default(), crate::agents::deepseek_mode_setting(&db).as_deref()).mode;
+        pkg = crate::agents::deepseek_mode_package(&mode)
+            .ok_or("当前 DeepSeek 方式为本地 dsh.cmd，无需卸载")?
+            .to_owned();
     }
     let proxy = db
         .get_setting("network.proxy")

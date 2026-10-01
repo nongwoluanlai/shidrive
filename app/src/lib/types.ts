@@ -20,12 +20,15 @@ export interface AgentEnvStatusItem {
 }
 
 export interface DeepseekSource {
-  /** manual | desktop | npm | invalid | none */
+  /** acp | dsh | harness */
+  mode: string;
+  /** acp | manual | desktop | npm | invalid | none */
   kind: string;
   path: string;
   manual: string | null;
   desktop: string | null;
   npm: string | null;
+  acp: string | null;
 }
 
 export interface OAuthPending {

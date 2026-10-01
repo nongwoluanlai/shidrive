@@ -136,11 +136,21 @@
     await refreshEnabled();
   }
 
+  /** DeepSeek 按当前方式安装对应包；先落盘方式，保证后端安装的就是界面所选。 */
+  async function pkgFor(r: AgentEnvStatusItem): Promise<string | null> {
+    if (r.id !== "deepseek") return r.npm;
+    const mode = r.deepseek?.mode ?? "acp";
+    await api.deepseekSetSource(mode);
+    return DS_PKG[mode] ?? null;
+  }
+
   async function install(r: AgentEnvStatusItem) {
     if (!r.npm) return;
     busy = r.id;
-    toast("info", t("正在安装 {p0}…（首次可能需要几分钟）", { p0: r.npm }));
     try {
+      const pkg = await pkgFor(r);
+      if (!pkg) return;
+      toast("info", t("正在安装 {p0}…（首次可能需要几分钟）", { p0: pkg }));
       await api.agentsBootstrap(r.id);
       toast("ok", t("适配器已安装"));
       await loadRegistry();
@@ -166,8 +176,10 @@
   async function uninstall(r: AgentEnvStatusItem) {
     if (!r.npm) return;
     busy = r.id;
-    toast("info", t("正在卸载 {p0}…", { p0: r.npm }));
     try {
+      const pkg = await pkgFor(r);
+      if (!pkg) return;
+      toast("info", t("正在卸载 {p0}…", { p0: pkg }));
       await api.agentsUninstall(r.id);
       toast("ok", t("适配器已卸载"));
       await loadRegistry();
@@ -215,13 +227,33 @@
   // ── DeepSeek dsh 来源：检测 / 手动指定 / 独立包互相独立 ──
   let dsBusy = $state(false);
 
+  const DS_MODES = [
+    { id: "acp", name: "三方 ACP", sub: "推荐 · 支持历史与标题" },
+    { id: "dsh", name: "本地 dsh.cmd", sub: "Desktop 自带 · 官方 ACP" },
+    { id: "harness", name: "官方完整包", sub: "npm 约 520MB · 官方 ACP" },
+  ] as const;
+  const DS_PKG: Record<string, string> = { acp: "@openma/deepseek-harness-acp", harness: "@deepseek-ai/dsh" };
+
   function dsKindLabel(kind?: string): string {
     switch (kind) {
+      case "acp": case "npm": return t("已安装");
       case "manual": return t("手动指定");
-      case "desktop": return t("Desktop 自动检测");
-      case "npm": return t("独立包");
-      case "invalid": return t("手动路径无效");
-      default: return t("未找到 dsh");
+      case "desktop": return t("自动检测");
+      case "invalid": return t("路径无效");
+      default: return t("未就绪");
+    }
+  }
+
+  async function dsSetMode(r: AgentEnvStatusItem, mode: string) {
+    if (r.deepseek?.mode === mode) return;
+    dsBusy = true;
+    try {
+      await api.deepseekSetSource(mode);
+      await loadRegistry();
+    } catch (e) {
+      toast("error", String(e));
+    } finally {
+      dsBusy = false;
     }
   }
 
@@ -307,8 +339,8 @@
     const { confirmDialog } = await import("../dialog.svelte");
     const pick = await confirmDialog({
       title: t("未检测到 DeepSeek Harness Desktop"),
-      message: t("常见安装目录和卸载注册表里都没有找到。若已安装在其他位置，可以手动选择安装目录；未安装也可以改用独立包。"),
-      confirmText: t("选择安装目录…"),
+      message: t("未在常见安装目录与注册表中找到。可手动选择 DeepSeek Harness 安装目录或 dsh.cmd。"),
+      confirmText: t("选择路径…"),
     });
     if (pick) await dsPickDir(r);
   }
@@ -400,62 +432,37 @@
         </div>
         {#if expanded === r.id}
           <div class="row-body">
-<p class="help-text">{t(r.help)}</p>
+{#if r.id !== "deepseek"}<p class="help-text">{t(r.help)}</p>{/if}
             {#if r.id === "deepseek"}
               {@const ds = r.deepseek}
+              {@const mode = ds?.mode ?? "acp"}
               <div class="ds-box">
-                <div class="ds-head">
-                  <span class="ds-title">{t("dsh 来源")}</span>
-                  <span class="badge {ds && ['manual', 'desktop', 'npm'].includes(ds.kind) ? 'ok' : 'warn'}">{dsKindLabel(ds?.kind)}</span>
+                <div class="ds-modes" role="radiogroup">
+                  {#each DS_MODES as m (m.id)}
+                    <button class="ds-mode" class:active={mode === m.id} role="radio" aria-checked={mode === m.id}
+                      disabled={dsBusy || busy === r.id} onclick={() => dsSetMode(r, m.id)}>
+                      <span class="ds-mode-name">{t(m.name)}</span>
+                      <span class="ds-mode-sub">{t(m.sub)}</span>
+                    </button>
+                  {/each}
+                </div>
+                <div class="ds-detail">
+                  <span class="badge {ds && ['acp', 'manual', 'desktop', 'npm'].includes(ds.kind) ? 'ok' : 'warn'}">{dsKindLabel(ds?.kind)}</span>
                   {#if ds?.path}<code class="ds-path" title={ds.path}>{ds.path}</code>{/if}
+                  <span class="spacer"></span>
+                  {#if mode === "dsh"}
+                    <button class="btn sm" disabled={dsBusy} onclick={() => dsRedetect(r)}>{dsBusy ? t("检测中…") : t("检测")}</button>
+                    <button class="btn sm" disabled={dsBusy} onclick={() => dsPickDir(r)}>{t("选择路径…")}</button>
+                    {#if ds?.manual}<button class="btn sm" disabled={dsBusy} onclick={() => dsClear(r)}>{t("清除")}</button>{/if}
+                  {:else if ds?.kind === "acp" || ds?.kind === "npm"}
+                    <button class="btn sm" disabled={busy === r.id} onclick={() => install(r)}>{busy === r.id ? t("处理中…") : t("更新")}</button>
+                    <button class="btn sm" disabled={busy === r.id} onclick={() => uninstall(r)}>{t("卸载")}</button>
+                  {:else}
+                    <button class="btn sm primary" disabled={busy === r.id} onclick={() => install(r)}>{busy === r.id ? t("安装中…") : t("安装")}</button>
+                  {/if}
                 </div>
-                <p class="pend">{t("优先级：手动指定 > 自动检测 Desktop > 独立包。三者互不影响，可随时切换。")}</p>
-
-                <div class="ds-step" class:active={ds?.kind === "desktop"}>
-                  <div class="ds-step-head">
-                    <span class="ds-no">1</span><span>{t("自动检测 DeepSeek Harness Desktop")}</span>
-                    <span class="spacer"></span>
-                    <button class="btn sm" disabled={dsBusy} onclick={() => dsRedetect(r)}>{dsBusy ? t("检测中…") : t("重新检测")}</button>
-                  </div>
-                  <p class="pend">
-                    {#if ds?.desktop}{t("已检测到：{path}", { path: ds.desktop })}{:else}{t("未检测到（检查了常见安装目录与卸载注册表）")}{/if}
-                  </p>
-                </div>
-
-                <div class="ds-step" class:active={ds?.kind === "manual"} class:bad={ds?.kind === "invalid"}>
-                  <div class="ds-step-head">
-                    <span class="ds-no">2</span><span>{t("手动指定安装目录")}</span>
-                    <span class="spacer"></span>
-                    <button class="btn sm primary" disabled={dsBusy} onclick={() => dsPickDir(r)}>{t("选择安装目录…")}</button>
-                    <button class="btn sm" disabled={dsBusy} onclick={() => dsTypePath(r)}>{t("输入路径")}</button>
-                    {#if ds?.manual}<button class="btn sm" disabled={dsBusy} onclick={() => dsClear(r)}>{t("清除手动路径")}</button>{/if}
-                  </div>
-                  <p class="pend">
-                    {#if ds?.kind === "invalid"}<span class="warn-text">{t("DSH_CMD 无效：{path}", { path: ds.manual ?? "" })}</span>
-                    {:else if ds?.manual}{t("使用：{path}", { path: ds.path })}
-                    {:else}{t("可选安装根目录、其子目录、上级目录，或直接选 dsh.cmd 所在目录，会自动定位 dsh.cmd")}{/if}
-                  </p>
-                </div>
-
-                <div class="ds-step" class:active={ds?.kind === "npm"}>
-                  <div class="ds-step-head">
-                    <span class="ds-no">3</span><span>{t("独立安装包（npm）")}</span>
-                    <span class="spacer"></span>
-                    {#if ds?.npm}
-                      <button class="btn sm" disabled={busy === r.id} onclick={() => install(r)}>{busy === r.id ? t("修复中…") : t("检查并修复")}</button>
-                      <button class="btn sm" disabled={busy === r.id} onclick={() => uninstall(r)}>{busy === r.id ? t("卸载中…") : t("卸载")}</button>
-                    {:else}
-                      <button class="btn sm" disabled={busy === r.id} onclick={() => install(r)}>{busy === r.id ? t("安装中…") : t("安装独立包")}</button>
-                    {/if}
-                  </div>
-                  <p class="pend">
-                    {#if ds?.npm}{t("已安装并通过自检：{path}", { path: ds.npm })}{:else}{t("{package}，约 520MB（含原生依赖，需 Node 22.19+）；未安装 Desktop 时使用", { package: r.npm ?? "" })}{/if}
-                  </p>
-                </div>
-
                 <div class="cfg-line">
                   <button class="btn sm" onclick={() => void fillDeepseekApiKey(r)}>{t("填充 API Key")}</button>
-                  <span class="pend">{t("填入后保存配置，连接时注入环境变量")}</span>
                   {#if r.auto_env?.DEEPSEEK_API_KEY === "set"}<span class="badge ok">{t("已检测到 {key}（系统环境）", { key: "DEEPSEEK_API_KEY" })}</span>{/if}
                 </div>
               </div>
@@ -621,67 +628,52 @@
     border-radius: 8px;
     background: color-mix(in srgb, var(--bg-elev) 70%, transparent);
   }
-  .ds-head {
+  .ds-modes {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+  }
+  .ds-mode {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: 6px 8px;
+    border: 1px solid var(--border-soft);
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    text-align: left;
+  }
+  .ds-mode.active {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+  }
+  .ds-mode-name {
+    font-weight: 600;
+    font-size: 0.86em;
+  }
+  .ds-mode-sub {
+    font-size: 0.74em;
+    color: var(--text-faint);
+  }
+  .ds-detail {
     display: flex;
     align-items: center;
     gap: 8px;
     min-width: 0;
-  }
-  .ds-title {
-    font-weight: 600;
-    font-size: 0.88em;
+    font-size: 0.86em;
   }
   .ds-path {
     font-family: var(--mono);
-    font-size: 0.78em;
+    font-size: 0.86em;
     color: var(--text-dim);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
     user-select: text;
-  }
-  .ds-step {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    padding: 6px 8px;
-    border-left: 3px solid var(--border-soft);
-    border-radius: 4px;
-  }
-  .ds-step.active {
-    border-left-color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 7%, transparent);
-  }
-  .ds-step.bad {
-    border-left-color: var(--danger, #d9534f);
-  }
-  .ds-step-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 0.86em;
-  }
-  .ds-step .pend {
-    word-break: break-all;
-  }
-  .ds-no {
-    width: 18px;
-    height: 18px;
-    border-radius: 50%;
-    background: var(--border-soft);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 0.78em;
-    flex: none;
-  }
-  .ds-step.active .ds-no {
-    background: var(--accent);
-    color: var(--bg, #fff);
-  }
-  .warn-text {
-    color: var(--danger, #d9534f);
   }
   .rowbtns {
     display: flex;

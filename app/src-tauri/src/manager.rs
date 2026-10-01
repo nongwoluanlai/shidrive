@@ -352,10 +352,23 @@ impl AgentManager {
             return Ok(manual);
         }
         if agent_type == "deepseek" {
-            // 来源判定与设置页共用 agents::deepseek_source：手动 DSH_CMD > Desktop 自动检测 > 独立 npm 包。
+            // 接入方式与设置页共用 agents::deepseek_source（acp / dsh / harness 互斥，不相互回退）。
             // 不改写 DSH_HOME（那是 dsh 的数据目录，指向安装目录会把会话写进 Program Files）。
-            let src = crate::agents::deepseek_source(&manual.env);
+            let mode = crate::agents::deepseek_mode_setting(&self.db);
+            let src = crate::agents::deepseek_source(&manual.env, mode.as_deref());
             match src.kind.as_str() {
+                "acp" => {
+                    // 三方桥自带 dsh 运行时，用 ShiDrive 的 Node 直接运行其 bin.js，无需参数；
+                    // 不使用全局 dsh plugin profile，不影响用户的 dsh 安装。
+                    let node = crate::node_rt::require_deepseek_node(&self.tools)?;
+                    let mut env = manual.env;
+                    env.remove("DSH_CMD");
+                    return Ok(AgentLaunch {
+                        command: node.to_string_lossy().to_string(),
+                        args: vec!["--disable-warning=ExperimentalWarning".into(), src.path],
+                        env,
+                    });
+                }
                 "manual" | "desktop" => {
                     let args = crate::agents::spec("deepseek").map(|sp| sp.args.clone()).unwrap_or_default();
                     let mut env = manual.env;
@@ -367,7 +380,7 @@ impl AgentManager {
                 }
                 "invalid" => {
                     return Err(format!(
-                        "DSH_CMD 指向的路径无效（{}）。请在「设置 → Agent 管理 → DeepSeek」重新「选择安装目录…」，或「清除手动路径」改用自动检测 / 独立包。",
+                        "DSH_CMD 指向的路径无效（{}）。请在「设置 → Agent 管理 → DeepSeek」重新选择 dsh.cmd 路径，或清除后改用自动检测。",
                         src.path
                     ));
                 }
@@ -376,7 +389,11 @@ impl AgentManager {
                     crate::node_rt::require_deepseek_node(&self.tools)?;
                 }
                 _ => {
-                    return Err("未找到 DeepSeek dsh：请在「设置 → Agent 管理 → DeepSeek」点「重新检测」（已安装 DeepSeek Harness Desktop 时），或「选择安装目录…」手动指定，或安装独立包（npm）。".into());
+                    return Err(match src.mode.as_str() {
+                        "acp" => "DeepSeek 三方 ACP 未安装：请在「设置 → Agent 管理 → DeepSeek」选择「三方 ACP」并点「安装」。",
+                        "harness" => "DeepSeek 官方完整包未安装：请在「设置 → Agent 管理 → DeepSeek」选择「官方完整包」并点「安装」。",
+                        _ => "未找到 dsh.cmd：请在「设置 → Agent 管理 → DeepSeek」点「检测」或「选择路径…」。",
+                    }.into());
                 }
             }
         }

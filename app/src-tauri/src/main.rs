@@ -235,6 +235,7 @@ fn main() {
             commands::acp_deepseek_new,
             commands::acp_pi_login,
             commands::deepseek_redetect,
+            commands::deepseek_set_source,
             commands::deepseek_resolve_dsh,
             commands::pick_folder,
             commands::acp_prompt,

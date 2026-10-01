@@ -430,6 +430,10 @@ import type { DisplayItem } from "../state.svelte";
   const loadingHere = $derived(app.chatLoading[key] ?? false);
   const sessionBusy = $derived(app.sessionBusy[key] ?? false);
   const sessionOccupied = $derived(app.sessionOccupied[key] ?? false);
+  /** 适配器明确报告会话被占用（跨进程写锁 / 所有权冲突）。 */
+  function isOccupiedError(msg: string): boolean {
+    return /\block(ed)?\b|EBUSY|in use|already (open|owned|active)|ownership|another (process|client)|被占用|占用中/i.test(msg);
+  }
 
   // Only session identity is reactive here. Draft keystrokes must not reload
   // the transcript or reset scroll following. All async work uses captured data.
@@ -487,12 +491,17 @@ import type { DisplayItem } from "../state.svelte";
             try {
               const rows = await api.acpSessionBind(context, agent, sid, b?.title ?? undefined, true);
               if (sameBinding() && !app.streaming[k]) {
-                setChatRows(k, rows, sid);
+                // 不支持重放的适配器（官方 dsh 的 resume）返回空：保留本地缓存，不清空。
+                if (rows.length || !app.chat[k]?.length) setChatRows(k, rows, sid);
                 app.sessionOccupied[k] = false;
               }
             } catch (e) {
               if (sameBinding()) {
-                app.sessionOccupied[k] = true;
+                // 只有明确的占用 / 锁冲突才提示「被其他客户端使用」；绑定变化、轮次进行中、
+                // cwd 不匹配、连接失败等都保留缓存静默处理，原因写入日志便于排查。
+                const msg = String(e);
+                app.sessionOccupied[k] = isOccupiedError(msg);
+                if (!/会话绑定已变化|会话正在进行中/.test(msg)) api.uiLog("warn", `[${agent}] 历史刷新失败，保留本地缓存：${msg}`);
               }
             }
           }

@@ -845,6 +845,24 @@ impl AcpConnection {
             }
         }
         let mut guard = LoadGuard(self, session_id, false);
+        // 按 initialize 声明的能力选择：未声明 loadSession 但声明了 sessionCapabilities.resume
+        // （官方 dsh）时直接 resume，省掉必然失败的 load + 重试往返。
+        let resume_only = {
+            let info = self.agent_info.lock().unwrap();
+            let caps = &info["agentCapabilities"];
+            caps["loadSession"].as_bool() != Some(true) && caps["sessionCapabilities"].get("resume").is_some()
+        };
+        if resume_only {
+            let resume = protocol::ResumeSessionRequest::new(session_id.to_string(), cwd).mcp_servers(mcp_servers);
+            self.begin_load(session_id);
+            let res = self.preserving(resume, Some(Duration::from_secs(60))).await
+                .map_err(|e| format!("session/resume 失败：{e}"));
+            if let Ok(response) = &res { self.cache_caps(session_id, response); }
+            let ok = res.is_ok();
+            self.finish_load(session_id, ok);
+            guard.2 = true;
+            return res;
+        }
         let request = protocol::LoadSessionRequest::new(session_id.to_string(), cwd).mcp_servers(mcp_servers.clone());
         self.begin_load(session_id);
         let mut res = self.preserving(request.clone(), Some(Duration::from_secs(60))).await;
