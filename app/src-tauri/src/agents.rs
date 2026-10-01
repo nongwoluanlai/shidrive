@@ -1,7 +1,7 @@
 //! Agent 注册表：支持的 ACP 工具清单、环境探测、适配器安装与启用顺序。
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::db::Db;
@@ -98,7 +98,7 @@ pub fn agent_specs() -> &'static [AgentSpec] {
         name: "DeepSeek".into(),
         npm: Some("@deepseek-ai/dsh".into()),
         args: vec!["--profile".into(), "acp".into()],
-        help: "DeepSeek Harness CLI（npm 包 @deepseek-ai/dsh），以 `dsh --profile acp` 提供 ACP stdio 服务。安装适配器后需配置 DeepSeek API Key：展开本行点「填充 API Key」，或在环境变量里加 DEEPSEEK_API_KEY=<key>（也可用系统环境变量）。支持 session/list 与 session/resume（不支持 session/load，恢复不回放历史，由使驾侧补齐）。".into(),
+        help: "DeepSeek Harness CLI（npm 包 @deepseek-ai/dsh），以 `dsh --profile acp` 提供 ACP stdio 服务。自动检测已安装的 DeepSeek Harness Desktop（优先使用其自带的 dsh 命令，无需重复下载 520MB）；也可展开本行点「从安装目录填充」手动指定。需配置 DEEPSEEK_API_KEY。⚠ 由于官方 ACP 功能限制：暂不支持会话历史重放（绑定旧会话后历史为空），也不显示会话标题与时间。如需迁移旧对话内容，可新建会话后让旧会话接入共享上下文来转移关键信息；后续官方 ACP 功能更新时使驾将同步更新。".into(),
     },
     AgentSpec {
         id: "pi".into(),
@@ -198,6 +198,68 @@ fn deepseek_package_version(dir: &std::path::Path) -> Option<String> {
 
 /// 安装完成后须通过 ACP initialize + session/new + session/close，
 /// 再写入标记。一个仅包含 bin.js 的残缺安装不再显示「适配器就绪」。
+/// Auto-detect the dsh.cmd bundled with DeepSeek Harness Desktop.
+// Search order: common install dirs, then registry uninstall keys.
+pub fn deepseek_desktop_dsh() -> Option<PathBuf> {
+    let rel = |root: &std::path::Path| {
+        let p = root.join("resources").join("runtime").join("cli").join("bin").join("dsh.cmd");
+        if p.is_file() && root.join("DeepSeek Harness.exe").is_file() {
+            Some(p)
+        } else {
+            None
+        }
+    };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        candidates.push(PathBuf::from(&pf).join("DeepSeek Harness"));
+    }
+    if let Ok(lad) = std::env::var("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(&lad).join("Programs").join("DeepSeek Harness"));
+    }
+    if let Ok(d) = std::env::var("SystemDrive") {
+        candidates.push(PathBuf::from(format!("{}\\tools\\dsh", d)));
+        candidates.push(PathBuf::from(format!("{}\\dsh", d)));
+    }
+    for c in &candidates {
+        if let Some(p) = rel(c) {
+            return Some(p);
+        }
+    }
+    // Registry fallback: Inno Setup uninstall key InstallLocation
+    for hive in ["HKCU", "HKLM"] {
+        for sub in [
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+            "Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        ] {
+            let output = crate::setup::hide_console(&mut std::process::Command::new("reg"))
+                .args(["query", &format!("{hive}\\{sub}")])
+                .output();
+            let Ok(out) = output else { continue };
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                let line = line.trim();
+                if !line.contains("HKEY_") || !line.ends_with("_is1") {
+                    continue;
+                }
+                let lo = crate::setup::hide_console(&mut std::process::Command::new("reg"))
+                    .args(["query", line, "/v", "InstallLocation"])
+                    .output();
+                let Ok(lo) = lo else { continue };
+                let lt = String::from_utf8_lossy(&lo.stdout);
+                if let Some(pos) = lt.find("REG_SZ") {
+                    let dir = lt[pos + 6..].trim().trim_end_matches('\\').to_string();
+                    if dir.len() > 3 {
+                        if let Some(p) = rel(Path::new(&dir)) {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn deepseek_install_candidate() -> Option<PathBuf> {
     let dir = managed_deepseek_dir()?;
     adapter_script_in(&dir.join("node_modules"), DEEPSEEK_PKG)

@@ -352,14 +352,27 @@ impl AgentManager {
             return Ok(manual);
         }
         if agent_type == "deepseek" {
-            // 检查将真正执行 dsh 的 Node；不能依赖仅查 major 的通用状态。
+            // DeepSeek Harness Desktop 自带的 dsh.cmd：优先使用（无需 npm 安装 520MB）
+            if let Some(dsh) = crate::agents::deepseek_desktop_dsh() {
+                let mut env: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+                for (k, v) in &manual.env {
+                    env.insert(k.clone(), v.clone());
+                }
+                env.insert("DSH_HOME".into(), dsh.parent().unwrap_or(std::path::Path::new("/")).to_string_lossy().to_string());
+                return Ok(AgentLaunch {
+                    command: dsh.to_string_lossy().to_string(),
+                    args: vec!["--profile".into(), "acp".into()],
+                    env,
+                });
+            }
+            // 未检测到 Desktop 安装：走 npm 安装路径
             crate::node_rt::require_deepseek_node(&self.tools)?;
         }
         let sp = crate::agents::spec(agent_type)
             .ok_or_else(|| format!("未知的 Agent 类型：{agent_type}（可在「设置 → Agent 管理」启用更多工具）"))?;
         let node = self.tools.node_exe();
         let node_str = node.to_string_lossy().to_string();
-        let mut env: HashMap<String, String> = HashMap::new();
+        let mut env: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
         let mut args: Vec<String>;
         match agent_type {
             "codex" => {
