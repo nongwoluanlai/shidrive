@@ -445,6 +445,20 @@ import type { DisplayItem } from "../state.svelte";
       stickToBottom = true;
       input = app.drafts[k] ?? "";
       touchChat(k);
+      // DeepSeek：连接前就注入已知模型，避免上一个 Agent 的选项残留
+      if (agent === "deepseek" && !app.agentCaps["deepseek"]?.configOptions?.length) {
+        app.agentCaps["deepseek"] = {
+          configOptions: [{
+            id: "model",
+            name: "model",
+            currentValue: "deepseek-flash",
+            options: [
+              { value: "deepseek-flash", name: "deepseek-flash" },
+              { value: "deepseek-v4-pro", name: "deepseek-v4-pro" },
+            ],
+          }],
+        };
+      }
       // 显式初始化新 key 的 chat 数组：Svelte 5 的动态属性访问
       // (app.chat[key]) 在 key 变化时可能不触发 $derived 失效——
       // 写入空数组强制 items 重算，清掉上一个 key 的残留渲染
@@ -857,7 +871,8 @@ import type { DisplayItem } from "../state.svelte";
   }
 
   // 通用会话配置条：codex models + zcode configOptions(select)
-  type CfgOpt = { value: string; name: string };
+  // raw：适配器原始值（dsh 的 model 是 ["provider","model"] 复合数组，须原样回传）
+  type CfgOpt = { value: string; name: string; raw?: unknown };
   type CfgItem = { id: string; label: string; value: string; options: CfgOpt[] };
 
   // 适配器给出的 id/name 多为英文，这里映射为中文；未收录的原样展示
@@ -948,6 +963,18 @@ import type { DisplayItem } from "../state.svelte";
   const caps = $derived.by(() => {
     const c = app.agentCaps[app.agent];
     if (c) return c as { models?: SessionReadyInfo["response"]["models"]; configOptions?: any[] };
+    // DeepSeek 无缓存时提供内置模型（deepseek-chat/reasoner 已弃用）
+    if (app.agent === "deepseek") {
+      return {
+        configOptions: [{
+          id: "model", name: "model", currentValue: "deepseek-flash",
+          options: [
+            { value: "deepseek-flash", name: "deepseek-flash" },
+            { value: "deepseek-v4-pro", name: "deepseek-v4-pro" },
+          ],
+        }],
+      } as { models?: SessionReadyInfo["response"]["models"]; configOptions?: any[] };
+    }
     return {} as { models?: SessionReadyInfo["response"]["models"]; configOptions?: any[] };
   });
 
@@ -957,15 +984,23 @@ import type { DisplayItem } from "../state.svelte";
 
   const cfgItems = $derived.by((): CfgItem[] => {
     const out: CfgItem[] = [];
-    const mapOpts = (list: any[]) =>
-      (list ?? []).map((x: any) => {
+    // 展平分组选项：dsh 的 model 项是 {group,name,options:[...]} 嵌套结构，
+    // 不展平会把整组压成一个 value 为 "undefined" 的 "DeepSeek" 项
+    const mapOpts = (list: any[]) => {
+      const flat: any[] = [];
+      for (const x of list ?? []) {
+        if (x && x.value === undefined && Array.isArray(x.options)) flat.push(...x.options);
+        else flat.push(x);
+      }
+      return flat.map((x: any) => {
         const v = String(x.value);
         const zh = zhValue(v);
         // 值有中文映射用映射；否则尝试按英文名映射；都没有保留原名
         const name = zh !== v ? zh : t(MODE_NAME_TEXT[String(x.name ?? "").toLowerCase()] ?? x.name);
-        return { value: v, name };
+        return { value: v, name, raw: x.value };
       });
-    const cfgOpts: any[] = sessionInfo?.response?.configOptions ?? caps.configOptions ?? [];
+    };
+    let cfgOpts: any[] = sessionInfo?.response?.configOptions ?? caps.configOptions ?? [];
     for (const o of cfgOpts) {
       if (o.type && o.type !== "select") continue;
       if (out.some((x) => x.id === o.id)) continue;
@@ -974,6 +1009,21 @@ import type { DisplayItem } from "../state.svelte";
       const opts = mapOpts(o.options ?? []);
       if (!opts.length) continue;
       out.push({ id: o.id, label: zhLabel(o.id, o.name ?? o.id), value: String(o.currentValue ?? ""), options: opts });
+    }
+    // DeepSeek 兜底：无 caps 缓存、或 dsh 只回出无法解析的通用项时注入已知模型
+    // （deepseek-chat/reasoner 已于 2026-07 弃用）。纯计算，不写共享 caps 对象——
+    // 在 $derived 里改 $state 会破坏信号图，配置栏会冻结在上一个 Agent 的内容上。
+    if (app.agent === "deepseek" && !out.some((x) => x.id === "model" && x.options.length > 1)) {
+      if (out.some((x) => x.id === "model")) out.splice(out.findIndex((x) => x.id === "model"), 1);
+      out.push({
+        id: "model",
+        label: t("模型"),
+        value: "deepseek-flash",
+        options: [
+          { value: "deepseek-flash", name: "deepseek-flash" },
+          { value: "deepseek-v4-pro", name: "deepseek-v4-pro" },
+        ],
+      });
     }
     // 回退：适配器没提供 model 配置项时才用 models 能力
     const models = liveModels;
@@ -994,6 +1044,9 @@ import type { DisplayItem } from "../state.svelte";
     if (sessionBusy || loadingHere) return;
     // 记住用户选择：跨会话/重启生效（session-ready 后自动回放）
     saveCfgPref(agent, id, value);
+    // 回传适配器原始值（dsh 的复合数组值不能压成逗号串）
+    const raw = cfgItems.find((x) => x.id === id)?.options.find((o) => o.value === value)?.raw;
+    const send = raw !== undefined ? raw : value;
     // 更新本地显示（无论是否已有会话）
     if (id === "model" && sessionInfo?.response?.models) sessionInfo.response.models.currentModelId = value;
     if (sessionInfo?.response?.configOptions) {
@@ -1001,15 +1054,15 @@ import type { DisplayItem } from "../state.svelte";
       if (opt) opt.currentValue = value;
     }
     if (!sessionId) {
-      // 会话尚未创建：暂存，session-ready 后自动应用
+      // 会话尚未创建：暂存，session-ready 后自动应用（存原始值以正确回传适配器）
       app.pendingCfg[cfgKey] ??= {};
-      app.pendingCfg[cfgKey][id] = value;
+      app.pendingCfg[cfgKey][id] = send;
       toast("info", t("已记录选择，创建会话后自动应用"));
       return;
     }
     if (!contextId) return;
     void api
-      .acpSetConfigOption(contextId, agent, id, value, sid ?? undefined)
+      .acpSetConfigOption(contextId, agent, id, send, sid ?? undefined)
       .then(() => toast("ok", t("已应用")))
       .catch((e) => {
         const msg = String(e);
@@ -1058,9 +1111,11 @@ import type { DisplayItem } from "../state.svelte";
       const opt = info.response.configOptions?.find((o) => o.id === item.id);
       if (opt) opt.currentValue = desired;
       saveCfgPref(app.agent, item.id, desired);
+      // 发送适配器原始值（dsh 复合数组值不能压成字符串）
+      const sendRaw = item.options.find((o) => o.value === desired)?.raw;
       cfgInflight++;
       void api
-        .acpSetConfigOption(ctx.id, app.agent, item.id, desired, sid)
+        .acpSetConfigOption(ctx.id, app.agent, item.id, sendRaw !== undefined ? sendRaw : desired, sid)
         .catch(() => {})
         .finally(() => {
           cfgInflight = Math.max(0, cfgInflight - 1);

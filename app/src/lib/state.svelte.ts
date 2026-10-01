@@ -84,7 +84,7 @@ export const app = $state({
   /** per-agent cached capability payload (models/configOptions) for pre-session display */
   agentCaps: {} as Record<string, { models?: unknown; configOptions?: unknown }>,
   /** config chosen before a session existed; applied on session-ready */
-  pendingCfg: {} as Record<string, Record<string, string>>,
+  pendingCfg: {} as Record<string, Record<string, unknown>>,
   /** 用户显式选择的会话配置（模型/模式等），key=agent:cfgId；跨会话/重启记住 */
   cfgPref: {} as Record<string, string>,
   /** 每个会话未发送的输入草稿，key=ctxId:agent；切页/切会话不丢 */
