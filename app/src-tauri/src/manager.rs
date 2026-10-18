@@ -804,6 +804,28 @@ impl AgentManager {
         Ok(rows)
     }
 
+    /// 网站接入：按当前绑定重放会话历史（只读：不改绑定、不发 session-ready，
+    /// 与 bind_session 同样的锁顺序：上下文绑定 -> 实际会话）。未绑定返回 (None, [])。
+    pub async fn replay_history(&self, context: &Context, agent_type: &str) -> Result<(Option<String>, Vec<ReplayRow>), String> {
+        let lock = self.bind_lock(&context.id, agent_type);
+        let _guard = lock.lock().await;
+        let Some(sid) = self.db.get_binding(&context.id, agent_type)?.and_then(|b| b.session_id) else {
+            return Ok((None, Vec::new()));
+        };
+        self.check_binding_idle(&context.id, agent_type).await?;
+        let cwd = self.project_root_for(context);
+        let conn = self.ensure_connected(agent_type).await?;
+        let session_lock = self.prompt_lock(&conn, &sid);
+        let _session = session_lock.lock().await;
+        let rows = self
+            .load_with_capture(&conn, &sid, &cwd)
+            .await?
+            .into_iter()
+            .map(|(role, content)| ReplayRow { role, content })
+            .collect();
+        Ok((Some(sid), rows))
+    }
+
     pub async fn list_sessions(&self, agent_type: &str) -> Result<Vec<SessionInfo>, String> {
         let conn = self.ensure_connected(agent_type).await?;
         conn.session_list().await

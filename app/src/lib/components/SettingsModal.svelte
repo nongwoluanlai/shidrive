@@ -7,10 +7,11 @@
   import { isEnabled as autoStartEnabled, enable as autoStartEnable, disable as autoStartDisable } from "@tauri-apps/plugin-autostart";
   import AgentsAdmin from "./AgentsAdmin.svelte";
   import RemoteMcpSettings from "./RemoteMcpSettings.svelte";
+  import WebAccessSettings from "./WebAccessSettings.svelte";
   import { t } from "../i18n";
   import type { AgentEnvStatusItem, NodeStat } from "../types";
 
-  let tab = $state<"agents" | "remote" | "theme" | "paths" | "about">("agents");
+  let tab = $state<"agents" | "remote" | "web" | "theme" | "paths" | "about">("agents");
   let registry = $state<AgentEnvStatusItem[]>([]);
 
   // --- paths / ports editing state ---
@@ -179,6 +180,7 @@
       <div class="tabs">
         <button class:active={tab === "agents"} onclick={() => { tab = "agents"; void loadRegistry(); }}>{t("Agent 管理")}</button>
         <button class:active={tab === "remote"} onclick={() => { tab = "remote"; void loadRegistry(); }}>{t("外部编程接入")}</button>
+        <button class:active={tab === "web"} onclick={() => (tab = "web")}>{t("网站接入")}</button>
         <button class:active={tab === "paths"} onclick={() => (tab = "paths")}>{t("环境与路径")}</button>
         <button class:active={tab === "theme"} onclick={() => (tab = "theme")}>{t("外观主题")}</button>
         <button class:active={tab === "about"} onclick={() => (tab = "about")}>{t("帮助与关于")}</button>
@@ -232,6 +234,8 @@
           <AgentsAdmin bind:registry loadRegistry={loadRegistry} />
         {:else if tab === "remote"}
           <RemoteMcpSettings />
+        {:else if tab === "web"}
+          <WebAccessSettings />
         {:else if tab === "about"}
           <AboutSettings />
         {:else}

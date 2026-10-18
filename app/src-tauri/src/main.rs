@@ -21,6 +21,7 @@ mod schedule;
 mod node_rt;
 mod setup;
 mod skins;
+mod web;
 
 use std::sync::Arc;
 
@@ -87,6 +88,9 @@ fn init_logger(debug: bool) {
 fn graceful_exit(app: &tauri::AppHandle) {
     if let Some(remote) = app.try_state::<crate::remote_mcp::RemoteManager>() {
         remote.stop();
+    }
+    if let Some(web) = app.try_state::<crate::web::WebManager>() {
+        web.stop();
     }
     if let Some(mgr) = app.try_state::<std::sync::Arc<crate::manager::AgentManager>>() {
         let conns = mgr.connection_ids();
@@ -209,6 +213,13 @@ fn main() {
             app.manage(engine);
             app.manage(crate::remote_mcp::RemoteManager::new());
             app.manage(std::sync::Arc::new(crate::remote_oauth::OAuthState::new()));
+            // 网站接入：开关为开时随应用自动启动
+            app.manage(crate::web::WebManager::new());
+            {
+                let h = app.handle().clone();
+                let db = h.state::<Arc<db::Db>>().inner().clone();
+                h.state::<crate::web::WebManager>().autostart(&h, &db);
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -335,6 +346,12 @@ fn main() {
             commands::agents_enabled_set,
             commands::agents_bootstrap,
             commands::agents_uninstall,
+            commands::web_status,
+            commands::web_start,
+            commands::web_stop,
+            commands::web_config_set,
+            commands::web_revoke_all,
+            commands::web_generate_code,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

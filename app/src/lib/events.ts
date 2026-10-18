@@ -1,6 +1,6 @@
 // Wire backend events to global state. Called once from App.svelte on mount.
 import { listen } from "@tauri-apps/api/event";
-import { app, applySessionUpdate, applyBindingStatus, adoptBinding, capabilityLists, toast, chatKey, gotoSession, refreshWorkflows } from "./state.svelte";
+import { app, applySessionUpdate, applyBindingStatus, adoptBinding, capabilityLists, toast, chatKey, gotoSession, refreshWorkflows, pushLocal } from "./state.svelte";
 import type { AgentType, ElicitationRequest, GlobalLogEntry, PermissionRequest, SessionReadyInfo } from "./types";
 import { pushGlobalLog } from "./global-log.svelte";
 import { forgetWorkflow } from "./components/wf-autosave.svelte";
@@ -79,6 +79,15 @@ export async function wireEvents() {
       if (!ctxId) return;
       applySessionUpdate(p.agentType, ctxId, p.sessionId ?? "", p.update, p);
     }
+  });
+
+  // 网站接入：网页端发出的提问同步显示到桌面聊天（回合状态由 binding-status 事件驱动）
+  await listen<{ contextId: string; agentType: string; text: string; origin: string; time?: string }>("chat://prompt", (e) => {
+    const p = e.payload;
+    if (p?.origin !== "web" || !p.contextId) return;
+    const key = chatKey(p.contextId, p.agentType);
+    if (!app.chat[key] || !app.bindingSession[key]) return;
+    pushLocal(key, { kind: "user", text: p.text, time: p.time });
   });
 
   await listen<{ agentType: AgentType; state: string }>("acp://status", (e) => {

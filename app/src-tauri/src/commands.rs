@@ -267,6 +267,15 @@ pub async fn acp_prompt(
     if text.trim().is_empty() && images.as_ref().map_or(true, |i| i.is_empty()) {
         return Err("消息不能为空".into());
     }
+    // 网站接入同步：桌面端发出的消息也推给网页端（网页端据此显示用户气泡）
+    {
+        use tauri::Emitter as _;
+        let _ = agents.app.emit("chat://prompt", serde_json::json!({
+            "contextId": context.id, "agentType": agent_type, "text": text, "origin": "desktop",
+            "requestId": request_id, "images": images.as_ref().map_or(0, |i| i.len()),
+            "time": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        }));
+    }
     agents.prompt_from_ui(&context, &agent_type, &text, &images.unwrap_or_default(), request_id.as_deref()).await
 }
 
@@ -1167,4 +1176,52 @@ pub async fn agent_config_set(agents: AgentsState<'_>, agent_type: String, launc
     }
     agents.set_override(&agent_type, launch).await;
     Ok(())
+}
+
+// ---------- 网站接入 ----------
+
+type WebState<'a> = State<'a, crate::web::WebManager>;
+
+#[tauri::command]
+pub async fn web_status(app: tauri::AppHandle, web: WebState<'_>, db: DbState<'_>) -> Result<crate::web::WebStatus, String> {
+    Ok(web.status(&app, &db))
+}
+
+/// 打开开关并启动服务（访客码未设置时报错，开关保持关闭）
+#[tauri::command]
+pub async fn web_start(app: tauri::AppHandle, web: WebState<'_>, db: DbState<'_>) -> Result<crate::web::WebStatus, String> {
+    web.start(&app, db.inner())?;
+    web.set_enabled(&db, true)?;
+    Ok(web.status(&app, &db))
+}
+
+#[tauri::command]
+pub async fn web_stop(app: tauri::AppHandle, web: WebState<'_>, db: DbState<'_>) -> Result<crate::web::WebStatus, String> {
+    web.set_enabled(&db, false)?;
+    web.stop();
+    Ok(web.status(&app, &db))
+}
+
+#[tauri::command]
+pub async fn web_config_set(
+    app: tauri::AppHandle,
+    web: WebState<'_>,
+    db: DbState<'_>,
+    port: Option<u16>,
+    public_url: Option<String>,
+    guest_code: Option<String>,
+    lan: Option<bool>,
+) -> Result<crate::web::WebStatus, String> {
+    web.configure(&app, db.inner(), port, public_url, guest_code, lan)?;
+    Ok(web.status(&app, &db))
+}
+
+#[tauri::command]
+pub async fn web_revoke_all(web: WebState<'_>) -> Result<usize, String> {
+    Ok(web.revoke_all())
+}
+
+#[tauri::command]
+pub async fn web_generate_code() -> Result<String, String> {
+    Ok(crate::web::generate_guest_code())
 }

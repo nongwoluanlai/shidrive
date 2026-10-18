@@ -29,6 +29,14 @@ import type {
 } from "./types";
 
 /** 每个工作流保留的运行历史条数，与后端 db::MAX_RUNS_PER_WORKFLOW 一致 */
+export interface WebSessionInfo { ip: string; ua: string; loginSecsAgo: number; activeSecsAgo: number }
+export interface WebStatus {
+  running: boolean; enabled: boolean; port: number; listen: string; lan: boolean;
+  public_url: string; guest_code: string; started_at: string | null;
+  sessions: WebSessionInfo[]; clients: number; local_urls: string[]; logs: string[];
+  assets_ready: boolean; last_error: string;
+}
+
 export const RUN_HISTORY_LIMIT = 50;
 
 export const api = {
@@ -163,6 +171,13 @@ export const api = {
   remoteMcpStart: (opts: { listenHost?: string; port?: number; quickTunnel?: boolean }) =>
     invoke<void>("remote_mcp_start", { opts: { listenHost: opts.listenHost ?? "0.0.0.0", port: opts.port ?? 51688, quickTunnel: !!opts.quickTunnel } }),
   remoteMcpStop: () => invoke<void>("remote_mcp_stop"),
+  // 网站接入（网页版服务）
+  webStatus: () => invoke<WebStatus>("web_status"),
+  webStart: () => invoke<WebStatus>("web_start"),
+  webStop: () => invoke<WebStatus>("web_stop"),
+  webConfigSet: (c: { port?: number; publicUrl?: string; guestCode?: string; lan?: boolean }) => invoke<WebStatus>("web_config_set", c),
+  webRevokeAll: () => invoke<number>("web_revoke_all"),
+  webGenerateCode: () => invoke<string>("web_generate_code"),
   remoteGrantsList: () => invoke<any[]>("remote_grants_list"),
   remoteGrantCreate: (input: Record<string, unknown>) => invoke<any>("remote_grant_create", { input }),
   remoteGrantRevoke: (id: string) => invoke<void>("remote_grant_revoke", { id }),
