@@ -24,6 +24,7 @@
   let nodeStat = $state<NodeStat | null>(null);
   let nodeBusy = $state(false);
   let autoStart = $state(false);
+  let contextHint = $state(true);
 
   async function loadNodeStatus() {
     nodeStat = await api.nodeStatus().catch(() => null);
@@ -31,6 +32,7 @@
 
   async function loadAutoStart() {
     autoStart = await autoStartEnabled().catch(() => false);
+    contextHint = ((await api.settingsGet("agent.context_hint").catch(() => null)) ?? "1") !== "0";
   }
 
   async function exportData() {
@@ -54,6 +56,12 @@
     }
   }
 
+  async function toggleContextHint(e: Event) {
+    const on = (e.target as HTMLInputElement).checked;
+    contextHint = on;
+    await api.settingsSet("agent.context_hint", on ? "1" : "0").catch(() => {});
+    toast("ok", t(on ? "已开启：聊天时向 Agent 附加项目与共享上下文说明" : "已关闭会话说明附加"));
+  }
   async function toggleEnterSend(e: Event) {
     const on = (e.target as HTMLInputElement).checked;
     app.enterSend = on;
@@ -243,6 +251,7 @@
             <h3>{t("通用")}</h3>
             <label class="check"><input type="checkbox" checked={autoStart} onchange={(e) => toggleAutoStart((e.target as HTMLInputElement).checked)} /> {t("开机自动启动使驾（最小化到托盘运行）")}</label>
             <label class="check"><input type="checkbox" checked={app.enterSend} onchange={toggleEnterSend} /> {t("Enter 发送消息（默认关闭：Enter 换行，Ctrl+Enter 发送）")}</label>
+            <label class="check"><input type="checkbox" checked={contextHint} onchange={toggleContextHint} /> {t("聊天时向 Agent 附加项目与共享上下文说明（提醒其读取/记录共享上下文、用工作流设定提醒）")}</label>
             <div class="rowbtns">
               <button class="btn sm" onclick={exportData}>{t("导出数据（项目/上下文/工作流 → 桌面）")}</button>
               <button class="btn sm" onclick={importData}>{t("导入数据（备份 JSON）")}</button>

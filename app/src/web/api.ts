@@ -85,9 +85,11 @@ export const api = {
   contexts: (project: string) => request<Context[]>("GET", `/api/contexts?${qs({ project })}`),
   context: (id: string) => request<{ context: Context; entries: ContextEntry[]; commits: Commit[] }>("GET", `/api/context?${qs({ id })}`),
   agents: () => request<Agent[]>("GET", "/api/agents"),
-  chat: (context: string, agent: string) =>
-    request<{ binding: Binding | null; sessionId: string | null; items: Item[] | null }>("GET", `/api/chat?${qs({ context, agent })}`),
-  history: (contextId: string, agent: string) => request<{ sessionId: string | null; rows: ReplayRow[] }>("POST", "/api/chat/history", { contextId, agent }),
+  /** limit：只取最近 N 条（默认服务端 150；0 = 全部） */
+  chat: (context: string, agent: string, limit?: number) =>
+    request<{ binding: Binding | null; sessionId: string | null; items: Item[] | null; omitted?: number }>("GET", `/api/chat?${qs({ context, agent, limit })}`),
+  history: (contextId: string, agent: string, limit?: number) =>
+    request<{ sessionId: string | null; rows: ReplayRow[]; omitted?: number }>("POST", "/api/chat/history", limit === undefined ? { contextId, agent } : { contextId, agent, limit }),
   send: (contextId: string, agent: string, text: string, requestId: string) =>
     request<{ requestId: string }>("POST", "/api/chat/send", { contextId, agent, text, requestId }),
   cancel: (contextId: string, agent: string) => request<{ ok: boolean }>("POST", "/api/chat/cancel", { contextId, agent }),

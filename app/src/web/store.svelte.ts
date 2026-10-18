@@ -14,6 +14,8 @@ export interface ChatState {
   /** 本地快照已显示，但尚未从 Agent 会话重放校准 */
   fromSnapshot: boolean;
   error: string;
+  /** 服务端省略的更早消息条数（长会话首屏只取最近一段） */
+  omitted: number;
 }
 
 export interface Toast { id: number; kind: "info" | "ok" | "warn" | "error"; text: string }
@@ -118,7 +120,7 @@ export function selectAgent(id: string) {
 }
 
 function blankChat(): ChatState {
-  return { sessionId: null, title: null, items: [], running: false, turnId: null, loading: true, syncing: false, fromSnapshot: false, error: "" };
+  return { sessionId: null, title: null, items: [], running: false, turnId: null, loading: true, syncing: false, fromSnapshot: false, error: "", omitted: 0 };
 }
 
 /** 打开当前上下文 + Agent 的会话：先显示桌面端保存的快照，无快照时从 Agent 会话重放历史 */
@@ -139,13 +141,36 @@ export async function openChat(force = false) {
     chat.running = r.binding?.status === "running";
     if (r.items?.length) {
       chat.items = r.items.map((it) => ({ ...it, id: nid(), streaming: false }));
+      chat.omitted = r.omitted ?? 0;
       chat.fromSnapshot = true;
     } else if (!chat.running) {
       chat.items = [];
+      chat.omitted = 0;
       if (r.sessionId) await syncHistory(key);
     }
   } catch (e) {
     chat.error = errText(e);
+  } finally {
+    chat.loading = false;
+  }
+}
+
+/** 加载服务端省略的更早消息（快照直接取全量；重放结果需重新重放全量） */
+export async function loadEarlier(key: string): Promise<boolean> {
+  const chat = ui.chats[key];
+  if (!chat || !chat.omitted || chat.loading || chat.syncing) return false;
+  if (!chat.fromSnapshot) { await syncHistory(key, true); return true; }
+  const [ctx, agent] = [key.slice(0, key.lastIndexOf(":")), key.slice(key.lastIndexOf(":") + 1)];
+  chat.loading = true;
+  try {
+    const r = await api.chat(ctx, agent, 0);
+    if (chat.running || r.sessionId !== chat.sessionId || !r.items?.length) return false;
+    chat.items = r.items.map((it) => ({ ...it, id: nid(), streaming: false }));
+    chat.omitted = 0;
+    return true;
+  } catch (e) {
+    toast("warn", errText(e));
+    return false;
   } finally {
     chat.loading = false;
   }
@@ -165,16 +190,17 @@ async function refreshChatMeta(key: string, ctx: string, agent: string) {
 }
 
 /** 从 Agent 会话重放历史（权威来源；会启动适配器，可能需要几秒） */
-export async function syncHistory(key: string) {
+export async function syncHistory(key: string, full = false) {
   const chat = ui.chats[key];
   if (!chat || chat.syncing) return;
   const [ctx, agent] = [key.slice(0, key.lastIndexOf(":")), key.slice(key.lastIndexOf(":") + 1)];
   chat.syncing = true;
   try {
-    const r = await api.history(ctx, agent);
+    const r = await api.history(ctx, agent, full ? 0 : undefined);
     if (chat.running) return; // 重放期间开始了新回合：以实时流为准
     chat.sessionId = r.sessionId;
     chat.items = rowsToItems(r.rows);
+    chat.omitted = r.omitted ?? 0;
     chat.fromSnapshot = false;
   } catch (e) {
     toast("warn", `历史同步失败：${errText(e)}`);

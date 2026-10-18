@@ -108,6 +108,8 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, state: Arc<McpState>, ap
     let mut content_length = 0usize;
     let mut origin = String::new();
     let mut host = String::new();
+    let mut hdr_ctx = String::new();
+    let mut hdr_agent = String::new();
     for line in lines {
         let lower = line.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
@@ -116,6 +118,10 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, state: Arc<McpState>, ap
             origin = line[7..].trim().to_string();
         } else if lower.starts_with("host:") {
             host = line[5..].trim().to_string();
+        } else if lower.starts_with("x-shidrive-context:") {
+            hdr_ctx = line[19..].trim().to_string();
+        } else if lower.starts_with("x-shidrive-agent:") {
+            hdr_agent = line[17..].trim().to_string();
         }
     }
     // 安全：本服务无鉴权且可创建/运行工作流（= 执行命令）。浏览器里任意网页都能向
@@ -145,6 +151,11 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, state: Arc<McpState>, ap
         None => (path.clone(), String::new()),
     };
 
+    // 会话绑定：使驾为每个 ACP 会话注入的地址形如 /mcp?ctx=<contextId>&agent=<type>，
+    // 工具的 context_id / 项目参数缺省时自动落到该会话的上下文与项目。
+    let binding = parse_binding(&query, &hdr_ctx, &hdr_agent);
+    let bound = binding.as_ref();
+
     // 按「请求」判定（而非响应体）：通知 / 客户端回包只回 202 空体；initialize 才下发会话头。
     let mut is_initialize = false;
     let (status, content_type, payload) = match (method.as_str(), path_only.as_str()) {
@@ -161,9 +172,9 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, state: Arc<McpState>, ap
                     }
                     McpMessageKind::Initialize => {
                         is_initialize = true;
-                        (200, "application/json", handle_mcp(&state, &app, msg).to_string())
+                        (200, "application/json", handle_mcp(&state, &app, msg, bound).to_string())
                     }
-                    McpMessageKind::Request => (200, "application/json", handle_mcp(&state, &app, msg).to_string()),
+                    McpMessageKind::Request => (200, "application/json", handle_mcp(&state, &app, msg, bound).to_string()),
                 },
                 Err(e) => (
                     200,
@@ -298,7 +309,7 @@ fn skills_document(query: &str, port: u16) -> String {
 | `context_update` | 提交更新：`base_version` + 本次摘要 + 涉及文件 + 变更的章节 |
 | `context_history` | 浏览提交历史（谁在什么时候做了什么、改了哪些文件） |
 | `context_search` | 按关键词搜索历史提交的摘要 / 涉及文件 / 内容 |
-| `workflow_list` | 列出项目的工作流（默认「无项目」；可用 project_name 或 context_id 定位项目） |
+| `workflow_list` | 列出项目的工作流（由使驾会话注入时默认当前会话的项目，否则默认「无项目」；可用 project_name 或 context_id 定位项目） |
 | `workflow_get` / `workflow_create` / `workflow_update` / `workflow_delete` | 查看/创建/更新/删除项目工作流。把用户常跑的命令（打包、构建、git 提交等）沉淀为工作流，用户可在使驾界面一键运行 |
 | `workflow_run` | 立即运行某个工作流，返回 run_id |
 | `workflow_run_status` | 按 run_id 查询运行状态与日志末尾（运行后用它确认结果） |
@@ -344,28 +355,41 @@ fn skills_document(query: &str, port: u16) -> String {
 
 // ---------- MCP protocol ----------
 
-fn handle_mcp(state: &McpState, app: &AppHandle, msg: Value) -> Value {
+fn handle_mcp(state: &McpState, app: &AppHandle, msg: Value, bound: Option<&Binding>) -> Value {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or_default().to_string();
     let params = msg.get("params").cloned().unwrap_or(json!({}));
+    let info = bound.and_then(|b| bound_info(&state.db, &b.context_id));
 
     match method.as_str() {
-        "initialize" => json!({
-            "jsonrpc": "2.0", "id": id,
-            "result": {
+        "initialize" => {
+            let mut result = json!({
                 "protocolVersion": "2025-03-26",
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "shidrive", "title": "使驾共享上下文", "version": env!("CARGO_PKG_VERSION") }
+            });
+            if let (Some(b), Some(info)) = (bound, info.as_ref()) {
+                result["instructions"] = Value::String(server_instructions(info, &b.agent));
             }
-        }),
+            json!({ "jsonrpc": "2.0", "id": id, "result": result })
+        }
         "notifications/initialized" | "notification/initialized" => {
             json!({"jsonrpc":"2.0","id":id,"result":{}})
         }
         "ping" => json!({"jsonrpc":"2.0","id":id,"result":{}}),
-        "tools/list" => json!({"jsonrpc":"2.0","id":id,"result":{"tools": tool_definitions()}}),
+        "tools/list" => {
+            let tools = match info.as_ref() {
+                Some(info) => bind_tool_definitions(tool_definitions(), info),
+                None => tool_definitions(),
+            };
+            json!({"jsonrpc":"2.0","id":id,"result":{"tools": tools}})
+        }
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
-            let args = params.get("arguments").cloned().unwrap_or(json!({}));
+            let mut args = params.get("arguments").cloned().unwrap_or(json!({}));
+            if let (Some(b), Some(_)) = (bound, info.as_ref()) {
+                args = apply_binding(b, &name, args);
+            }
             match call_tool(state, app, &name, &args) {
                 Ok(text) => json!({
                     "jsonrpc":"2.0","id":id,
@@ -1006,6 +1030,254 @@ fn call_workflow_tool(state: &McpState, name: &str, args: &Value) -> Result<Valu
             })))
         }
         _ => tool_error(format!("未知工具 {name}。")),
+    }
+}
+
+// ---------- 会话绑定（ACP 会话 → 项目 / 共享上下文） ----------
+
+/// 使驾注入给 ACP 会话的 MCP 地址携带的绑定信息。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Binding {
+    pub context_id: String,
+    pub agent: String,
+}
+
+/// 绑定上下文的展示信息（项目名 / 根目录 / 上下文名）。
+#[derive(Debug, Clone, Default)]
+pub struct BoundInfo {
+    pub context_id: String,
+    pub context_name: String,
+    pub project_name: String,
+    pub project_root: String,
+}
+
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) {
+                    Ok(v) => { out.push(v); i += 3; continue; }
+                    Err(_) => out.push(b'%'),
+                }
+            }
+            b'+' => out.push(b' '),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        (k == key).then(|| pct_decode(v).trim().to_string())
+    })
+}
+
+/// 从 `?ctx=`（兼容 `sharedsession=`）/`agent=` 或 `X-ShiDrive-Context`/`X-ShiDrive-Agent` 头解析绑定。
+pub(crate) fn parse_binding(query: &str, hdr_ctx: &str, hdr_agent: &str) -> Option<Binding> {
+    let ctx = query_param(query, "ctx")
+        .or_else(|| query_param(query, "sharedsession"))
+        .filter(|s| !s.is_empty() && s != "1")
+        .or_else(|| Some(hdr_ctx.trim().to_string()).filter(|s| !s.is_empty()))?;
+    let agent = query_param(query, "agent")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| hdr_agent.trim().to_string());
+    Some(Binding { context_id: ctx, agent })
+}
+
+pub fn bound_info(db: &Db, context_id: &str) -> Option<BoundInfo> {
+    let c = db.get_context_row(context_id)?;
+    let project = db.list_projects().ok().and_then(|ps| ps.into_iter().find(|p| p.id == c.project_id));
+    Some(BoundInfo {
+        context_id: c.id,
+        context_name: c.name,
+        project_name: project.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "无项目".into()),
+        project_root: project.map(|p| p.root_path).unwrap_or_default(),
+    })
+}
+
+fn project_label(info: &BoundInfo) -> String {
+    if info.project_root.trim().is_empty() {
+        format!("「{}」", info.project_name)
+    } else {
+        format!("「{}」（根目录 {}）", info.project_name, info.project_root)
+    }
+}
+
+/// 使驾 MCP 的使用约定（initialize.instructions 与首轮注入共用）。
+fn usage_rules() -> &'static str {
+    "1) 每轮开始先 context_get_version；版本比你读过的新（或本会话还没读过）就 context_get 阅读后再动手。\n\
+2) 有产出或分析结论（改了代码、定位了问题、做了决定、用户提出新要求）后，用 context_update 记录：base_version=读到的版本，只传改动的章节，内容精简；纯闲聊可不记。\n\
+3) 用户说「X 点提醒我 / 到时执行…」：用 workflow_create 建一次性定时工作流，schedule={\"kind\":\"once\",\"at\":\"YYYY-MM-DD HH:MM\",\"delete_after_run\":true}；提醒用 balloon 节点，执行任务用 shell 或 agent 节点。\n\
+4) 发现用户反复使用某条命令（构建、打包、测试、提交等），可简短询问是否加入项目工作流，同意后再 workflow_create。"
+}
+
+/// MCP initialize 的 instructions（部分客户端会放进系统提示词）。
+pub fn server_instructions(info: &BoundInfo, agent: &str) -> String {
+    let agent_line = if agent.is_empty() { String::new() } else { format!("当前 Agent：{agent}。") };
+    format!(
+        "你在使驾（ShiDrive）中工作：项目{}，共享上下文「{}」（context_id={}）。{agent_line}\n\
+本服务的 context_* / workflow_* 工具省略 context_id、project_name 时默认作用于该上下文与项目。\n约定：\n{}",
+        project_label(info),
+        info.context_name,
+        info.context_id,
+        usage_rules()
+    )
+}
+
+/// 会话首轮附加在用户消息后的完整说明。`with_tools`=false 表示该 Agent 未接入使驾 MCP。
+pub fn session_brief(info: &BoundInfo, agent: &str, now: &str, with_tools: bool) -> String {
+    let agent_line = if agent.is_empty() { String::new() } else { format!("\n- 当前 Agent：{agent}") };
+    let head = format!(
+        "（以下为使驾自动附加的会话说明，无需回复）\n- 项目：{}\n- 共享上下文：「{}」 context_id={}{agent_line}\n- 当前时间：{now}",
+        project_label(info),
+        info.context_name,
+        info.context_id
+    );
+    if with_tools {
+        format!(
+            "{head}\n已接入 MCP 服务 shidrive：context_* / workflow_* 工具省略 context_id、project_name 时默认作用于本上下文与本项目。\n约定：\n{}",
+            usage_rules()
+        )
+    } else {
+        format!("{head}\n（本 Agent 未接入使驾 MCP 工具，以上信息仅供参考。）")
+    }
+}
+
+/// 之后每轮附加的简短提示。
+pub fn turn_hint(info: &BoundInfo, now: &str, with_tools: bool) -> String {
+    if with_tools {
+        format!(
+            "（使驾提示）项目「{}」· context_id={} · 时间 {now}：先检查共享上下文（context_get_version），有产出/结论后 context_update 记录。",
+            info.project_name, info.context_id
+        )
+    } else {
+        format!("（使驾提示）项目「{}」· 共享上下文「{}」· 时间 {now}", info.project_name, info.context_name)
+    }
+}
+
+/// 绑定会话时：context_id 不再必填，并在描述里写明默认值。
+fn bind_tool_definitions(mut tools: Value, info: &BoundInfo) -> Value {
+    let ctx_desc = format!("可省略，默认当前会话绑定的共享上下文 {}", info.context_id);
+    let proj_desc = format!("可省略，默认当前项目「{}」", info.project_name);
+    if let Some(arr) = tools.as_array_mut() {
+        for t in arr.iter_mut() {
+            let name = t.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            if name == "workflow_list" {
+                t["description"] = Value::String(format!("列出项目的工作流（默认当前项目「{}」，可用 project_name 或 context_id 指定其他项目）", info.project_name));
+            }
+            let Some(schema) = t.get_mut("inputSchema") else { continue };
+            if let Some(req) = schema.get_mut("required").and_then(|r| r.as_array_mut()) {
+                req.retain(|v| v.as_str() != Some("context_id"));
+            }
+            if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+                if let Some(p) = props.get_mut("context_id") {
+                    p["description"] = Value::String(ctx_desc.clone());
+                }
+                if let Some(p) = props.get_mut("project_name") {
+                    p["description"] = Value::String(proj_desc.clone());
+                }
+            }
+        }
+    }
+    tools
+}
+
+fn is_blank(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => s.trim().is_empty(),
+        _ => false,
+    }
+}
+
+/// 绑定会话的参数补全：缺省 context_id / 项目 / agent 节点的上下文与类型。
+pub(crate) fn apply_binding(b: &Binding, name: &str, args: Value) -> Value {
+    let mut args = match args {
+        Value::Object(_) => args,
+        _ => json!({}),
+    };
+    let ctx = Value::String(b.context_id.clone());
+    if name.starts_with("context_") {
+        if is_blank(args.get("context_id")) {
+            args["context_id"] = ctx.clone();
+        }
+        if name == "context_update" && !b.agent.is_empty() && is_blank(args.get("agent_type")) {
+            args["agent_type"] = Value::String(b.agent.clone());
+        }
+    } else if name.starts_with("workflow_") && name != "workflow_run_status" {
+        if is_blank(args.get("project_name")) && is_blank(args.get("context_id")) {
+            args["context_id"] = ctx.clone();
+        }
+        if matches!(name, "workflow_create" | "workflow_update") {
+            if let Some(steps) = args.get_mut("steps").and_then(|s| s.as_array_mut()) {
+                for st in steps.iter_mut() {
+                    if st.get("type").and_then(|t| t.as_str()) != Some("agent") || !st.is_object() {
+                        continue;
+                    }
+                    if is_blank(st.get("context_id")) {
+                        st["context_id"] = ctx.clone();
+                    }
+                    if !b.agent.is_empty() && is_blank(st.get("agent_type")) {
+                        st["agent_type"] = Value::String(b.agent.clone());
+                    }
+                }
+            }
+        }
+    }
+    args
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    #[test]
+    fn parses_binding_from_query_or_header() {
+        let b = parse_binding("ctx=abc-1&agent=codex", "", "").unwrap();
+        assert_eq!(b, Binding { context_id: "abc-1".into(), agent: "codex".into() });
+        assert_eq!(parse_binding("sharedsession=x%2Dy", "", "").unwrap().context_id, "x-y");
+        assert_eq!(parse_binding("", "h1", "zcode").unwrap(), Binding { context_id: "h1".into(), agent: "zcode".into() });
+        assert!(parse_binding("sharedsession=1", "", "").is_none());
+        assert!(parse_binding("", "", "").is_none());
+    }
+
+    #[test]
+    fn fills_defaults_without_overriding() {
+        let b = Binding { context_id: "C".into(), agent: "codex".into() };
+        let a = apply_binding(&b, "context_get", json!({}));
+        assert_eq!(a["context_id"], "C");
+        let a = apply_binding(&b, "context_update", json!({"context_id":"D","base_version":1}));
+        assert_eq!(a["context_id"], "D");
+        assert_eq!(a["agent_type"], "codex");
+        let a = apply_binding(&b, "workflow_list", json!({"project_name":"P"}));
+        assert!(a.get("context_id").is_none());
+        let a = apply_binding(&b, "workflow_create", json!({"name":"w","steps":[{"type":"agent","prompt":"x"},{"type":"shell","command":"ls"},{"type":"agent","context_id":"E","agent_type":"zcode","prompt":"y"}]}));
+        assert_eq!(a["context_id"], "C");
+        assert_eq!(a["steps"][0]["context_id"], "C");
+        assert_eq!(a["steps"][0]["agent_type"], "codex");
+        assert!(a["steps"][1].get("context_id").is_none());
+        assert_eq!(a["steps"][2]["context_id"], "E");
+        assert_eq!(a["steps"][2]["agent_type"], "zcode");
+        let a = apply_binding(&b, "workflow_run_status", json!({"run_id":"r"}));
+        assert!(a.get("context_id").is_none());
+    }
+
+    #[test]
+    fn bound_definitions_drop_required_context() {
+        let info = BoundInfo { context_id: "C".into(), context_name: "主".into(), project_name: "P".into(), project_root: "D:/p".into() };
+        let tools = bind_tool_definitions(tool_definitions(), &info);
+        for t in tools.as_array().unwrap() {
+            let req = t["inputSchema"].get("required").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+            assert!(!req.iter().any(|v| v == "context_id"), "{}", t["name"]);
+        }
+        let brief = session_brief(&info, "codex", "2025-01-01 09:00", true);
+        assert!(brief.contains("context_id=C") && brief.contains("delete_after_run"));
     }
 }
 

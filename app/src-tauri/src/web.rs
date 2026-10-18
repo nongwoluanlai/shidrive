@@ -365,6 +365,18 @@ impl Hub {
             }
             _ => {}
         }
+        // 工具调用的大段输入/输出（读文件、终端输出、diff）对网页端只需预览：
+        // 转发前截短长字符串，减少移动端流量与解析/渲染开销
+        if event == "acp://update" && payload.len() > SLIM_EVENT_BYTES {
+            if let Ok(mut v) = serde_json::from_str::<Value>(payload) {
+                slim_value(&mut v, SLIM_STR, 0);
+                let slim = v.to_string();
+                if slim.len() <= 1024 * 1024 {
+                    self.broadcast(event, &slim);
+                }
+            }
+            return;
+        }
         // 单条事件过大（极端的工具输出）不转发，避免拖垮移动端；网页端可「刷新历史」补齐
         if payload.len() > 1024 * 1024 {
             return;
@@ -410,6 +422,77 @@ pub struct WebManager {
     runtime: Mutex<Option<Runtime>>,
     wired: AtomicBool,
     last_error: Mutex<String>,
+}
+
+// ---------- 网页端负载瘦身 ----------
+
+/// 超过该体积的 acp://update 才做瘦身（普通文本分片原样转发）
+const SLIM_EVENT_BYTES: usize = 8 * 1024;
+/// 工具输入/输出中单个字符串保留的最大字符数（网页端只做预览）
+const SLIM_STR: usize = 4000;
+/// 首屏默认返回的最近消息条数（其余按需「加载更早」）
+const CHAT_TAIL_DEFAULT: usize = 150;
+
+/// 递归截短 JSON 中的长字符串（按字符边界），并限制数组长度
+pub(crate) fn slim_value(v: &mut Value, max: usize, depth: usize) {
+    match v {
+        Value::String(s) => {
+            if s.len() > max {
+                let total = s.chars().count();
+                if total > max {
+                    let mut t: String = s.chars().take(max).collect();
+                    t.push_str(&format!("\n…（网页端预览已截断，共 {total} 字符）"));
+                    *s = t;
+                }
+            }
+        }
+        Value::Array(a) => {
+            if a.len() > 400 {
+                a.truncate(400);
+            }
+            if depth < 12 {
+                for x in a.iter_mut() {
+                    slim_value(x, max, depth + 1);
+                }
+            }
+        }
+        Value::Object(o) => {
+            if depth < 12 {
+                for (_, x) in o.iter_mut() {
+                    slim_value(x, max, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 聊天快照 items：只瘦身工具调用部分（正文保持完整）
+fn slim_items(items: &mut Value) {
+    if let Value::Array(list) = items {
+        for it in list.iter_mut() {
+            if let Some(tools) = it.get_mut("tools") {
+                slim_value(tools, SLIM_STR, 0);
+            }
+        }
+    }
+}
+
+/// 取末尾 limit 条（limit=0 表示全部），返回 (被省略的条数)
+fn keep_tail<T>(list: &mut Vec<T>, limit: usize) -> usize {
+    if limit == 0 || list.len() <= limit {
+        return 0;
+    }
+    let skip = list.len() - limit;
+    list.drain(..skip);
+    skip
+}
+
+fn tail_limit(raw: &str) -> usize {
+    match raw.trim() {
+        "" => CHAT_TAIL_DEFAULT,
+        v => v.parse::<usize>().unwrap_or(CHAT_TAIL_DEFAULT),
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1079,7 +1162,13 @@ fn route(req: &Req, ctx: &Ctx) -> ApiResult {
                     }
                 }
             }
-            Ok(json!({ "binding": binding, "sessionId": sid, "items": items }))
+            // 长会话只回最近 N 条（limit=0 取全部），工具详情截短，首屏更快
+            let mut omitted = 0usize;
+            if let Value::Array(list) = &mut items {
+                omitted = keep_tail(list, tail_limit(&req.q("limit")));
+            }
+            slim_items(&mut items);
+            Ok(json!({ "binding": binding, "sessionId": sid, "items": items, "omitted": omitted }))
         }
         ("POST", "/api/chat/history") => {
             let b = req.json()?;
@@ -1087,8 +1176,30 @@ fn route(req: &Req, ctx: &Ctx) -> ApiResult {
             let agent = s(&b, "agent");
             check_agent(ctx, &agent)?;
             let mgr = agents(ctx);
-            let (sid, rows) = block(mgr.replay_history(&c, &agent))?;
-            Ok(json!({ "sessionId": sid, "rows": rows }))
+            let (sid, mut rows) = block(mgr.replay_history(&c, &agent))?;
+            let limit = match b.get("limit") {
+                Some(Value::Number(n)) => n.as_u64().unwrap_or(0) as usize,
+                _ => CHAT_TAIL_DEFAULT,
+            };
+            let omitted = keep_tail(&mut rows, limit);
+            let rows: Vec<Value> = rows
+                .into_iter()
+                .map(|r| {
+                    let content = if r.role == "tools" {
+                        match serde_json::from_str::<Value>(&r.content) {
+                            Ok(mut v) => {
+                                slim_value(&mut v, SLIM_STR, 0);
+                                v.to_string()
+                            }
+                            Err(_) => r.content,
+                        }
+                    } else {
+                        r.content
+                    };
+                    json!({ "role": r.role, "content": content })
+                })
+                .collect();
+            Ok(json!({ "sessionId": sid, "rows": rows, "omitted": omitted }))
         }
         ("POST", "/api/chat/send") => {
             let b = req.json()?;
@@ -1309,6 +1420,29 @@ fn fs_raw(stream: &mut TcpStream, req: &Req, ctx: &Ctx) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slim_truncates_long_strings_on_char_boundary() {
+        let mut v = json!({ "a": "中".repeat(5000), "b": ["x".repeat(10)], "n": 1 });
+        slim_value(&mut v, 100, 0);
+        let a = v["a"].as_str().unwrap();
+        assert!(a.starts_with(&"中".repeat(100)));
+        assert!(a.contains("共 5000 字符"));
+        assert_eq!(v["b"][0].as_str().unwrap().len(), 10);
+        assert_eq!(v["n"], 1);
+    }
+
+    #[test]
+    fn keep_tail_limits() {
+        let mut v: Vec<i32> = (0..10).collect();
+        assert_eq!(keep_tail(&mut v, 3), 7);
+        assert_eq!(v, vec![7, 8, 9]);
+        let mut w: Vec<i32> = (0..5).collect();
+        assert_eq!(keep_tail(&mut w, 0), 0);
+        assert_eq!(w.len(), 5);
+        assert_eq!(tail_limit(""), CHAT_TAIL_DEFAULT);
+        assert_eq!(tail_limit("0"), 0);
+    }
 
     #[test]
     fn ct_eq_works() {

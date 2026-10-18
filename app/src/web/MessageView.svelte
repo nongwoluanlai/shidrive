@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { md } from "../lib/markdown";
   import type { Item, ToolCall } from "./api";
   import Icon from "./Icon.svelte";
@@ -8,7 +9,26 @@
   let thoughtOpen = $state(false);
   let openTools = $state<Record<string, boolean>>({});
 
-  const html = $derived(item.kind === "assistant" ? md(item.text) : "");
+  // 流式输出时 markdown 渲染节流（每 ~120ms 一次），避免长回复逐字重排卡顿
+  let html = $state("");
+  let mdTimer: ReturnType<typeof setTimeout> | null = null;
+  $effect(() => {
+    if (item.kind !== "assistant") return;
+    const text = item.text ?? "";
+    if (!item.streaming) {
+      if (mdTimer) { clearTimeout(mdTimer); mdTimer = null; }
+      html = md(text);
+      return;
+    }
+    if (!untrack(() => html)) { html = md(text); return; }
+    if (mdTimer) return;
+    mdTimer = setTimeout(() => {
+      mdTimer = null;
+      html = md(item.text ?? "");
+    }, 120);
+  });
+  $effect(() => () => { if (mdTimer) clearTimeout(mdTimer); });
+  const userText = $derived(item.kind === "user" ? (item.text ?? "").replace(/\s*<shidrive-context>[\s\S]*?<\/shidrive-context>\s*/g, "") : "");
 
   const STATUS: Record<string, { cls: string; label: string }> = {
     pending: { cls: "", label: "等待" },
@@ -60,7 +80,7 @@
 
 {#if item.kind === "user"}
   <div class="row user">
-    <div class="bubble">{item.text}</div>
+    <div class="bubble">{userText}</div>
   </div>
 {:else if item.kind === "assistant"}
   <div class="row assistant">
@@ -94,7 +114,7 @@
 {/if}
 
 <style>
-  .row { padding: 6px 0; max-width: 100%; }
+  .row { padding: 6px 0; max-width: 100%; content-visibility: auto; contain-intrinsic-size: auto 80px; }
   .user { display: flex; justify-content: flex-end; }
   .bubble {
     background: var(--user-bubble); padding: 9px 13px; border-radius: 16px 16px 4px 16px; max-width: min(85%, 720px);

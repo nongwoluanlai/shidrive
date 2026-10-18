@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { ui, currentChat, currentContext, chatKey, selectAgent, sendMessage, cancelTurn, newSession, syncHistory, openChat, setView } from "./store.svelte";
+  import { ui, currentChat, currentContext, chatKey, selectAgent, sendMessage, cancelTurn, newSession, syncHistory, openChat, setView, loadEarlier } from "./store.svelte";
   import MessageView from "./MessageView.svelte";
   import Icon from "./Icon.svelte";
 
@@ -17,6 +17,34 @@
   const agentName = $derived(ui.agents.find((a) => a.id === ui.agent)?.name ?? ui.agent);
   const DRAFT = "shidrive.web.draft.";
 
+  // 长会话只渲染最近一段（DOM 越少，打字/滚动/流式输出越流畅），上滑到顶自动展开更早的
+  const PAGE = 40;
+  let shown = $state(PAGE);
+  const items = $derived(chat?.items ?? []);
+  const hiddenLocal = $derived(Math.max(0, items.length - shown));
+  const visible = $derived(hiddenLocal ? items.slice(hiddenLocal) : items);
+  let expanding = false;
+
+  async function showEarlier() {
+    if (expanding || !listEl) return;
+    const omitted = chat?.omitted ?? 0;
+    if (!hiddenLocal && !omitted) return;
+    expanding = true;
+    const before = listEl.scrollHeight - listEl.scrollTop;
+    try {
+      if (hiddenLocal) shown += PAGE;
+      else {
+        const prevLen = items.length;
+        if (await loadEarlier(key)) shown = Math.max(PAGE, items.length - prevLen + shown);
+      }
+      await tick();
+      // 保持当前阅读位置不跳动
+      if (listEl) listEl.scrollTop = listEl.scrollHeight - before;
+    } finally {
+      expanding = false;
+    }
+  }
+
   // 草稿按会话保存，切换上下文 / Agent 不丢
   let draftKey = "";
   $effect(() => {
@@ -24,15 +52,26 @@
     if (k === draftKey) return;
     draftKey = k;
     try { text = localStorage.getItem(DRAFT + k) ?? ""; } catch { text = ""; }
+    shown = PAGE;
     stick = true;
     void tick().then(() => { autosize(); scrollBottom(); });
   });
-  function saveDraft() { try { if (text) localStorage.setItem(DRAFT + key, text); else localStorage.removeItem(DRAFT + key); } catch { /* ignore */ } }
+  function saveDraftNow() {
+    if (draftTimer) { clearTimeout(draftTimer); draftTimer = null; }
+    try { if (text) localStorage.setItem(DRAFT + key, text); else localStorage.removeItem(DRAFT + key); } catch { /* ignore */ }
+  }
+  // 打字时节流写 localStorage（同步 IO，长草稿每键都写会卡）
+  let draftTimer: ReturnType<typeof setTimeout> | null = null;
+  function saveDraft() {
+    if (draftTimer) clearTimeout(draftTimer);
+    draftTimer = setTimeout(saveDraftNow, 400);
+  }
 
   function scrollBottom() { if (listEl) listEl.scrollTop = listEl.scrollHeight; }
   function onScroll() {
     if (!listEl) return;
     stick = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 80;
+    if (listEl.scrollTop < 120 && hiddenLocal) void showEarlier();
   }
   // 内容高度变化（流式输出 / Markdown 渲染）时，贴底则保持贴底
   $effect(() => {
@@ -42,10 +81,19 @@
     return () => ro.disconnect();
   });
 
+  // 浏览器原生支持按内容自适应高度时（field-sizing）不再用 JS 测量；否则合并到下一帧测量一次，
+  // 避免每个按键都强制整页重排
+  const nativeSize = typeof CSS !== "undefined" && CSS.supports?.("field-sizing", "content");
+  let sizeRaf = 0;
   function autosize() {
-    if (!taEl) return;
-    taEl.style.height = "auto";
-    taEl.style.height = Math.min(taEl.scrollHeight, Math.round(window.innerHeight * 0.4)) + "px";
+    if (nativeSize || !taEl || sizeRaf) return;
+    sizeRaf = requestAnimationFrame(() => {
+      sizeRaf = 0;
+      if (!taEl) return;
+      const max = Math.round(window.innerHeight * 0.4);
+      taEl.style.height = "auto";
+      taEl.style.height = Math.min(taEl.scrollHeight, max) + "px";
+    });
   }
 
   const coarse = typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches;
@@ -64,11 +112,11 @@
     sending = true;
     stick = true;
     text = "";
-    saveDraft();
+    saveDraftNow();
     await tick();
     autosize();
     const ok = await sendMessage(t);
-    if (!ok) { text = t; saveDraft(); await tick(); autosize(); }
+    if (!ok) { text = t; saveDraftNow(); await tick(); autosize(); }
     sending = false;
   }
 
@@ -131,7 +179,15 @@
           <div class="faint">{agentName} · {ctx.name}</div>
         </div>
       {:else}
-        {#each chat?.items ?? [] as it (it.id)}<MessageView item={it} />{/each}
+        {#if hiddenLocal || chat?.omitted}
+          <div class="earlier">
+            <button class="btn sm" disabled={chat?.loading || chat?.syncing} onclick={() => void showEarlier()}>
+              {#if chat?.loading || chat?.syncing}<span class="spin"></span>{/if}
+              显示更早的消息（{hiddenLocal + (chat?.omitted ?? 0)} 条）
+            </button>
+          </div>
+        {/if}
+        {#each visible as it (it.id)}<MessageView item={it} />{/each}
         {#if chat?.running && !chat.items[chat.items.length - 1]?.streaming}
           <div class="working"><span class="spin"></span><span>{agentName} 正在处理…</span></div>
         {/if}
@@ -148,6 +204,7 @@
         placeholder={ctx ? `给 ${agentName} 发消息${coarse ? "" : "（Enter 发送，Shift+Enter 换行）"}` : "请先选择上下文"}
         disabled={!ctx || !ui.agent}
         oninput={() => { autosize(); saveDraft(); }}
+        onblur={saveDraftNow}
         onkeydown={onKey}
       ></textarea>
       {#if chat?.running}
@@ -186,7 +243,8 @@
   }
   .box:focus-within { border-color: var(--accent); }
   .box.disabled { opacity: .6; }
-  textarea { flex: 1; border: none; outline: none; background: transparent; resize: none; max-height: 40vh; padding: 7px 0; line-height: 1.5; font-size: 15px; min-height: 36px; }
+  .earlier { display: flex; justify-content: center; padding: 4px 0 10px; }
+  textarea { field-sizing: content; flex: 1; border: none; outline: none; background: transparent; resize: none; max-height: 40vh; padding: 7px 0; line-height: 1.5; font-size: 15px; min-height: 36px; }
   .send { width: 38px; height: 38px; border-radius: 50%; background: var(--accent); color: var(--accent-contrast); display: grid; place-items: center; flex: none; }
   .send:disabled { opacity: .4; cursor: default; }
   .send.stop { background: var(--danger); color: #fff; }

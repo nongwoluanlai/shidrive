@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tick, untrack } from "svelte";
+  import { prepareImage, MAX_IMAGES } from "../images";
   import { app, chatKey, currentContext, finishTurn, setChatRows, pushLocal, toast, clearChat, sharedContextPrompt, switchAgent, loadChatLocal, saveCfgPref, fullAccessDefault, touchChat, nextId, adoptBinding, invalidateBindingRead, addDraftImage, clearDraftImages } from "../state.svelte";
 import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { api } from "../ipc";
@@ -1333,21 +1334,34 @@ import type { DisplayItem } from "../state.svelte";
   // ---------- 图片粘贴 ----------
   // ACP prompt 支持图片内容块：codex-acp 转 data-url，zcode-acp-server
   // 走 base64 附件，两侧均支持，粘贴后随文本一起发送。
+  // 多图：粘贴 / 「🖼」选择多张；统一预处理（格式、尺寸、体量），按选择顺序加入。
+  // 不支持图片输入的适配器由后端改为落盘并在文本中给出路径。
+  async function attachImages(files: File[]) {
+    const imgs = files.filter((f) => f.type.startsWith("image/"));
+    if (!imgs.length) return;
+    const attachmentKey = key;
+    const attachmentRevision = app.draftImageRev[attachmentKey] ?? 0;
+    const room = MAX_IMAGES - (app.draftImages[attachmentKey]?.length ?? 0);
+    if (room <= 0) { toast("warn", t("每条消息最多附带 {n} 张图片", { n: MAX_IMAGES })); return; }
+    if (imgs.length > room) toast("warn", t("每条消息最多附带 {n} 张图片，多余的已忽略", { n: MAX_IMAGES }));
+    const results = await Promise.allSettled(imgs.slice(0, room).map((f) => prepareImage(f)));
+    for (const r of results) {
+      if (r.status === "fulfilled") addDraftImage(attachmentKey, r.value, attachmentRevision);
+      else toast("error", t(String((r.reason as Error)?.message ?? r.reason)));
+    }
+  }
   function onPaste(e: ClipboardEvent) {
     const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith("image/"));
     if (!files.length) return;
     e.preventDefault();
-    const attachmentKey = key;
-    const attachmentRevision = app.draftImageRev[attachmentKey] ?? 0;
-    for (const f of files.slice(0, 4)) {
-      const rd = new FileReader();
-      rd.onload = () => {
-        const url = String(rd.result ?? "");
-        const data = url.split(",")[1] ?? "";
-        if (data) addDraftImage(attachmentKey, { data, mime: f.type, preview: url }, attachmentRevision);
-      };
-      rd.readAsDataURL(f);
-    }
+    void attachImages(files);
+  }
+  let imagePicker = $state<HTMLInputElement | null>(null);
+  function onPickImages(e: Event) {
+    const el = e.target as HTMLInputElement;
+    const files = Array.from(el.files ?? []);
+    el.value = "";
+    void attachImages(files);
   }
   function removeImage(i: number) {
     app.draftImages[key]?.splice(i, 1);
@@ -1584,6 +1598,8 @@ import type { DisplayItem } from "../state.svelte";
       onpaste={onPaste}
       oncontextmenu={onInputContext}
     ></textarea>
+    <input class="img-picker" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" multiple bind:this={imagePicker} onchange={onPickImages} />
+    <button class="btn ghost sched-btn" title={t("添加图片（可多选，最多 {n} 张）", { n: MAX_IMAGES })} disabled={!ctx} onclick={() => imagePicker?.click()}>🖼</button>
     <button class="btn ghost sched-btn" class:on={schedOpen} title={t("定时发送：到点自动发送输入框里的文字（回答中会等本回合结束）")} disabled={!ctx} onclick={openSched}>⏰</button>
     {#if streaming}
       <button class="btn danger" onclick={stop}>■ {t("停止")}</button>
@@ -1810,6 +1826,7 @@ import type { DisplayItem } from "../state.svelte";
   .cfg-select:hover {
     border-color: var(--accent);
   }
+  .img-picker { display: none; }
   .thumbs {
     position: absolute;
     left: 12px;

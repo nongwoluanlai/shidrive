@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use agent_client_protocol::schema::v1::{McpServer, McpServerHttp, ContentBlock, TextContent, ImageContent};
+use agent_client_protocol::schema::v1::{McpServer, McpServerHttp, McpServerStdio, ContentBlock, TextContent, ImageContent};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::RwLock;
 
@@ -66,6 +66,28 @@ mod audit_tests {
     /// v0.3.9 把 cap_str 也套在 tools 行上：JSON 数组字符串被从中间掐断后前端
     /// JSON.parse 失败 → 整个工具块从聊天里消失。工具行必须始终是合法 JSON，
     /// 体量靠逐条瘦身（acp::compact_tool_update）而不是掐断字符串来控制。
+    #[test]
+    fn context_hint_is_stripped_and_transport_chosen() {
+        let s = "帮我看看\n\n<shidrive-context>\n（使驾提示）项目「P」\n</shidrive-context>";
+        assert_eq!(strip_context_hint(s), "帮我看看");
+        assert_eq!(strip_context_hint("无标记"), "无标记");
+        let rows = replay_to_messages(&[
+            json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": s } }),
+            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "好" } }),
+        ]);
+        assert_eq!(rows[0], ("user".to_string(), "帮我看看".to_string()));
+        assert_eq!(mcp_transport_for(None), McpTransport::Http);
+        assert_eq!(mcp_transport_for(Some(&json!({"http": true}))), McpTransport::Http);
+        assert_eq!(mcp_transport_for(Some(&json!({"http": false, "sse": false}))), McpTransport::Stdio);
+        assert_eq!(url_component("a b/c"), "a%20b%2Fc");
+        assert!(prompt_images_supported(&Value::Null));
+        assert!(prompt_images_supported(&json!({"agentCapabilities":{"promptCapabilities":{"image":true}}})));
+        assert!(!prompt_images_supported(&json!({"agentCapabilities":{"promptCapabilities":{"image":false}}})));
+        assert!(!prompt_images_supported(&json!({"agentCapabilities":{}})));
+        assert_eq!(b64_decode("aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(b64_decode("aGk").unwrap(), b"hi");
+    }
+
     #[test]
     fn replay_tool_rows_stay_valid_json_and_bounded() {
         let big = "y".repeat(crate::acp::TOOL_OUTPUT_MAX_BYTES * 4);
@@ -165,6 +187,8 @@ pub struct AgentManager {
     bind_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Every entry point uses the same (connection generation, actual SID) lock.
     prompt_locks: std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// 本次运行中已附加过完整会话说明的会话（agent:sid），之后只附加简短提示。
+    primed: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl AgentManager {
@@ -179,7 +203,7 @@ impl AgentManager {
                 }
             }
         }
-        Self { app, db, tools, conns: RwLock::new(HashMap::new()), overrides: RwLock::new(overrides), connection_locks: std::sync::Mutex::new(HashMap::new()), bind_locks: std::sync::Mutex::new(HashMap::new()), prompt_locks: std::sync::Mutex::new(HashMap::new()) }
+        Self { app, db, tools, conns: RwLock::new(HashMap::new()), overrides: RwLock::new(overrides), connection_locks: std::sync::Mutex::new(HashMap::new()), bind_locks: std::sync::Mutex::new(HashMap::new()), prompt_locks: std::sync::Mutex::new(HashMap::new()), primed: std::sync::Mutex::new(Default::default()) }
     }
 
     fn prompt_lock(&self, conn: &AcpConnection, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -195,6 +219,11 @@ impl AgentManager {
     pub fn mcp_url(&self) -> String {
         let port = crate::mcp::port_from_settings(&self.db);
         format!("http://127.0.0.1:{port}/mcp")
+    }
+
+    /// 会话绑定的 MCP 地址：工具缺省参数落到该会话的上下文 / 项目。
+    pub fn mcp_url_for(&self, context: &Context, agent_type: &str) -> String {
+        format!("{}?ctx={}&agent={}", self.mcp_url(), url_component(&context.id), url_component(agent_type))
     }
 
     fn connection_lock(&self, agent_type: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -594,28 +623,53 @@ impl AgentManager {
     /// mcpServers for session/new: inject the ShiDrive MCP endpoint when the
     /// adapter supports HTTP MCP (or hasn't declared a capability). Other agents
     /// retain their old retry without MCP; DeepSeek preserves the first error.
-    fn mcp_servers_param(&self, conn: &AcpConnection) -> Vec<McpServer> {
+    fn mcp_servers_param(&self, conn: &AcpConnection, context: &Context) -> Vec<McpServer> {
         if conn.mcp_degraded() {
             return vec![];
         }
-        let caps = &conn.agent_info.lock().unwrap();
-        let declared_http = caps
-            .get("agentCapabilities")
-            .and_then(|c| c.get("mcpCapabilities"))
-            .and_then(|m| m.get("http"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let no_mcp_caps = caps.get("agentCapabilities").and_then(|c| c.get("mcpCapabilities")).is_none();
-        if declared_http || no_mcp_caps {
-            vec![McpServer::Http(McpServerHttp::new("shidrive", self.mcp_url()))]
-        } else {
-            vec![]
+        let url = self.mcp_url_for(context, &conn.agent_type);
+        let mode = {
+            let caps = conn.agent_info.lock().unwrap();
+            mcp_transport_for(caps.get("agentCapabilities").and_then(|c| c.get("mcpCapabilities")))
+        };
+        match mode {
+            McpTransport::Http => vec![McpServer::Http(McpServerHttp::new("shidrive", url))],
+            // ACP 规范要求所有 Agent 支持 stdio MCP：未声明 http 的适配器改用
+            // 「shidrive --mcp-stdio <url>」桥接到同一个本机 HTTP 端点。
+            McpTransport::Stdio => match std::env::current_exe() {
+                Ok(exe) => vec![McpServer::Stdio(McpServerStdio::new("shidrive", exe).args(vec!["--mcp-stdio".to_string(), url]))],
+                Err(_) => vec![],
+            },
         }
+    }
+
+    /// 是否已为该会话注入使驾 MCP（决定提示词里是否要求调用工具）。
+    fn session_has_mcp(&self, conn: &AcpConnection, context: &Context) -> bool {
+        !self.mcp_servers_param(conn, context).is_empty()
+    }
+
+    /// 聊天消息附加的会话说明（类似系统提示词）：首轮完整、之后简短。
+    /// 设置 agent.context_hint=0 可关闭。
+    fn context_hint_for(&self, conn: &AcpConnection, context: &Context, sid: &str) -> Option<String> {
+        if self.db.get_setting("agent.context_hint").ok().flatten().as_deref() == Some("0") {
+            return None;
+        }
+        let info = crate::mcp::bound_info(&self.db, &context.id)?;
+        let with_tools = self.session_has_mcp(conn, context);
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        let key = format!("{}:{sid}", conn.agent_type);
+        let first = self.primed.lock().unwrap().insert(key);
+        let body = if first {
+            crate::mcp::session_brief(&info, &conn.agent_type, &now, with_tools)
+        } else {
+            crate::mcp::turn_hint(&info, &now, with_tools)
+        };
+        Some(format!("{CONTEXT_TAG_OPEN}\n{body}\n{CONTEXT_TAG_CLOSE}"))
     }
 
     async fn session_new_impl(&self, conn: &AcpConnection, context: &Context) -> Result<(String, Value), String> {
         let cwd = self.project_root_for(context);
-        let with_mcp = self.mcp_servers_param(conn);
+        let with_mcp = self.mcp_servers_param(conn, context);
         let res = conn
             .new_session(&cwd, with_mcp.clone())
             .await;
@@ -673,7 +727,7 @@ impl AgentManager {
                     if !conn.is_loaded(&sid) {
                         // Preserve the old binding and snapshot on transient load
                         // failures; never silently replace it with an empty session.
-                        conn.load_session(&sid, &cwd, self.mcp_servers_param(&conn)).await?;
+                        conn.load_session(&sid, &cwd, self.mcp_servers_param(&conn, context)).await?;
                     }
                 }
                 if emit_ready {
@@ -742,6 +796,7 @@ impl AgentManager {
     async fn load_with_capture(
         &self,
         conn: &Arc<AcpConnection>,
+        context: &Context,
         session_id: &str,
         cwd: &str,
     ) -> Result<Vec<(String, String)>, String> {
@@ -749,7 +804,7 @@ impl AgentManager {
         impl Drop for CaptureGuard<'_> { fn drop(&mut self) { self.0.abort_capture(self.1); } }
         conn.begin_capture(session_id);
         let _capture = CaptureGuard(conn, session_id);
-        let res = conn.load_session(session_id, cwd, self.mcp_servers_param(conn)).await;
+        let res = conn.load_session(session_id, cwd, self.mcp_servers_param(conn, context)).await;
         let updates = conn.end_capture(session_id).await;
         match &res {
             Ok(resp) => {
@@ -784,7 +839,7 @@ impl AgentManager {
         let _session = session_lock.lock().await;
         // Empty replay is a valid result. Never kill other sessions to manufacture
         // history, and never capture notifications from an active prompt.
-        let loaded = self.load_with_capture(&conn, session_id, &cwd).await?;
+        let loaded = self.load_with_capture(&conn, context, session_id, &cwd).await?;
         let rows: Vec<ReplayRow> = loaded
             .into_iter()
             .map(|(role, content)| ReplayRow { role, content })
@@ -818,7 +873,7 @@ impl AgentManager {
         let session_lock = self.prompt_lock(&conn, &sid);
         let _session = session_lock.lock().await;
         let rows = self
-            .load_with_capture(&conn, &sid, &cwd)
+            .load_with_capture(&conn, context, &sid, &cwd)
             .await?
             .into_iter()
             .map(|(role, content)| ReplayRow { role, content })
@@ -871,7 +926,32 @@ impl AgentManager {
         let lock = self.prompt_lock(&conn, &sid);
         let session_guard = lock.lock_owned().await;
         if !conn.is_alive() { return Err("适配器连接已断开，请重试".into()); }
-        if !conn.is_loaded(&sid) { conn.load_session(&sid, &cwd, self.mcp_servers_param(&conn)).await?; }
+        if !conn.is_loaded(&sid) { conn.load_session(&sid, &cwd, self.mcp_servers_param(&conn, context)).await?; }
+        // 会话说明附在用户文本之后（标题仍取自用户原话）；重放历史时会剥掉
+        let hint = if source == "chat" { self.context_hint_for(&conn, context, &sid) } else { None };
+        // 适配器未声明 promptCapabilities.image 时（ACP 规定此时不得发送图片块），
+        // 把图片落到临时目录并在文本里给出路径，Agent 可用自己的读图/读文件工具查看。
+        let image_ok = prompt_images_supported(&conn.agent_info.lock().unwrap());
+        let mut extra = String::new();
+        let images: &[crate::models::PromptImage] = if !images.is_empty() && !image_ok {
+            let paths = save_prompt_images(images);
+            if !paths.is_empty() {
+                extra = format!(
+                    "\n\n[用户附带了 {} 张图片；当前 Agent 不支持直接接收图片，已保存为本地文件：\n{}\n请用读取文件/查看图片的工具打开]",
+                    paths.len(),
+                    paths.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n")
+                );
+            }
+            &[]
+        } else {
+            images
+        };
+        let mut full = String::from(text);
+        full.push_str(&extra);
+        if let Some(h) = hint {
+            if full.is_empty() { full = h; } else { full.push_str("\n\n"); full.push_str(&h); }
+        }
+        let text: &str = &full;
         let turn_id = request_id.filter(|id| !id.is_empty()).map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         conn.begin_turn(&sid, &context.id, &turn_id, source)?;
@@ -1054,6 +1134,96 @@ fn cap_str(s: String) -> String {
     )
 }
 
+const CONTEXT_TAG_OPEN: &str = "<shidrive-context>";
+const CONTEXT_TAG_CLOSE: &str = "</shidrive-context>";
+
+/// 去掉使驾附加的会话说明块（重放历史时展示用户原话）。
+pub(crate) fn strip_context_hint(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find(CONTEXT_TAG_OPEN) {
+        out.push_str(&rest[..i]);
+        match rest[i..].find(CONTEXT_TAG_CLOSE) {
+            Some(j) => rest = &rest[i + j + CONTEXT_TAG_CLOSE.len()..],
+            None => { rest = ""; break; }
+        }
+    }
+    out.push_str(rest);
+    if out.len() == s.len() { return out; }
+    out.trim_end().to_string()
+}
+
+/// 适配器是否声明支持图片输入。未完成 initialize（无能力信息）时保持原行为直接发送。
+fn prompt_images_supported(info: &Value) -> bool {
+    match info.get("agentCapabilities") {
+        None | Some(Value::Null) => true,
+        Some(c) => c.get("promptCapabilities").and_then(|p| p.get("image")).and_then(Value::as_bool).unwrap_or(false),
+    }
+}
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a' + 26) as u32,
+            b'0'..=b'9' => (c - b'0' + 52) as u32,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        })
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=').collect();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let mut acc = 0u32;
+        for (i, c) in chunk.iter().enumerate() { acc |= val(*c)? << (18 - 6 * i as u32); }
+        out.push((acc >> 16) as u8);
+        if chunk.len() > 2 { out.push((acc >> 8) as u8); }
+        if chunk.len() > 3 { out.push(acc as u8); }
+    }
+    Some(out)
+}
+
+/// 图片落盘到 %TEMP%\shidrive-attachments（顺手清理 3 天前的旧文件），返回路径。
+fn save_prompt_images(images: &[crate::models::PromptImage]) -> Vec<String> {
+    let dir = std::env::temp_dir().join("shidrive-attachments");
+    if std::fs::create_dir_all(&dir).is_err() { return Vec::new(); }
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        let cutoff = std::time::SystemTime::now() - Duration::from_secs(3 * 86400);
+        for e in rd.flatten() {
+            if e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < cutoff) { let _ = std::fs::remove_file(e.path()); }
+        }
+    }
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..6];
+    images.iter().enumerate().filter_map(|(i, img)| {
+        let ext = match img.mime.as_str() { "image/jpeg" | "image/jpg" => "jpg", "image/gif" => "gif", "image/webp" => "webp", "image/bmp" => "bmp", _ => "png" };
+        let data = b64_decode(&img.data)?;
+        let path = dir.join(format!("{stamp}-{tag}-{}.{ext}", i + 1));
+        std::fs::write(&path, data).ok()?;
+        Some(path.to_string_lossy().to_string())
+    }).collect()
+}
+
+#[derive(Debug, PartialEq)]
+enum McpTransport { Http, Stdio }
+
+/// mcpCapabilities 缺失 → http（沿用旧行为）；声明 http → http；否则 stdio（ACP 必备）。
+fn mcp_transport_for(mcp_caps: Option<&Value>) -> McpTransport {
+    match mcp_caps {
+        None | Some(Value::Null) => McpTransport::Http,
+        Some(m) if m.get("http").and_then(Value::as_bool).unwrap_or(false) => McpTransport::Http,
+        Some(_) => McpTransport::Stdio,
+    }
+}
+
+fn url_component(s: &str) -> String {
+    s.bytes().map(|b| match b {
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+        _ => format!("%{b:02X}"),
+    }).collect()
+}
+
 fn replay_to_messages(updates: &[Value]) -> Vec<(String, String)> {
     fn text_of(content: &Value) -> String {
         match content {
@@ -1075,7 +1245,10 @@ fn replay_to_messages(updates: &[Value]) -> Vec<(String, String)> {
     macro_rules! flush {
         ($out:expr, $user:expr, $thought:expr, $assistant:expr, $tools:expr) => {
             if !$user.is_empty() {
-                $out.push(("user".to_string(), cap_str(std::mem::take(&mut $user))));
+                let u = strip_context_hint(&std::mem::take(&mut $user));
+                if !u.is_empty() {
+                    $out.push(("user".to_string(), cap_str(u)));
+                }
             }
             if !$thought.is_empty() {
                 $out.push(("thought".to_string(), cap_str(std::mem::take(&mut $thought))));

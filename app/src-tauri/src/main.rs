@@ -126,11 +126,54 @@ fn raise_main_window(app: &tauri::AppHandle) {
     }
 }
 
+fn mcp_stdio_bridge(url: &str) -> i32 {
+    use std::io::{BufRead, Write};
+    if !url.starts_with("http://127.0.0.1:") && !url.starts_with("http://localhost:") {
+        eprintln!("--mcp-stdio 需要本机 MCP 地址，例如 http://127.0.0.1:8345/mcp");
+        return 2;
+    }
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(600)).build();
+    let mut session: Option<String> = None;
+    let stdin = std::io::stdin();
+    let mut out = std::io::stdout();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let id = serde_json::from_str::<serde_json::Value>(line).ok().and_then(|v| v.get("id").cloned()).filter(|v| !v.is_null());
+        let mut req = agent.post(url)
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json, text/event-stream");
+        if let Some(s) = &session { req = req.set("Mcp-Session-Id", s); }
+        let body = match req.send_string(line) {
+            Ok(resp) => {
+                if let Some(s) = resp.header("Mcp-Session-Id") { session = Some(s.to_string()); }
+                resp.into_string().unwrap_or_default()
+            }
+            Err(ureq::Error::Status(_, resp)) => resp.into_string().unwrap_or_default(),
+            Err(e) => match &id {
+                Some(id) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":format!("使驾 MCP 服务不可达：{e}（请确认使驾正在运行）")}}).to_string(),
+                None => String::new(),
+            },
+        };
+        let body = body.trim();
+        if body.is_empty() || !body.starts_with('{') { continue; }
+        if writeln!(out, "{body}").and_then(|_| out.flush()).is_err() { break; }
+    }
+    0
+}
+
 fn main() {
     // 独立模式：shidrive.exe --coding-mcp [--port N] [--root DIR] [--token T] [--bind ADDR]
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--coding-mcp") {
         std::process::exit(coding_mcp::run(&argv));
+    }
+    // stdio MCP 桥：shidrive.exe --mcp-stdio <http://127.0.0.1:port/mcp?ctx=..>
+    // 供只支持 stdio MCP 的 ACP 适配器使用，逐行转发到本机 HTTP MCP 端点。
+    if let Some(i) = argv.iter().position(|a| a == "--mcp-stdio") {
+        let url = argv.get(i + 1).cloned().unwrap_or_default();
+        std::process::exit(mcp_stdio_bridge(&url));
     }
     // --debug：输出调试面板 + 日志写入文件（%APPDATA%\com.shidrive.desktop\logs\shidrive.log）
     let debug_mode = argv.iter().any(|a| a == "--debug" || a == "--debug=true");
