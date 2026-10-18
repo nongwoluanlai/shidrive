@@ -6,7 +6,7 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   import Icon from "./Icon.svelte";
   import type { MenuItem } from "./menu-item";
   import type { Edge, Workflow, WorkflowStep } from "../types";
-  import { scheduleText } from "./wf-shared";
+  import { runWorkflowInteractive, scheduleText } from "./wf-shared";
   import { t } from "../i18n";
 
   let showNewContext = $state(false);
@@ -248,26 +248,13 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     if (!w) return;
     const items: MenuItem[] = [
       { label: t("▶ 运行"), run: () => {
-          // 运行不切页：当前在会话页就留在会话页，仅提示结果
+          // 运行不切页：当前在会话页就留在会话页，仅提示结果；正在运行时询问是否停止后重跑
           if (app.tab === "workflows") app.workflowSelected = id;
-          api.workflowRun(id).then(() => toast("ok", t("已启动"))).catch((err) => toast("error", String(err)));
+          void runWorkflowInteractive(id);
       } },
       { label: t("↻ 重新执行"), run: () => {
-          void (async () => {
-            const act = await api.activeRuns();
-            const r = act.find((x) => x[1] === id);
-            if (r) {
-              await api.workflowStop(r[0]);
-              await new Promise((res) => setTimeout(res, 800));
-            }
-            if (app.tab === "workflows") app.workflowSelected = id;
-            try {
-              await api.workflowRun(id);
-              toast("ok", t("已重新执行"));
-            } catch (err) {
-              toast("error", String(err));
-            }
-          })();
+          if (app.tab === "workflows") app.workflowSelected = id;
+          void runWorkflowInteractive(id, { force: true });
       } },
       { label: t("■ 停止运行"), run: () => {
           void (async () => {

@@ -17,6 +17,8 @@ use crate::models::*;
 
 pub const EVT_WF_LOG: &str = "wf://log";
 pub const EVT_WF_STATUS: &str = "wf://status";
+/// 工作流被引擎删除（单次定时「执行后销毁」）
+pub const EVT_WF_DELETED: &str = "wf://deleted";
 
 pub use crate::schedule::{compute_next, fmt_time, parse_time};
 
@@ -126,6 +128,7 @@ impl Engine {
                         None => {
                             log::warn!("workflow {} ({}) has no future occurrence; disabling", w.name, w.id);
                             self.db.set_workflow_enabled(&w.id, false)?;
+                            crate::glog::warn("schedule", format!("定时工作流「{}」没有后续执行时间，已自动停用", w.name));
                         }
                     }
                 }
@@ -148,7 +151,21 @@ impl Engine {
                         retire,
                     )?;
                     if claimed {
-                        self.spawn_run(&w, "schedule");
+                        // 调度 tick 间隔 15s：迟到超过 90s 说明错过了计划时间（应用未运行 /
+                        // 系统休眠 / 上次运行占用），这里补执行一次并记入全局日志
+                        let late = (now - due).num_seconds();
+                        let when = fmt_time(due);
+                        if late > 90 {
+                            crate::glog::warn(
+                                "schedule",
+                                format!("定时工作流「{}」错过计划时间 {when}（迟到 {}），已补执行", w.name, fmt_late(late)),
+                            );
+                        } else {
+                            crate::glog::info("schedule", format!("定时工作流「{}」已触发（计划时间 {when}）", w.name));
+                        }
+                        if self.spawn_run(&w, "schedule").is_none() {
+                            crate::glog::warn("schedule", format!("定时工作流「{}」启动失败（已在运行或建档失败）", w.name));
+                        }
                     }
                 }
                 Some(_) => {}
@@ -228,6 +245,7 @@ impl Engine {
         let eng = self.clone();
         let wf = w.clone();
         let run_id2 = run_id.clone();
+        let trigger = trigger.to_string();
         tauri::async_runtime::spawn(async move {
             let _ = eng.app.emit(EVT_WF_STATUS, json!({ "runId": run_id2, "workflowId": wf.id, "status": "running" }));
             // 执行过程中任何 panic（例如模板/第三方库异常）都不能跳过下面的收尾：
@@ -249,11 +267,52 @@ impl Engine {
             let _ = eng.app.emit(EVT_WF_STATUS, json!({ "runId": run_id2, "workflowId": wf.id, "status": status }));
             eng.controls.lock().unwrap_or_else(|p| p.into_inner()).remove(&run_id2);
             eng.active.lock().unwrap_or_else(|p| p.into_inner()).remove(&wf.id);
+            if trigger == "schedule" {
+                eng.after_scheduled_run(&wf, &status);
+            }
             // One-shot schedules are retired when the run is *claimed* (tick_once), not
             // here: doing it on success only made failed/stopped runs repeat forever, and
             // writing back the stale `wf` copy clobbered edits made during the run.
         });
         Some(run_id)
+    }
+
+    /// 调度触发的运行结束后：记全局日志；单次定时且勾选「执行后销毁」的在成功后删除自身。
+    /// 以数据库里的最新版本为准（运行期间用户可能取消了勾选或改成了别的计划），
+    /// 失败 / 停止时保留，便于用户查看日志后手动处理。
+    fn after_scheduled_run(&self, wf: &Workflow, status: &str) {
+        let label = match status {
+            "success" => "成功",
+            "stopped" => "已停止",
+            _ => "失败",
+        };
+        crate::glog::push(
+            if status == "success" { "success" } else if status == "stopped" { "warn" } else { "error" },
+            "schedule",
+            format!("定时工作流「{}」运行结束：{label}", wf.name),
+        );
+        let fresh = match self.db.get_workflow(&wf.id) {
+            Ok(Some(w)) => w,
+            _ => return,
+        };
+        if !should_self_destroy(&fresh, status) {
+            if matches!(fresh.schedule, Some(ScheduleConfig::Once { delete_after_run: true, .. })) {
+                crate::glog::warn("schedule", format!("「{}」本次未成功，已保留（未执行销毁）", fresh.name));
+            }
+            return;
+        }
+        match self.db.delete_workflow(&fresh.id) {
+            Ok(()) => {
+                crate::glog::info("schedule", format!("单次工作流「{}」执行完成，已按「执行后销毁」删除", fresh.name));
+                let _ = self.app.emit(
+                    EVT_WF_DELETED,
+                    json!({ "workflowId": fresh.id, "projectId": fresh.project_id, "name": fresh.name }),
+                );
+            }
+            Err(e) => {
+                crate::glog::push("error", "schedule", format!("销毁工作流「{}」失败：{e}", fresh.name));
+            }
+        }
     }
 
     /// Execute the workflow graph. Nodes whose predecessors finished run in parallel.
@@ -894,6 +953,23 @@ fn step_name(step: &WorkflowStep, i: usize) -> String {
     }
 }
 
+/// 是否满足「执行后销毁」：仍是勾选了销毁的单次定时，且本次成功。
+fn should_self_destroy(w: &Workflow, status: &str) -> bool {
+    status == "success"
+        && w.trigger_type == "schedule"
+        && matches!(w.schedule, Some(ScheduleConfig::Once { delete_after_run: true, .. }))
+}
+
+fn fmt_late(secs: i64) -> String {
+    if secs >= 86_400 {
+        format!("{} 天 {} 小时", secs / 86_400, secs % 86_400 / 3600)
+    } else if secs >= 3600 {
+        format!("{} 小时 {} 分钟", secs / 3600, secs % 3600 / 60)
+    } else {
+        format!("{} 分钟", (secs + 59) / 60)
+    }
+}
+
 fn first_line(s: &str) -> String {
     let l = s.lines().next().unwrap_or("");
     if l.chars().count() > 60 {
@@ -908,6 +984,28 @@ fn first_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_destroy_only_for_successful_flagged_one_shots() {
+        let wf = |sched: serde_json::Value, trigger: &str| -> Workflow {
+            serde_json::from_value(json!({
+                "id": "w", "project_id": "p", "name": "n", "description": "", "enabled": false,
+                "trigger_type": trigger, "schedule": sched, "steps": [],
+                "last_run_at": null, "next_run_at": null, "created_at": "", "updated_at": ""
+            }))
+            .unwrap()
+        };
+        let on = json!({"kind": "once", "at": "2026-01-01 00:00", "delete_after_run": true});
+        let off = json!({"kind": "once", "at": "2026-01-01 00:00"});
+        assert!(should_self_destroy(&wf(on.clone(), "schedule"), "success"));
+        assert!(!should_self_destroy(&wf(on.clone(), "schedule"), "failed"));
+        assert!(!should_self_destroy(&wf(on.clone(), "schedule"), "stopped"));
+        assert!(!should_self_destroy(&wf(on, "manual"), "success"));
+        assert!(!should_self_destroy(&wf(off, "schedule"), "success"));
+        assert!(!should_self_destroy(&wf(json!({"kind": "daily", "time": "09:00"}), "schedule"), "success"));
+        assert_eq!(fmt_late(120), "2 分钟");
+        assert_eq!(fmt_late(3 * 3600 + 120), "3 小时 2 分钟");
+    }
 
     fn control() -> Arc<RunControl> {
         Arc::new(RunControl {

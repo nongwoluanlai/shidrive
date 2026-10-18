@@ -12,8 +12,33 @@ pub struct DirEntryInfo {
     pub mtime: String,
 }
 
+/// 目录路径归一化：去掉首尾空白与多余的尾部分隔符，但盘符根目录保留为 `X:\`。
+/// 裸 `X:` 在 Windows 上表示「该盘的当前工作目录」（对本进程而言通常是 exe 所在目录），
+/// 直接拿去 read_dir / current_dir 会列出错误的位置。空串保持为空。
+pub fn normalize_dir(p: &str) -> String {
+    let s = p.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    #[cfg(windows)]
+    let s = s.replace('/', "\\");
+    #[cfg(not(windows))]
+    let s = s.to_string();
+    let t = s.trim_end_matches(['\\', '/']);
+    if t.is_empty() {
+        // 纯分隔符（如 `\` 或 `/`）：保留一个
+        return s[..1].to_string();
+    }
+    let b = t.as_bytes();
+    if b.len() == 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        return format!("{t}\\");
+    }
+    t.to_string()
+}
+
 pub fn list_dir(path: &str) -> Result<Vec<DirEntryInfo>, String> {
     let mut entries = Vec::new();
+    let path = &normalize_dir(path);
     let rd = std::fs::read_dir(path).map_err(|e| format!("无法读取目录 {path}: {e}"))?;
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
@@ -107,7 +132,7 @@ pub fn delete_path(path: &str) -> Result<(), String> {
 
 pub fn open_in_explorer(path: &str) -> Result<(), String> {
     // 归一化分隔符（Markdown 里的路径常是正斜杠），避免 /select 静默失败
-    let normalized = path.replace('/', "\\");
+    let normalized = normalize_dir(&path.replace('/', "\\"));
     let p = std::path::Path::new(&normalized);
     if !p.exists() {
         return Err(format!("路径不存在: {normalized}"));
@@ -126,6 +151,7 @@ pub fn open_in_explorer(path: &str) -> Result<(), String> {
 }
 
 pub fn open_in_terminal(path: &str) -> Result<(), String> {
+    let path = &normalize_dir(path);
     let script = format!("Set-Location -LiteralPath '{}'; Clear-Host", path.replace('\'', "''"));
     let mut c = std::process::Command::new("powershell");
     new_console(&mut c);
@@ -136,10 +162,19 @@ pub fn open_in_terminal(path: &str) -> Result<(), String> {
 }
 
 /// Open cmd.exe kept open at the given directory.
+///
+/// 用进程工作目录（current_dir）定位，而不是拼 `cd /d "..."`：Rust 会把参数里的
+/// 双引号转义成 `\"`，cmd 不认这种转义，于是报「文件名、目录名或卷标语法不正确」。
 pub fn open_in_cmd(path: &str) -> Result<(), String> {
+    let dir = normalize_dir(path);
+    let p = std::path::Path::new(&dir);
+    if !p.is_dir() {
+        return Err(format!("目录不存在: {dir}"));
+    }
     let mut c = std::process::Command::new("cmd");
     new_console(&mut c);
-    c.args(["/D", "/K", &format!("cd /d \"{path}\"")])
+    c.current_dir(p)
+        .args(["/D", "/K"])
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("打开 cmd 失败: {e}"))
@@ -150,8 +185,9 @@ pub fn open_in_cmd(path: &str) -> Result<(), String> {
 /// 此前手写 `cmd /d /s /c` + 双重引号包裹的形式会被 cmd 误解析成网络路径
 /// 而静默失败（spawn 只启动了 cmd 本身，返回 Ok）。
 pub fn open_in_vscode(code_path: &str, dir: &str) -> Result<(), String> {
+    let dir = normalize_dir(dir);
     let mut c = std::process::Command::new(code_path);
-    c.arg(dir);
+    c.arg(&dir);
     #[cfg(windows)]
     {
         let lower = code_path.to_ascii_lowercase();
@@ -213,7 +249,7 @@ pub fn copy_to_clipboard(paths: &[String]) -> Result<(), String> {
 pub fn paste_from_clipboard(dest_dir: &str) -> Result<(), String> {
     let script = format!(
         "$d = Get-Clipboard -Format FileDropList; if ($d) {{ Copy-Item -LiteralPath $d.FullName -Destination '{}' -Recurse -Force }} else {{ Write-Error '剪贴板中没有文件' }}",
-        dest_dir.replace("'", "''")
+        normalize_dir(dest_dir).replace("'", "''")
     );
     let mut c = std::process::Command::new("powershell");
     let out = hide_window(&mut c)
@@ -229,7 +265,8 @@ pub fn paste_from_clipboard(dest_dir: &str) -> Result<(), String> {
 
 /// Open with the system default application (double-click behavior).
 pub fn open_default(path: &str) -> Result<(), String> {
-    open::that(path).map_err(|e| format!("打开失败: {e}"))
+    let path = normalize_dir(path);
+    open::that(&path).map_err(|e| format!("打开失败: {e}"))
 }
 
 /// 写文本到系统剪贴板（PowerShell Set-Clipboard）。
@@ -297,6 +334,15 @@ mod tests {
 
     fn entry(name: &str, is_dir: bool) -> DirEntryInfo {
         DirEntryInfo { name: name.into(), path: name.into(), is_dir, size: 0, mtime: String::new() }
+    }
+
+    #[test]
+    fn normalize_dir_keeps_drive_root() {
+        assert_eq!(normalize_dir("D:"), "D:\\");
+        assert_eq!(normalize_dir("D:\\"), "D:\\");
+        assert_eq!(normalize_dir(" d:\\\\ "), "d:\\");
+        assert_eq!(normalize_dir(""), "");
+        assert_eq!(normalize_dir("D:\\play\\x\\"), "D:\\play\\x");
     }
 
     #[test]

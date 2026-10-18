@@ -198,6 +198,59 @@
     }
   }
 
+  // ================= 全局搜索跳转 =================
+  // SearchPanel 打开文件后写入 app.editorJump：按「行(1起)+列(UTF-16)」换算成 textarea 偏移，
+  // 选中匹配并滚动到可视区域。像素位置用一个与 textarea 同排版的临时 div 测量（换行规则一致）。
+  let lastJumpSeq = -1;
+  function measureTop(offset: number): number {
+    if (!taEl) return 0;
+    const cs = getComputedStyle(taEl);
+    const div = document.createElement("div");
+    for (const k of MIRROR_PROPS) (div.style as unknown as Record<string, string>)[k] = cs[k] as string;
+    div.style.position = "absolute";
+    div.style.visibility = "hidden";
+    div.style.left = "-99999px";
+    div.style.top = "0";
+    div.style.width = taEl.clientWidth + "px";
+    div.style.borderStyle = "solid";
+    div.style.borderColor = "transparent";
+    div.textContent = taEl.value.slice(0, offset);
+    const mk = document.createElement("span");
+    mk.textContent = "\u200b";
+    div.appendChild(mk);
+    document.body.appendChild(div);
+    const top = mk.offsetTop;
+    div.remove();
+    return top;
+  }
+  $effect(() => {
+    const j = app.editorJump;
+    const path = ed?.path;
+    const el = taEl;
+    if (!j || !el || j.path !== path || j.seq === lastJumpSeq) return;
+    lastJumpSeq = j.seq;
+    void tick().then(() => {
+      if (!taEl) return;
+      const text = taEl.value;
+      let off = 0;
+      for (let ln = 1; ln < j.line; ln++) {
+        const nx = text.indexOf("\n", off);
+        if (nx < 0) break;
+        off = nx + 1;
+      }
+      const lineEnd = text.indexOf("\n", off);
+      const maxCol = (lineEnd < 0 ? text.length : lineEnd) - off;
+      const s = off + Math.min(Math.max(0, j.col), maxCol);
+      const e = Math.min(text.length, s + Math.max(0, j.len));
+      taEl.focus({ preventScroll: true });
+      taEl.setSelectionRange(s, e);
+      const top = measureTop(s);
+      taEl.scrollTop = Math.max(0, top - taEl.clientHeight / 3);
+      taEl.scrollLeft = 0;
+      syncScroll();
+    });
+  });
+
   // 查询/选项/文件变化：从光标处向后找第一个命中（与常见编辑器一致）；
   // 编辑内容本身不触发跳转，只刷新高亮
   let lastFindKey = "";

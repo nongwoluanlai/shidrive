@@ -138,7 +138,7 @@ export type ScheduleConfig =
   | { kind: "interval"; every_minutes: number }
   | { kind: "daily"; time: string }
   | { kind: "weekly"; weekdays: number[]; time: string }
-  | { kind: "once"; at: string };
+  | { kind: "once"; at: string; /** 执行后销毁：调度触发的运行成功后删除该工作流 */ delete_after_run?: boolean };
 
 export type WorkflowStep =
   | {
@@ -381,4 +381,38 @@ export interface NodeStat {
   ok: boolean;
   deepseek_ok: boolean;
   source: string;
+}
+
+/** 全局日志（标题栏日志面板；后端 glog.rs） */
+export interface GlobalLogEntry {
+  id: number;
+  time: string;
+  level: "info" | "warn" | "error" | "success" | string;
+  category: string;
+  message: string;
+}
+
+export interface SearchOpts {
+  root: string;
+  query: string;
+  mode: "files" | "content";
+  caseSensitive?: boolean;
+  wholeWord?: boolean;
+  regex?: boolean;
+  include?: string;
+  exclude?: string;
+  useIgnore?: boolean;
+  maxResults?: number;
+}
+export interface SearchFileHit { path: string; rel: string; score: number; indices: number[] }
+export interface SearchLineMatch { line: number; col: number; len: number; preview: string; pstart: number; plen: number }
+export interface SearchContentHit { path: string; rel: string; matches: SearchLineMatch[]; more: boolean }
+export interface SearchResult {
+  files: SearchFileHit[];
+  content: SearchContentHit[];
+  totalMatches: number;
+  searchedFiles: number;
+  truncated: boolean;
+  cancelled: boolean;
+  elapsedMs: number;
 }

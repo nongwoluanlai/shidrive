@@ -1316,7 +1316,7 @@ fn tools_for_caps(fs_read: bool, fs_write: bool, exec_allowed: bool, context_ena
         // 单授权强制覆盖 context_id；共享 OAuth 必须显式选择开放的 context_id。
         tools.push(serde_json::json!({ "name": "context_get", "description": "读取共享上下文完整内容（概述/待办/进展/注意/约束 + 当前版本号 version）", "inputSchema": { "type": "object", "properties": {} } }));
         tools.push(serde_json::json!({ "name": "context_get_version", "description": "轻量查询当前版本号与最近一次提交摘要", "inputSchema": { "type": "object", "properties": {} } }));
-        tools.push(serde_json::json!({ "name": "context_update", "description": "提交一轮共享上下文更新（git 式）。base_version 不匹配会被拒绝并提示重新读取合并", "inputSchema": { "type": "object", "properties": {
+        tools.push(serde_json::json!({ "name": "context_update", "description": "提交一轮共享上下文更新（git 式）。base_version 不匹配会被拒绝并提示重新读取合并。JSON 字符串里的 Windows 路径反斜杠须写成 \\\\（或改用 /），否则 \\t、\\n 等会被解析成控制字符（服务端会尽量还原路径中的误转义）", "inputSchema": { "type": "object", "properties": {
             "base_version": {"type":"integer","description":"必填：你读取内容时的版本号"},
             "summary": {"type":"string","description":"必填：本次提交摘要（做了哪些工作）"},
             "files": {"type":"array","items":{"type":"string"},"description":"本次改动的核心文件路径"},

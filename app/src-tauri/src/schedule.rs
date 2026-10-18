@@ -71,7 +71,7 @@ pub fn validate(sched: &ScheduleConfig) -> Result<(), String> {
             }
             parse_hhmm_strict(time).ok_or_else(|| format!("每周时间格式无效：「{time}」，应为 HH:MM"))?;
         }
-        ScheduleConfig::Once { at } => {
+        ScheduleConfig::Once { at, .. } => {
             if at.trim().is_empty() {
                 return Err("请填写单次执行时间".into());
             }
@@ -85,9 +85,9 @@ pub fn validate(sched: &ScheduleConfig) -> Result<(), String> {
 /// which may arrive as `YYYY-MM-DDTHH:MM` from the browser).
 pub fn normalize(sched: ScheduleConfig) -> ScheduleConfig {
     match sched {
-        ScheduleConfig::Once { at } => {
+        ScheduleConfig::Once { at, delete_after_run } => {
             let canonical = canonical_once(&at).unwrap_or(at);
-            ScheduleConfig::Once { at: canonical }
+            ScheduleConfig::Once { at: canonical, delete_after_run }
         }
         other => other,
     }
@@ -126,7 +126,7 @@ pub fn compute_next(sched: &ScheduleConfig, from: DateTime<Local>) -> Option<Dat
             }
             Some(from + ChronoDuration::weeks(1))
         }
-        ScheduleConfig::Once { at } => parse_time(at).filter(|t| *t > from),
+        ScheduleConfig::Once { at, .. } => parse_time(at).filter(|t| *t > from),
     }
 }
 
@@ -167,9 +167,9 @@ mod tests {
         // Regression: the UI sends `YYYY-MM-DDTHH:MM`; the old parser failed on the
         // `T` and silently scheduled the run one minute from now.
         let now = local("2026-09-26 10:00");
-        let sched = ScheduleConfig::Once { at: "2026-09-27T09:30".into() };
+        let sched = ScheduleConfig::Once { at: "2026-09-27T09:30".into(), delete_after_run: false };
         assert_eq!(compute_next(&sched, now), Some(local("2026-09-27 09:30")));
-        assert_eq!(normalize(sched), ScheduleConfig::Once { at: "2026-09-27 09:30".into() });
+        assert_eq!(normalize(sched), ScheduleConfig::Once { at: "2026-09-27 09:30".into(), delete_after_run: false });
     }
 
     #[test]
@@ -177,17 +177,28 @@ mod tests {
         // Regression: after firing (or when the time has passed / is unparsable)
         // a one-shot must not keep re-arming itself every scheduler tick.
         let now = local("2026-09-27 09:31");
-        assert_eq!(compute_next(&ScheduleConfig::Once { at: "2026-09-27 09:30".into() }, now), None);
-        assert_eq!(compute_next(&ScheduleConfig::Once { at: "2026-09-27 09:31".into() }, now), None);
-        assert_eq!(compute_next(&ScheduleConfig::Once { at: "".into() }, now), None);
-        assert_eq!(compute_next(&ScheduleConfig::Once { at: "garbage".into() }, now), None);
+        assert_eq!(compute_next(&ScheduleConfig::Once { at: "2026-09-27 09:30".into(), delete_after_run: false }, now), None);
+        assert_eq!(compute_next(&ScheduleConfig::Once { at: "2026-09-27 09:31".into(), delete_after_run: false }, now), None);
+        assert_eq!(compute_next(&ScheduleConfig::Once { at: "".into(), delete_after_run: false }, now), None);
+        assert_eq!(compute_next(&ScheduleConfig::Once { at: "garbage".into(), delete_after_run: false }, now), None);
+    }
+
+    #[test]
+    fn once_delete_after_run_flag_is_optional_and_round_trips() {
+        let old: ScheduleConfig = serde_json::from_str(r#"{"kind":"once","at":"2026-09-27 09:30"}"#).unwrap();
+        assert_eq!(old, ScheduleConfig::Once { at: "2026-09-27 09:30".into(), delete_after_run: false });
+        // 未勾选时不写入字段，旧数据/旧前端看到的 JSON 不变
+        assert_eq!(serde_json::to_string(&old).unwrap(), r#"{"kind":"once","at":"2026-09-27 09:30"}"#);
+        let on: ScheduleConfig =
+            serde_json::from_str(r#"{"kind":"once","at":"2026-09-27T09:30","delete_after_run":true}"#).unwrap();
+        assert_eq!(normalize(on), ScheduleConfig::Once { at: "2026-09-27 09:30".into(), delete_after_run: true });
     }
 
     #[test]
     fn validation_rejects_empty_or_malformed_schedules() {
-        assert!(validate(&ScheduleConfig::Once { at: "".into() }).is_err());
-        assert!(validate(&ScheduleConfig::Once { at: "27/09/2026".into() }).is_err());
-        assert!(validate(&ScheduleConfig::Once { at: "2026-09-27T09:30".into() }).is_ok());
+        assert!(validate(&ScheduleConfig::Once { at: "".into(), delete_after_run: false }).is_err());
+        assert!(validate(&ScheduleConfig::Once { at: "27/09/2026".into(), delete_after_run: false }).is_err());
+        assert!(validate(&ScheduleConfig::Once { at: "2026-09-27T09:30".into(), delete_after_run: false }).is_ok());
         assert!(validate(&ScheduleConfig::Interval { every_minutes: 0 }).is_err());
         assert!(validate(&ScheduleConfig::Interval { every_minutes: 1 }).is_ok());
         assert!(validate(&ScheduleConfig::Daily { time: "25:00".into() }).is_err());

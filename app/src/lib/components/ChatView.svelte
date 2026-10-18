@@ -8,6 +8,8 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { t } from "../i18n";
   import ContextMenu from "./ContextMenu.svelte";
   import ChatTimeline from "./ChatTimeline.svelte";
+  import { addScheduledSend, cancelScheduledSend, fmtAt, scheduledFor, sendScheduledNow } from "../scheduled-send.svelte";
+  import { loadAfterAction, saveAfterAction as persistAfterAction, DEFAULT_POPUP_MSG, type AfterActionCfg, type AfterActionKind } from "../events";
   import type { AgentType, Context, SessionReadyInfo } from "../types";
 import type { DisplayItem } from "../state.svelte";
 
@@ -845,6 +847,46 @@ import type { DisplayItem } from "../state.svelte";
     }
   }
 
+  // ---------- 定时发送 ----------
+  let schedOpen = $state(false);
+  let schedAt = $state("");
+  const mySched = $derived(scheduledFor(ctx?.id ?? null, app.agent));
+  function toLocalInput(ms: number): string {
+    const d = new Date(ms);
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+  function openSched() {
+    if (!schedOpen) schedAt = toLocalInput(Date.now() + 10 * 60_000);
+    schedOpen = !schedOpen;
+  }
+  function schedPlus(min: number) {
+    schedAt = toLocalInput(Date.now() + min * 60_000);
+  }
+  function scheduleSend() {
+    if (!ctx) return;
+    const text = input.trim();
+    if (!text) {
+      toast("warn", t("请先输入要定时发送的内容"));
+      return;
+    }
+    const at = new Date(schedAt).getTime();
+    if (!schedAt || Number.isNaN(at)) {
+      toast("warn", t("请选择发送时间"));
+      return;
+    }
+    if (at <= Date.now()) {
+      toast("warn", t("发送时间需晚于现在"));
+      return;
+    }
+    if (pendingImages.length) toast("warn", t("定时发送仅包含文字，图片已保留在输入框"));
+    addScheduledSend(ctx, app.agent, text, at);
+    input = "";
+    app.drafts[key] = "";
+    schedOpen = false;
+    toast("ok", t("将于 {at} 发送", { at: fmtAt(at) }));
+  }
+
   async function stop() {
     if (!ctx) return;
     try {
@@ -1189,24 +1231,11 @@ import type { DisplayItem } from "../state.svelte";
   }
 
   // ---------- 执行后动作（回合结束后触发；配置全局生效，存 localStorage） ----------
-  type AfterActionKind = "sound" | "shutdown" | "command";
-  let afterAction = $state<{ kind: AfterActionKind; cmd: string }>({ kind: "sound", cmd: "" });
+  let afterAction = $state<AfterActionCfg>(loadAfterAction());
 
-  $effect(() => {
-    // 挂载时读一次持久化配置（与 events.ts 的 loadAfterAction 同一存储）
-    try {
-      const raw = localStorage.getItem("shidrive.afterAction");
-      if (raw) {
-        const v = JSON.parse(raw);
-        if (v && (v.kind === "sound" || v.kind === "shutdown" || v.kind === "command")) {
-          afterAction = { kind: v.kind, cmd: typeof v.cmd === "string" ? v.cmd : "" };
-        }
-      }
-    } catch {}
-  });
-
-  function saveAfterAction() {
-    try { localStorage.setItem("shidrive.afterAction", JSON.stringify(afterAction)); } catch {}
+  function saveAfterActionUi() {
+    if (afterAction.kind === "popup" && !afterAction.msg.trim()) afterAction.msg = DEFAULT_POPUP_MSG;
+    persistAfterAction($state.snapshot(afterAction));
     if (afterAction.kind === "shutdown") toast("warn", t("回合结束后将安排关机（30 秒缓冲，cmd 执行 shutdown /a 可取消）"));
     else if (afterAction.kind === "command" && !afterAction.cmd.trim()) toast("warn", t("请填写要执行的 cmd 命令"));
   }
@@ -1401,7 +1430,7 @@ import type { DisplayItem } from "../state.svelte";
   </div>
 
   <div class="msgs-row">
-    <ChatTimeline {items} onJump={(id) => void scrollToItem(id, "start")} />
+    <ChatTimeline {items} scroller={listEl} onJump={(id) => void scrollToItem(id, "start")} />
     <!-- 键盘/滚轮/指针监听只用于识别「用户在滚动」（上翻缓冲），不是交互控件 -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div class="msgs" bind:this={listEl} onscroll={onScroll} onwheel={onMsgsWheel} onpointerdown={onMsgsPointerDown} onkeydown={onMsgsKeydown} ontouchmove={noteUserScroll} role="log">
@@ -1479,8 +1508,9 @@ import type { DisplayItem } from "../state.svelte";
   <div class="cfg-bar">
       <label class="cfg">
         <span class="cfg-label" title={t("回合结束（完成/中断）后自动执行")}>⚙ {t("执行后动作")}</span>
-        <select class="cfg-select" value={afterAction.kind} onchange={(e) => { afterAction.kind = (e.target as HTMLSelectElement).value as AfterActionKind; saveAfterAction(); }}>
+        <select class="cfg-select" value={afterAction.kind} onchange={(e) => { afterAction.kind = (e.target as HTMLSelectElement).value as AfterActionKind; saveAfterActionUi(); }}>
           <option value="sound">{t("声音提示")}</option>
+          <option value="popup">{t("弹窗提醒")}</option>
           <option value="shutdown">{t("关机")}</option>
           <option value="command">{t("执行命令")}</option>
         </select>
@@ -1490,8 +1520,17 @@ import type { DisplayItem } from "../state.svelte";
           class="cfg-cmd"
           placeholder={t("回合结束后执行的 cmd 命令，如 build.bat")}
           bind:value={afterAction.cmd}
-          onchange={saveAfterAction}
-          onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); saveAfterAction(); } }}
+          onchange={saveAfterActionUi}
+          onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); saveAfterActionUi(); } }}
+        />
+      {:else if afterAction.kind === "popup"}
+        <input
+          class="cfg-cmd"
+          placeholder={t("标题:内容，如 {p0}", { p0: DEFAULT_POPUP_MSG })}
+          title={t("回合结束后弹出系统通知（第一个冒号前为标题）；点击通知回到该会话")}
+          bind:value={afterAction.msg}
+          onchange={saveAfterActionUi}
+          onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); saveAfterActionUi(); } }}
         />
       {/if}
       {#each cfgItems as c (c.id)}
@@ -1506,6 +1545,31 @@ import type { DisplayItem } from "../state.svelte";
         {/each}
       </div>
     <div class="grow-handle" title={t("拖拽调整输入框高度")} onpointerdown={startResize}><span></span></div>
+    {#if mySched.length}
+      <div class="sched-list">
+        {#each mySched as s (s.id)}
+          <div class="sched-item" class:missed={s.status === "missed" || s.status === "failed"}>
+            <span class="sched-time">⏰ {fmtAt(s.at)}</span>
+            {#if s.note}<span class="sched-note">{s.note}</span>{/if}
+            <span class="sched-text" title={s.text}>{s.text}</span>
+            <button class="btn ghost sm" title={t("现在就发送这条")} onclick={() => sendScheduledNow(s.id)}>{t("立即发送")}</button>
+            <button class="btn ghost sm" onclick={() => cancelScheduledSend(s.id)}>{t("取消")}</button>
+          </div>
+        {/each}
+      </div>
+    {/if}
+    {#if schedOpen}
+      <div class="sched-bar">
+        <span>⏰ {t("定时发送")}</span>
+        <input class="input sm" type="datetime-local" bind:value={schedAt} />
+        <button class="btn ghost sm" onclick={() => schedPlus(10)}>+10{t("分钟")}</button>
+        <button class="btn ghost sm" onclick={() => schedPlus(30)}>+30{t("分钟")}</button>
+        <button class="btn ghost sm" onclick={() => schedPlus(60)}>+1{t("小时")}</button>
+        <span class="spacer"></span>
+        <button class="btn primary sm" disabled={!input.trim() || !ctx} onclick={scheduleSend}>{t("确定定时")}</button>
+        <button class="btn ghost sm" onclick={() => (schedOpen = false)}>{t("取消")}</button>
+      </div>
+    {/if}
     <div class="input-row">
     <textarea
       rows="3"
@@ -1520,6 +1584,7 @@ import type { DisplayItem } from "../state.svelte";
       onpaste={onPaste}
       oncontextmenu={onInputContext}
     ></textarea>
+    <button class="btn ghost sched-btn" class:on={schedOpen} title={t("定时发送：到点自动发送输入框里的文字（回答中会等本回合结束）")} disabled={!ctx} onclick={openSched}>⏰</button>
     {#if streaming}
       <button class="btn danger" onclick={stop}>■ {t("停止")}</button>
     {:else}
@@ -1803,6 +1868,55 @@ import type { DisplayItem } from "../state.svelte";
   }
   .composer:focus-within {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--border-soft));
+  }
+  .sched-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px 12px 0;
+  }
+  .sched-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-dim);
+    min-width: 0;
+  }
+  .sched-item.missed .sched-time,
+  .sched-item.missed .sched-note {
+    color: var(--warn);
+  }
+  .sched-time {
+    flex: none;
+    font-family: var(--mono);
+  }
+  .sched-note {
+    flex: none;
+    color: var(--text-faint);
+  }
+  .sched-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text);
+  }
+  .sched-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    padding: 6px 12px 0;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .sched-bar .spacer {
+    flex: 1;
+  }
+  .sched-btn.on {
+    color: var(--accent);
   }
   .input-row {
     display: flex;

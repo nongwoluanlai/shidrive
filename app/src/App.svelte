@@ -24,6 +24,10 @@
   import PromptsPanel from "./lib/components/PromptsPanel.svelte";
   import HistoryBindModal from "./lib/components/HistoryBindModal.svelte";
   import DialogHost from "./lib/components/DialogHost.svelte";
+  import SearchPanel from "./lib/components/SearchPanel.svelte";
+  import GlobalLogPanel from "./lib/components/GlobalLogPanel.svelte";
+  import { loadGlobalLog } from "./lib/global-log.svelte";
+  import { startScheduledSends } from "./lib/scheduled-send.svelte";
   import Icon from "./lib/components/Icon.svelte";
 import SkinCharacter from "./lib/components/SkinCharacter.svelte";
   import logo from "./assets/logo.png";
@@ -57,6 +61,50 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
     }
   }
 
+  // Alt+F：全局搜索（已打开时切换「文件 / 内容」模式）
+  function onGlobalKey(e: KeyboardEvent) {
+    if (e.isComposing || !e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    if (e.code !== "KeyF" && e.key.toLowerCase() !== "f") return;
+    if (!app.projectId || isNoProject(app.projectId)) return;
+    e.preventDefault();
+    if (!app.searchOpen) app.searchOpen = true;
+    else app.searchMode = app.searchMode === "files" ? "content" : "files";
+  }
+
+  // 右侧文件树宽度：拖动左边缘调整，持久化到 localStorage
+  const DOCK_KEY = "shidrive.fileDockWidth";
+  const DOCK_MIN = 180;
+  const dockMax = () => Math.max(DOCK_MIN, Math.floor(window.innerWidth * 0.5));
+  let dockWidth = $state(Math.min(Math.max(Number(localStorage.getItem(DOCK_KEY)) || 246, DOCK_MIN), 1200));
+  let dockDragging = $state(false);
+  let winW = $state(window.innerWidth);
+  function startDockDrag(e: PointerEvent) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const el = e.currentTarget as HTMLElement;
+    el.setPointerCapture(e.pointerId);
+    const startX = e.clientX;
+    const startW = dockWidth;
+    dockDragging = true;
+    const move = (ev: PointerEvent) => {
+      dockWidth = Math.round(Math.min(dockMax(), Math.max(DOCK_MIN, startW + (startX - ev.clientX))));
+    };
+    const up = () => {
+      dockDragging = false;
+      el.removeEventListener("pointermove", move);
+      el.removeEventListener("pointerup", up);
+      el.removeEventListener("pointercancel", up);
+      localStorage.setItem(DOCK_KEY, String(dockWidth));
+    };
+    el.addEventListener("pointermove", move);
+    el.addEventListener("pointerup", up);
+    el.addEventListener("pointercancel", up);
+  }
+  function resetDockWidth() {
+    dockWidth = 246;
+    localStorage.setItem(DOCK_KEY, "246");
+  }
+
   onMount(() => {
     document.addEventListener("contextmenu", blockMenu);
     void boot();
@@ -80,6 +128,7 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
 
   async function boot() {
     await wireEvents();
+    await loadGlobalLog();
     const t = await api.settingsGet("ui.theme").catch(() => null);
     if (t) {
       try {
@@ -125,6 +174,7 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
     await loadPrompts();
     loadCfgPrefs();
     app.ready = true;
+    startScheduledSends();
     for (const a of app.agents) {
       api
         .acpStatus(a.id)
@@ -136,6 +186,8 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
   // 编辑器仅与聊天共存；工作流等其他页面时自动让位（状态保留，回到聊天恢复显示）
   const editorVisible = $derived(!!app.editor && !app.editor.collapsed && app.tab === "chat");
 </script>
+
+<svelte:window onkeydown={onGlobalKey} bind:innerWidth={winW} />
 
 <div class="root">
   <TitleBar />
@@ -203,7 +255,9 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
       {/if}
     </div>
     {#if app.projectId && !isNoProject(app.projectId) && app.fileTreeOpen}
-      <aside class="filedock">
+      <aside class="filedock" class:dragging={dockDragging} style="width: {Math.min(dockWidth, Math.max(DOCK_MIN, Math.floor(winW * 0.5)))}px">
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="dock-handle" title={t("拖动调整宽度，双击恢复默认")} onpointerdown={startDockDrag} ondblclick={resetDockWidth}></div>
         <FileTree />
       </aside>
     {/if}
@@ -218,6 +272,8 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
 <PermissionDialog />
 <ElicitationDialog />
 <Toasts />
+<SearchPanel />
+<GlobalLogPanel />
 <DialogHost />
 <OAuthConsent />
 <!-- 皮肤人物：顶层悬浮于左下角，不占布局、不挡操作 -->
@@ -319,12 +375,28 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
     display: flex;
   }
   .filedock {
-    width: 246px;
+    position: relative;
     flex: none;
     border-left: 1px solid var(--border-soft);
     background: var(--bg-panel);
     display: flex;
     min-height: 0;
+  }
+  .dock-handle {
+    position: absolute;
+    left: -3px;
+    top: 0;
+    bottom: 0;
+    width: 6px;
+    cursor: col-resize;
+    z-index: 5;
+  }
+  .dock-handle:hover,
+  .filedock.dragging .dock-handle {
+    background: color-mix(in srgb, var(--accent) 35%, transparent);
+  }
+  .filedock.dragging {
+    user-select: none;
   }
   .welcome {
     flex: 1;

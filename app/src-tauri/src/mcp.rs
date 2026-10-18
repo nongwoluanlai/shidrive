@@ -402,7 +402,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "context_update",
-            "description": "提交一轮共享上下文更新（git 式）。base_version 不匹配当前版本会被拒绝并提示重新读取合并。",
+            "description": "提交一轮共享上下文更新（git 式）。base_version 不匹配当前版本会被拒绝并提示重新读取合并。JSON 字符串里的 Windows 路径反斜杠须写成 \\\\（或改用 /），否则 \\t、\\n 等会被解析成控制字符（服务端会尽量还原路径中的误转义）。",
             "inputSchema": { "type":"object", "required":["context_id","base_version","summary"], "properties":{
                 "context_id": {"type":"string"},
                 "base_version": {"type":"integer","description":"你读取内容时的版本号"},
@@ -460,7 +460,7 @@ fn tool_definitions() -> Value {
                 "edges": {"type":"array","description":"有向连线（无环）。写法任选：{\"from\":0,\"to\":1}、{\"source\":\"构建\",\"target\":\"测试\"}、[0,1]；端点可用索引或唯一的节点名。索引基于你传入的 steps。省略或 [] = 按顺序串联。所有无前驱节点会自动从开始节点并行起跑。并行示例（打包后同时上传和通知）：steps=[打包,上传,通知] edges=[[0,1],[0,2]]。"},
                 "auto_layout": {"type":"boolean","description":"强制按连线重新布局（默认仅在有节点未给坐标时布局）"},
                 "env": {"type":"object","description":"工作流级环境变量（值支持 {{date:格式}} 插值）"},
-                "schedule": {"type":"object","description":"定时调度 {\"kind\":\"interval|daily|weekly|once\", ...}；省略为手动"},
+                "schedule": {"type":"object","description":"定时调度 {\"kind\":\"interval|daily|weekly|once\", ...}；once 可加 \"delete_after_run\":true（成功执行后删除自身）；省略为手动"},
                 "description": {"type":"string"},
                 "enabled": {"type":"boolean","description":"默认 true"},
                 "project_name": {"type":"string"},
@@ -605,7 +605,7 @@ pub(crate) fn call_tool(state: &McpState, _app: &AppHandle, name: &str, args: &V
                     .map(|a| {
                         a.iter()
                             .filter_map(|e| {
-                                let content = e.get("content").and_then(|c| c.as_str())?.to_string();
+                                let content = repair_escapes(e.get("content").and_then(|c| c.as_str())?);
                                 Some(ScEntry {
                                     content: clamp_str(&content, MAX_ENTRY, "entry"),
                                     status: e.get("status").and_then(|s| s.as_str()).unwrap_or("open").to_string(),
@@ -617,8 +617,11 @@ pub(crate) fn call_tool(state: &McpState, _app: &AppHandle, name: &str, args: &V
                     .unwrap_or_default()
             };
             let patch = crate::db::ScPatch {
-                overview: updates.get("overview").and_then(|v| v.as_str()).map(|v| clamp_str(v, MAX_OVERVIEW, "overview")),
-                constraints: updates.get("constraints").and_then(|v| v.as_str()).map(|v| clamp_str(v, MAX_CONSTRAINTS, "constraints")),
+                overview: updates.get("overview").and_then(|v| v.as_str()).map(|v| clamp_str(&repair_escapes(v), MAX_OVERVIEW, "overview")),
+                constraints: updates
+                    .get("constraints")
+                    .and_then(|v| v.as_str())
+                    .map(|v| clamp_str(&repair_escapes(v), MAX_CONSTRAINTS, "constraints")),
                 todos: updates.get("todos").map(&conv),
                 progress: updates.get("progress").map(&conv),
                 notes: updates.get("notes").map(&conv),
@@ -626,8 +629,9 @@ pub(crate) fn call_tool(state: &McpState, _app: &AppHandle, name: &str, args: &V
             let files: Vec<String> = args
                 .get("files")
                 .and_then(|f| f.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).take(MAX_FILES).collect())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(repair_path)).take(MAX_FILES).collect())
                 .unwrap_or_default();
+            let summary = repair_escapes(&summary);
             let meta = crate::db::ScCommitMeta {
                 agent_type: args.get("agent_type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
                 session_id: args.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
@@ -688,6 +692,83 @@ pub(crate) fn call_tool(state: &McpState, _app: &AppHandle, name: &str, args: &V
 fn json_bytes(v: &Value) -> Value {
     // tools return text content; pass pretty JSON string
     Value::String(serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
+}
+
+// ---------- 反斜杠转义修复 ----------
+//
+// Agent 手写 JSON 时常把 Windows 路径里的 `\` 原样写出（应写 `\\`）。`\t` `\n` `\r` `\b` `\f`
+// 恰好是合法的 JSON 转义，于是 `D:\tools` 到达这里时已经变成了「D: + 制表符 + ools」。
+// 服务端无法拿到原始字节，只能按上下文启发式还原：
+// - 退格(0x08) / 换页(0x0C)：正常文本里不会出现，一律还原为 `\b` / `\f`；
+// - 制表符 / 孤立回车：两侧都是路径字符（字母数字 _ . - : \ / 等）时还原；
+// - 换行：两侧是路径字符、前面的词形似路径（含 `\` `/` 或以盘符开头），且后一个字符为
+//   小写字母/数字/下划线时才还原（避免把「路径结尾 + 正常换行」误伤）。
+// `files` 字段只放路径，其中的控制字符一律还原。
+
+fn is_path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ':' | '\\' | '/' | '~' | '$' | '%' | '@' | '+' | '#')
+}
+
+/// 前一个「词」（到空白/引号/括号为止）是否形似路径。
+fn prev_token_is_pathlike(chars: &[char], i: usize) -> bool {
+    let mut start = i;
+    while start > 0 {
+        let c = chars[start - 1];
+        if c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '(' | '（' | '「' | '[' | '<' | '，' | '：' | ',' | '=') {
+            break;
+        }
+        start -= 1;
+    }
+    let tok = &chars[start..i];
+    if tok.is_empty() {
+        return false;
+    }
+    let drive = tok.len() >= 2 && tok[0].is_ascii_alphabetic() && tok[1] == ':';
+    drive || tok.iter().any(|c| matches!(c, '\\' | '/'))
+}
+
+pub(crate) fn repair_escapes(s: &str) -> String {
+    if !s.chars().any(|c| matches!(c, '\t' | '\n' | '\r' | '\u{8}' | '\u{c}')) {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len() + 8);
+    for (i, &c) in chars.iter().enumerate() {
+        let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+        let next = chars.get(i + 1).copied();
+        let between_path = prev.is_some_and(is_path_char) && next.is_some_and(is_path_char);
+        match c {
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\t' if between_path => out.push_str("\\t"),
+            '\r' if between_path && next != Some('\n') => out.push_str("\\r"),
+            '\n' if between_path
+                && next.is_some_and(|n| n.is_ascii_lowercase() || n.is_ascii_digit() || n == '_')
+                && prev_token_is_pathlike(&chars, i) =>
+            {
+                out.push_str("\\n")
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// `files` 只放路径：其中的控制字符一律还原成被误解析前的转义序列。
+pub(crate) fn repair_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.trim().chars() {
+        match c {
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn clamp_str(s: &str, max: usize, field: &str) -> String {
@@ -925,5 +1006,35 @@ fn call_workflow_tool(state: &McpState, name: &str, args: &Value) -> Result<Valu
             })))
         }
         _ => tool_error(format!("未知工具 {name}。")),
+    }
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::*;
+
+    #[test]
+    fn restores_escapes_swallowed_inside_paths() {
+        assert_eq!(repair_escapes("目录 D:\tools\\tauri"), "目录 D:\\tools\\tauri");
+        assert_eq!(repair_escapes("D:play\test"), "D:play\\test");
+        assert_eq!(repair_escapes("D:\\play\tmp"), "D:\\play\\tmp");
+        assert_eq!(repair_escapes("D:\\play\nodes\\x"), "D:\\play\\nodes\\x");
+        assert_eq!(repair_escapes("C:\\x\repo"), "C:\\x\\repo");
+        assert_eq!(repair_escapes("a\u{8}in"), "a\\bin");
+        assert_eq!(repair_escapes("D:\\x\u{c}oo"), "D:\\x\\foo");
+    }
+
+    #[test]
+    fn keeps_real_whitespace() {
+        let text = "第一行\n第二行\n\t缩进\n- D:\\a\\b.rs\n- 下一条\r\n结束";
+        assert_eq!(repair_escapes(text), text);
+        assert_eq!(repair_escapes("路径 D:\\a\nNext"), "路径 D:\\a\nNext");
+        assert_eq!(repair_escapes("普通句子。\nabc"), "普通句子。\nabc");
+    }
+
+    #[test]
+    fn files_are_always_repaired() {
+        assert_eq!(repair_path("src\test.rs"), "src\\test.rs");
+        assert_eq!(repair_path(" app\nav.ts "), "app\\nav.ts");
     }
 }

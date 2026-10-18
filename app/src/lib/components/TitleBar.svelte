@@ -2,6 +2,7 @@
   import { t } from "../i18n";
   import { app, toast } from "../state.svelte";
   import Icon from "./Icon.svelte";
+  import { glog } from "../global-log.svelte";
   import logo from "../../assets/logo.png";
 
   let maximized = $state(false);
@@ -40,6 +41,12 @@
     </button>
     <button class="qbtn" class:active={app.overlay === "prompts"} title={t("常用提示词")} onclick={() => (app.overlay = app.overlay === "prompts" ? null : "prompts")}>
       <Icon name="prompts" size={15} /> {t("常用提示词")}
+    </button>
+    <button class="qbtn" class:active={app.overlay === "logs"} title={t("全局日志：定时任务触发、错过的计划等")} onclick={() => (app.overlay = app.overlay === "logs" ? null : "logs")}>
+      <Icon name="log" size={15} /> {t("日志")}
+      {#if glog.unread > 0 && app.overlay !== "logs"}
+        <span class="log-badge" class:alert={glog.unreadAlert > 0}>{glog.unread > 99 ? "99+" : glog.unread}</span>
+      {/if}
     </button>
     <span class="divider"></span>
     <button class="qbtn icon-only" class:active={app.settingsOpen} title={t("设置")} onclick={() => (app.settingsOpen = true)}>
@@ -128,6 +135,17 @@
     padding: 7px;
   }
   .consent-btn { color: var(--warn); }
+  .log-badge {
+    min-width: 16px;
+    padding: 0 5px;
+    border-radius: 8px;
+    font-size: 0.75em;
+    line-height: 16px;
+    text-align: center;
+    color: #fff;
+    background: var(--text-faint);
+  }
+  .log-badge.alert { background: var(--warn); }
   .consent-count { border-radius: 10px; padding: 0 6px; color: #fff; background: var(--warn); }
   .divider {
     width: 1px;

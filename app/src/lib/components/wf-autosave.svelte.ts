@@ -39,7 +39,7 @@ function markClean(id: string) {
 }
 
 function canonicalSchedule(s: ScheduleConfig | null): ScheduleConfig | null {
-  if (s && s.kind === "once") return { kind: "once", at: onceFromInput(s.at) };
+  if (s && s.kind === "once") return { kind: "once", at: onceFromInput(s.at), ...(s.delete_after_run ? { delete_after_run: true } : {}) };
   return s;
 }
 
@@ -109,7 +109,7 @@ async function flushNow(quiet: boolean): Promise<boolean> {
       continue;
     }
     const payload = $state.snapshot(live) as Workflow;
-    if (payload.schedule?.kind === "once") payload.schedule = { kind: "once", at: onceFromInput(payload.schedule.at) };
+    if (payload.schedule?.kind === "once") payload.schedule = canonicalSchedule(payload.schedule);
     const problem = workflowProblem(payload);
     if (problem) {
       ok = false;

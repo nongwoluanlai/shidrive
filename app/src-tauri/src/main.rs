@@ -7,6 +7,9 @@ mod commands;
 mod db;
 mod engine;
 mod fsops;
+mod glog;
+mod notify;
+mod search;
 mod mcp;
 mod wf_graph;
 mod manager;
@@ -189,6 +192,9 @@ fn main() {
             let db_path = data_dir.join("shidrive.db");
             let db = Arc::new(db::Db::open(&db_path).map_err(|e| format!("打开数据库失败: {e}"))?);
 
+            crate::glog::init(app.handle().clone());
+            crate::glog::info("app", format!("ShiDrive v{} 已启动", env!("CARGO_PKG_VERSION")));
+
             let handle = app.handle().clone();
             let agents = Arc::new(manager::AgentManager::new(handle, db.clone()));
 
@@ -311,6 +317,13 @@ fn main() {
             commands::clipboard_write_text,
             commands::clipboard_read_text,
             commands::ui_log,
+            commands::fs_search,
+            commands::fs_search_cancel,
+            commands::fs_dir_sigs,
+            commands::global_log_list,
+            commands::global_log_clear,
+            commands::global_log_push,
+            commands::system_notify,
             commands::data_export,
             commands::data_import,
             commands::node_status,

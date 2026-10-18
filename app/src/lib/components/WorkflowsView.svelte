@@ -4,7 +4,7 @@
   import { app, currentProject, refreshWorkflows, toast } from "../state.svelte";
   import { api, RUN_HISTORY_LIMIT } from "../ipc";
   import type { Edge, ScheduleConfig, Workflow, WorkflowRun, WorkflowStep } from "../types";
-  import { onceFromInput, onceToInput, scheduleText } from "./wf-shared";
+  import { onceFromInput, onceToInput, runWorkflowInteractive, scheduleText } from "./wf-shared";
   import { flushWorkflowSaves, forgetWorkflow, isDirty, trackWorkflowEdit } from "./wf-autosave.svelte";
   import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { firstLineOf } from "./wf-firstline";
@@ -147,12 +147,7 @@
 
   async function runNow() {
     if (!selected) return;
-    try {
-      await api.workflowRun(selected.id);
-      toast("ok", t("已启动"));
-    } catch (e) {
-      toast("error", String(e));
-    }
+    await runWorkflowInteractive(selected.id);
   }
 
   async function stopRun() {
@@ -554,7 +549,7 @@
     if (kind === "interval") selected.schedule = { kind: "interval", every_minutes: base.every_minutes ?? 30 };
     else if (kind === "daily") selected.schedule = { kind: "daily", time: base.time ?? "09:00" };
     else if (kind === "weekly") selected.schedule = { kind: "weekly", weekdays: base.weekdays ?? [1, 2, 3, 4, 5], time: base.time ?? "09:00" };
-    else if (kind === "once") selected.schedule = { kind: "once", at: base.at ?? "" };
+    else if (kind === "once") selected.schedule = { kind: "once", at: base.at ?? "", ...(base.delete_after_run ? { delete_after_run: true } : {}) };
   }
 
   const WEEKDAYS = [
@@ -676,6 +671,13 @@
                         type="datetime-local"
                         bind:value={() => onceToInput((selected!.schedule as { at: string }).at), (v: string) => ((selected!.schedule as { at: string }).at = onceFromInput(v))}
                       />
+                      <label class="toggle" title={t("仅在定时触发且执行成功后自动删除该工作流；失败、被停止或手动运行时保留")}>
+                        <input
+                          type="checkbox"
+                          bind:checked={() => !!(selected!.schedule as { delete_after_run?: boolean }).delete_after_run, (v: boolean) => ((selected!.schedule as { delete_after_run?: boolean }).delete_after_run = v)}
+                        />
+                        {t("执行后销毁")}
+                      </label>
                     {/if}
                   </div>
                   {#if saveProblem}

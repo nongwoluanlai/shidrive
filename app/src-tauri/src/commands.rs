@@ -1023,6 +1023,68 @@ pub async fn data_import(db: DbState<'_>, path: String) -> Result<String, String
     Ok(format!("导入完成：{summary}"))
 }
 
+/// 全局搜索（Alt+F）：文件名快速打开 / 内容搜索。阻塞遍历放到线程池，新请求自动取消旧请求。
+#[tauri::command]
+pub async fn fs_search(opts: crate::search::SearchOpts) -> Result<crate::search::SearchResult, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::search::search(opts))
+        .await
+        .map_err(|e| format!("搜索线程异常: {e}"))?
+}
+
+#[tauri::command]
+pub async fn fs_search_cancel() -> Result<(), String> {
+    crate::search::cancel();
+    Ok(())
+}
+
+/// 文件树自动刷新：批量取目录签名（子项名+类型的哈希），前端只重载变化的目录。
+#[tauri::command]
+pub async fn fs_dir_sigs(paths: Vec<String>) -> Result<Vec<Option<String>>, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::search::dir_signatures(&paths))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn global_log_list() -> Result<Vec<crate::glog::LogEntry>, String> {
+    Ok(crate::glog::list())
+}
+
+#[tauri::command]
+pub async fn global_log_clear() -> Result<(), String> {
+    crate::glog::clear();
+    Ok(())
+}
+
+/// 前端写全局日志（定时发送等前端功能）。
+#[tauri::command]
+pub async fn global_log_push(level: String, category: String, message: String) -> Result<(), String> {
+    crate::glog::push(&level, &category, message);
+    Ok(())
+}
+
+/// 聊天回合结束后的「弹窗提醒」：text 为「标题:内容」。立即返回；用户点击气泡后
+/// 唤出主窗口并发 `notify://clicked`，前端据此切到对应项目/上下文/Agent 会话。
+#[tauri::command]
+pub async fn system_notify(app: tauri::AppHandle, text: String, context_id: String, agent_type: String) -> Result<(), String> {
+    let (title, body) = crate::notify::split_title(&text);
+    tauri::async_runtime::spawn_blocking(move || match crate::notify::show_clickable(&title, &body, 10) {
+        Ok(true) => {
+            crate::raise_main_window(&app);
+            let db = tauri::Manager::state::<std::sync::Arc<Db>>(&app);
+            let project_id = db.get_context_row(&context_id).map(|c| c.project_id);
+            let _ = tauri::Emitter::emit(
+                &app,
+                "notify://clicked",
+                serde_json::json!({ "contextId": context_id, "agentType": agent_type, "projectId": project_id }),
+            );
+        }
+        Ok(false) => {}
+        Err(e) => log::warn!("{e}"),
+    });
+    Ok(())
+}
+
 /// 前端气泡提示落日志文件（error/warn 记录详情，便于远程排查）。
 #[tauri::command]
 pub async fn ui_log(kind: String, text: String) -> Result<(), String> {

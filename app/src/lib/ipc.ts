@@ -23,6 +23,9 @@ import type {
   Workflow,
   WorkflowRun,
   WorkflowStep,
+  GlobalLogEntry,
+  SearchOpts,
+  SearchResult,
 } from "./types";
 
 /** 每个工作流保留的运行历史条数，与后端 db::MAX_RUNS_PER_WORKFLOW 一致 */
@@ -104,6 +107,15 @@ export const api = {
   fsCopyToClipboard: (paths: string[]) => invoke<void>("fs_copy_to_clipboard", { paths }),
   fsPasteFromClipboard: (dest_dir: string) => invoke<void>("fs_paste_from_clipboard", { destDir: dest_dir }),
   fsDesktopDir: () => invoke<string>("fs_desktop_dir"),
+  fsSearch: (opts: SearchOpts) => invoke<SearchResult>("fs_search", { opts }),
+  fsSearchCancel: () => invoke<void>("fs_search_cancel"),
+  /** 目录签名（子项名+类型哈希），null = 目录不可读/已删除 */
+  fsDirSigs: (paths: string[]) => invoke<(string | null)[]>("fs_dir_sigs", { paths }),
+  globalLogList: () => invoke<GlobalLogEntry[]>("global_log_list"),
+  globalLogClear: () => invoke<void>("global_log_clear"),
+  globalLogPush: (level: string, category: string, message: string) => invoke<void>("global_log_push", { level, category, message }),
+  /** 弹窗提醒（text=「标题:内容」）；点击后后端唤出主窗口并发 notify://clicked */
+  systemNotify: (text: string, contextId: string, agentType: string) => invoke<void>("system_notify", { text, contextId, agentType }),
   chatStoreGet: (key: string) => invoke<string>("chat_store_get", { key }),
   chatStoreSet: (key: string, itemsJson: string) => invoke<void>("chat_store_set", { key, itemsJson }),
   chatStoreDelete: (key: string) => invoke<void>("chat_store_delete", { key }),

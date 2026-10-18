@@ -1,5 +1,51 @@
 import type { ScheduleConfig } from "../types";
 import { t } from "../i18n";
+import { api } from "../ipc";
+import { toast } from "../state.svelte";
+import { confirmDialog } from "../dialog.svelte";
+
+/** 停止某个运行并等待引擎真正释放它（最多 timeoutMs）；返回是否已停下。 */
+export async function stopAndWait(workflowId: string, runId: string, timeoutMs = 10_000): Promise<boolean> {
+  await api.workflowStop(runId);
+  const until = Date.now() + timeoutMs;
+  while (Date.now() < until) {
+    await new Promise((r) => setTimeout(r, 200));
+    const act = await api.activeRuns().catch(() => [] as [string, string, string, string][]);
+    if (!act.some((x) => x[1] === workflowId)) return true;
+  }
+  return false;
+}
+
+/**
+ * 手动运行工作流：若它正在运行，先弹窗询问「停止后重新运行 / 取消」。
+ * force=true 时（↻ 重新执行）不询问，直接停止后重跑。返回是否已启动。
+ */
+export async function runWorkflowInteractive(id: string, opts: { force?: boolean } = {}): Promise<boolean> {
+  try {
+    const act = await api.activeRuns().catch(() => [] as [string, string, string, string][]);
+    const r = act.find((x) => x[1] === id);
+    if (r) {
+      if (
+        !opts.force &&
+        !(await confirmDialog({ title: t("工作流正在运行"), message: t("工作流正在运行，是否需要停止后重新运行？"), confirmText: t("重新运行") }))
+      )
+        return false;
+      if (!(await stopAndWait(id, r[0]))) {
+        toast("error", t("停止超时：工作流仍在运行，请稍后再试"));
+        return false;
+      }
+      await api.workflowRun(id);
+      toast("ok", t("已重新运行"));
+      return true;
+    }
+    await api.workflowRun(id);
+    toast("ok", t("已启动"));
+    return true;
+  } catch (err) {
+    toast("error", String(err));
+    return false;
+  }
+}
 
 export function scheduleText(s: ScheduleConfig | null): string {
   if (!s) return t("定时");
@@ -13,7 +59,7 @@ export function scheduleText(s: ScheduleConfig | null): string {
       return t("每周 {days} {time}", { days: s.weekdays.map((d) => t(weekdays[d - 1] ?? String(d))).join(", "), time: s.time });
     }
     case "once":
-      return t("单次 {at}", { at: s.at });
+      return t("单次 {at}", { at: s.at }) + (s.delete_after_run ? " · " + t("执行后销毁") : "");
   }
 }
 

@@ -22,7 +22,7 @@ export type Tab = "chat" | "context" | "workflows";
 /** 内置「无项目」的固定 ID（后端 models.rs NO_PROJECT_ID 同值） */
 export const NO_PROJECT_ID = "00000000-0000-0000-0000-000000000000";
 export const isNoProject = (id: string | null) => id === NO_PROJECT_ID;
-export type Overlay = null | "sessions" | "tasks" | "prompts";
+export type Overlay = null | "sessions" | "tasks" | "prompts" | "logs";
 
 export interface FileEditorState {
   path: string;
@@ -120,6 +120,11 @@ export const app = $state({
   customSkins: {} as Record<string, string>,
   /** open editor panel (file preview/edit) */
   editor: null as FileEditorState | null,
+  /** 打开文件后定位到某行（全局搜索结果）；seq 自增保证重复跳同一处也生效。line 1 起，col/len 为 UTF-16 */
+  editorJump: null as { path: string; line: number; col: number; len: number; seq: number } | null,
+  /** 全局搜索面板（Alt+F） */
+  searchOpen: false,
+  searchMode: "files" as "files" | "content",
   /** workflows of the current project (sidebar bottom half) */
   workflows: [] as Workflow[],
   /** currently selected workflow id in the workflows view */
@@ -667,6 +672,28 @@ export function closeEditor() {
 
 export async function selectContext(id: string | null) {
   app.contextId = id;
+}
+
+/** 跳到指定会话（弹窗提醒点击、定时发送列表等）：必要时先切项目，再选上下文与 Agent。 */
+export async function gotoSession(projectId: string | null, contextId: string, agent: AgentType) {
+  let pid = projectId;
+  if (!pid) {
+    const all = await api.contextsAll().catch(() => [] as [Context, string][]);
+    pid = all.find(([c]) => c.id === contextId)?.[0].project_id ?? null;
+  }
+  if (pid && app.projectId !== pid) {
+    if (!app.projects.some((p) => p.id === pid)) await loadProjects();
+    await selectProject(pid);
+  }
+  if (!app.contexts.some((c) => c.id === contextId)) await refreshContexts();
+  if (!app.contexts.some((c) => c.id === contextId)) {
+    toast("warn", "对应的上下文已不存在");
+    return;
+  }
+  await selectContext(contextId);
+  app.overlay = null;
+  app.tab = "chat";
+  if (agent && app.agent !== agent) switchAgent(agent);
 }
 
 export function switchAgent(agent: AgentType) {

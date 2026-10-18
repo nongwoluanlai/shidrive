@@ -38,3 +38,5 @@ website/
 
 # 外部合并包备份目录
 .merge-backup-oauth/
+/.tmp-verify-dist
+/.shidrive-patch-backup

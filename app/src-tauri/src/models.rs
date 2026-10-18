@@ -151,7 +151,12 @@ pub enum ScheduleConfig {
     /// one shot at local datetime; stored canonically as "YYYY-MM-DD HH:MM"
     /// (the editor's `datetime-local` form "YYYY-MM-DDTHH:MM" is accepted on input)
     #[serde(rename = "once")]
-    Once { at: String },
+    Once {
+        at: String,
+        /// 执行后销毁：调度触发的这次运行成功结束后删除该工作流（手动运行不触发）
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        delete_after_run: bool,
+    },
 }
 
 /// Shared fields of every step (flattened into the tagged enum JSON by hand in db.rs helpers).

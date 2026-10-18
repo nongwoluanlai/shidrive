@@ -35,6 +35,9 @@ sha2 = "0.10"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 log = "0.4"
+# 全局搜索（search.rs）：二者本就是现有依赖的传递依赖，不增加体积
+regex = "1"
+memchr = "2"
 env_logger = "0.11"
 
 # 原生文件夹选择器（Windows 下仅依赖 Tauri 已引入的 windows-sys / raw-window-handle）

@@ -358,22 +358,41 @@
     }
   }
 
-  // 复制接入提示词：取当前有效凭据（不轮换）。凭据刷新时机：
+  // 取当前有效接入地址（URL + 凭据）。凭据刷新时机：
   // 服务启动（全部授权）/「暂停开放→继续开放」切换（单个授权），见暂停/继续按钮。
-  async function copyPrompt(g: RemoteGrant) {
+  async function grantAddress(g: RemoteGrant): Promise<string> {
     const base = publicUrl ? `${publicUrl}/mcp` : "";
-    if (!base) { toast("warn", unavailableReason()); return; }
+    if (!base) { toast("warn", unavailableReason()); return ""; }
     let token = "";
     try {
       const res = await api.remoteGrantToken(g.id);
       token = (res as { token?: string }).token ?? "";
     } catch (e) {
       toast("error", String(e));
-      return;
+      return "";
     }
-    if (!token) { toast("error", t("凭据生成失败，请重试")); return; }
+    if (!token) { toast("error", t("凭据生成失败，请重试")); return ""; }
+    return `${base}?passcode=${token}`;
+  }
+
+  // 只复制该授权的接入地址（含凭据）：会话已了解提示词内容、仅地址变化
+  // （服务/隧道重启）时，重发这一行即可，不必重发完整提示词。
+  async function copyGrantAddress(g: RemoteGrant) {
+    const url = await grantAddress(g);
+    if (!url) return;
+    void navigator.clipboard.writeText(url).then(
+      () => toast("ok", t("接入地址已复制")),
+      () => toast("error", t("复制失败")),
+    );
+  }
+
+  // 复制接入提示词：取当前有效凭据（不轮换）。
+  async function copyPrompt(g: RemoteGrant) {
+    const url = await grantAddress(g);
+    if (!url) return;
+    const token = new URL(url).searchParams.get("passcode") ?? "";
     const lines = [
-      `MCP Server URL：${base}?passcode=${token}`,
+      `MCP Server URL：${url}`,
       "",
       t("这是 ShiDrive Coding MCP，你可以借助它完成已授权项目的远端开发任务。"),
       `${t("项目")}: ${g.project_name}`,
@@ -600,6 +619,7 @@
               <td class="op">
                 {#if !g.revoked_at && !g.paused_at}
                   <button class="btn ghost sm" title={t("复制当前有效凭据的接入提示词")} onclick={() => void copyPrompt(g)}>{t("复制提示词")}</button>
+                  <button class="btn ghost sm" title={t("只复制接入地址（含当前凭据），提示词不变、仅地址变化时使用")} onclick={() => void copyGrantAddress(g)}>{t("复制仅地址")}</button>
                   <button class="btn ghost sm" title={t("暂停后外部连接将被拒绝，继续开放时自动刷新凭据")} onclick={() => void pauseGrant(g.id)}>{t("暂停开放")}</button>
                 {:else if g.paused_at}
                   <button class="btn ghost sm" title={t("继续开放并刷新凭据，旧凭据失效")} onclick={() => void resumeGrant(g.id)}>{t("继续开放")}</button>

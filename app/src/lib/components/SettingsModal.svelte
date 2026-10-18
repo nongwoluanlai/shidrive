@@ -281,9 +281,9 @@
 {/if}
 
 <style>
-  /* 固定尺寸：切 tab 时对话框不跳变 */
+  /* 固定尺寸：切 tab 时对话框不跳变（外部接入操作列加宽后 700→820） */
   .modal.settings {
-    width: 700px;
+    width: 820px;
     max-width: 92vw;
     height: min(620px, 86vh);
   }

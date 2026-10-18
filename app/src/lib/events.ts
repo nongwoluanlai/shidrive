@@ -1,32 +1,52 @@
 // Wire backend events to global state. Called once from App.svelte on mount.
 import { listen } from "@tauri-apps/api/event";
-import { app, applySessionUpdate, applyBindingStatus, adoptBinding, capabilityLists, toast, chatKey } from "./state.svelte";
-import type { AgentType, ElicitationRequest, PermissionRequest, SessionReadyInfo } from "./types";
+import { app, applySessionUpdate, applyBindingStatus, adoptBinding, capabilityLists, toast, chatKey, gotoSession, refreshWorkflows } from "./state.svelte";
+import type { AgentType, ElicitationRequest, GlobalLogEntry, PermissionRequest, SessionReadyInfo } from "./types";
+import { pushGlobalLog } from "./global-log.svelte";
+import { forgetWorkflow } from "./components/wf-autosave.svelte";
 import { api } from "./ipc";
 
 // ---------- 执行后动作（回合结束后触发；配置存 localStorage，聊天页配置栏可改） ----------
+export type AfterActionKind = "sound" | "popup" | "shutdown" | "command";
 export interface AfterActionCfg {
-  kind: "sound" | "shutdown" | "command";
+  kind: AfterActionKind;
   cmd: string;
+  /** 弹窗提醒文案「标题:内容」 */
+  msg: string;
 }
+
+export const DEFAULT_POPUP_MSG = "ShiDrive:嘟嘟噜";
+const AFTER_ACTION_KINDS: AfterActionKind[] = ["sound", "popup", "shutdown", "command"];
 
 export function loadAfterAction(): AfterActionCfg {
   try {
     const raw = localStorage.getItem("shidrive.afterAction");
     if (raw) {
-      const v = JSON.parse(raw) as AfterActionCfg;
-      if (v && (v.kind === "sound" || v.kind === "shutdown" || v.kind === "command")) {
-        return { kind: v.kind, cmd: typeof v.cmd === "string" ? v.cmd : "" };
+      const v = JSON.parse(raw) as Partial<AfterActionCfg>;
+      if (v && AFTER_ACTION_KINDS.includes(v.kind as AfterActionKind)) {
+        return {
+          kind: v.kind as AfterActionKind,
+          cmd: typeof v.cmd === "string" ? v.cmd : "",
+          msg: typeof v.msg === "string" ? v.msg : DEFAULT_POPUP_MSG,
+        };
       }
     }
   } catch {}
-  return { kind: "sound", cmd: "" };
+  return { kind: "sound", cmd: "", msg: DEFAULT_POPUP_MSG };
 }
 
-function fireAfterAction() {
+export function saveAfterAction(cfg: AfterActionCfg) {
+  try {
+    localStorage.setItem("shidrive.afterAction", JSON.stringify(cfg));
+  } catch {}
+}
+
+function fireAfterAction(contextId: string, agentType: string) {
   const cfg = loadAfterAction();
   if (cfg.kind === "sound") {
     void api.systemAfterAction("sound", "").catch(() => {});
+  } else if (cfg.kind === "popup") {
+    void api.systemNotify(cfg.msg.trim() || DEFAULT_POPUP_MSG, contextId, agentType).catch(() => {});
   } else if (cfg.kind === "shutdown") {
     void api.systemAfterAction("shutdown", "").catch(() => {});
     import("./state.svelte").then(({ toast }) => toast("warn", "回合已结束：已安排 30 秒后关机（cmd 执行 shutdown /a 可取消）"));
@@ -113,7 +133,7 @@ export async function wireEvents() {
   }>("acp://binding-status", (e) => {
     if (applyBindingStatus(e.payload)) {
       app.treeRev++;
-      fireAfterAction();
+      fireAfterAction(e.payload.contextId, e.payload.agentType);
     }
   });
 
@@ -134,6 +154,26 @@ export async function wireEvents() {
         if (!Object.values(app.wfRunning).includes(k)) delete logs[k];
       }
     }
+  });
+
+  // 弹窗提醒被点击：后端已唤出主窗口，这里切到对应项目 / 上下文 / Agent 会话
+  await listen<{ contextId: string; agentType: string; projectId?: string | null }>("notify://clicked", (e) => {
+    const p = e.payload;
+    void gotoSession(p.projectId ?? null, p.contextId, p.agentType as AgentType);
+  });
+
+  // 单次定时工作流「执行后销毁」：引擎已删除，刷新列表并清掉选中/草稿
+  await listen<{ workflowId: string; projectId: string; name: string }>("wf://deleted", (e) => {
+    const { workflowId, projectId, name } = e.payload;
+    delete app.wfRunning[workflowId];
+    if (app.workflowSelected === workflowId) app.workflowSelected = null;
+    forgetWorkflow(workflowId);
+    if (app.projectId === projectId) void refreshWorkflows();
+    toast("info", `单次工作流「${name}」已执行完成并按设置自动删除`);
+  });
+
+  await listen<GlobalLogEntry>("glog://entry", (e) => {
+    pushGlobalLog(e.payload);
   });
 
   await listen<{ runId: string; workflowId: string; status: string }>("wf://status", (e) => {

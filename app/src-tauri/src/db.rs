@@ -181,7 +181,7 @@ impl Db {
         let p = Project {
             id: uuid(),
             name: name.to_string(),
-            root_path: root_path.trim_end_matches(['\\', '/']).to_string(),
+            root_path: crate::fsops::normalize_dir(root_path),
             description: description.to_string(),
             sort: 0,
             created_at: now(),
@@ -201,7 +201,7 @@ impl Db {
         self.with(|c| {
             c.execute(
                 "UPDATE projects SET name=?2, root_path=?3, description=?4, updated_at=?5 WHERE id=?1",
-                params![id, name, root_path.trim_end_matches(['\\', '/']), description, now()],
+                params![id, name, crate::fsops::normalize_dir(root_path), description, now()],
             )?;
             Ok(())
         })
@@ -1414,7 +1414,8 @@ fn row_project(r: &Row) -> rusqlite::Result<Project> {
     Ok(Project {
         id: r.get(0)?,
         name: r.get(1)?,
-        root_path: r.get(2)?,
+        // 旧版本把 `D:\` 存成了 `D:`（会被解析成当前目录），读取时统一归一化
+        root_path: crate::fsops::normalize_dir(&r.get::<_, String>(2)?),
         description: r.get(3)?,
         sort: r.get(4)?,
         created_at: r.get(5)?,
@@ -1753,9 +1754,9 @@ mod tests {
         assert_ne!(stored.next_run_at.as_deref(), Some(armed.as_str()));
         // changing the schedule re-arms immediately (no waiting for the next tick)
         let mut edited = stored.clone();
-        edited.schedule = Some(ScheduleConfig::Once { at: "2099-09-27T09:30".into() });
+        edited.schedule = Some(ScheduleConfig::Once { at: "2099-09-27T09:30".into(), delete_after_run: false });
         let stored = db.update_workflow(&edited).unwrap();
-        assert_eq!(stored.schedule, Some(ScheduleConfig::Once { at: "2099-09-27 09:30".into() }), "datetime-local input is normalised");
+        assert_eq!(stored.schedule, Some(ScheduleConfig::Once { at: "2099-09-27 09:30".into(), delete_after_run: false }), "datetime-local input is normalised");
         assert_eq!(stored.next_run_at.as_deref(), Some("2099-09-27 09:30:00"));
         // switching to manual / disabling clears the slot
         let mut off = stored.clone();
@@ -1763,14 +1764,14 @@ mod tests {
         assert_eq!(db.update_workflow(&off).unwrap().next_run_at, None);
         // invalid / past one-shot times are rejected at save time instead of "in one minute"
         let mut bad = stored.clone();
-        bad.schedule = Some(ScheduleConfig::Once { at: "".into() });
+        bad.schedule = Some(ScheduleConfig::Once { at: "".into(), delete_after_run: false });
         assert!(db.update_workflow(&bad).unwrap_err().contains("单次执行时间"));
-        bad.schedule = Some(ScheduleConfig::Once { at: "2000-01-01 00:00".into() });
+        bad.schedule = Some(ScheduleConfig::Once { at: "2000-01-01 00:00".into(), delete_after_run: false });
         assert!(db.update_workflow(&bad).unwrap_err().contains("已过去"));
         bad.schedule = None;
         assert!(db.update_workflow(&bad).is_err());
         assert!(db
-            .create_workflow(&p.id, "x", "", true, "schedule", Some(&ScheduleConfig::Once { at: "not a time".into() }), &[], &Default::default(), &[])
+            .create_workflow(&p.id, "x", "", true, "schedule", Some(&ScheduleConfig::Once { at: "not a time".into(), delete_after_run: false }), &[], &Default::default(), &[])
             .is_err());
     }
 
@@ -1779,7 +1780,7 @@ mod tests {
         let db = fixture_db();
         let p = db.create_project("p", "", "").unwrap();
         let w = db
-            .create_workflow(&p.id, "once", "", true, "schedule", Some(&ScheduleConfig::Once { at: "2099-01-01 00:00".into() }), &[], &Default::default(), &[])
+            .create_workflow(&p.id, "once", "", true, "schedule", Some(&ScheduleConfig::Once { at: "2099-01-01 00:00".into(), delete_after_run: false }), &[], &Default::default(), &[])
             .unwrap();
         let expected = w.next_run_at.clone();
         // first tick claims the slot and retires the workflow (before the run even starts)
