@@ -176,6 +176,11 @@ pub enum SessionTarget {
     Temp,
 }
 
+/// 全局助手回合的路由标记（acp 回合缓冲里的 context_id；不对应任何真实上下文）。
+pub const ASSISTANT_CONTEXT_ID: &str = "__assistant__";
+/// 助手回合被用户停止时的错误前缀（其后附已生成的部分文本）。
+pub const ASSISTANT_CANCELLED: &str = "__cancelled__:";
+
 pub struct AgentManager {
     pub app: AppHandle,
     pub db: Arc<Db>,
@@ -1006,6 +1011,80 @@ impl AgentManager {
         let joined = task.await;
         cancel.0.take();
         joined.map_err(|e| format!("会话任务结束异常: {e}"))?
+    }
+
+    // ---------- 全局助手（不属于任何项目/上下文的独立长期会话） ----------
+    // 助手会话不写 agent_bindings、不注入使驾 MCP，回合输出走 acp://assistant-update，
+    // 与聊天页 / 工作流互不干扰；记忆与对话记录由 assistant.rs 自己落库。
+
+    /// 新建助手会话，返回 (sessionId, 能力/配置项)。
+    pub async fn assistant_session_new(&self, agent_type: &str, cwd: &str) -> Result<(String, Value), String> {
+        let conn = self.ensure_connected(agent_type).await?;
+        let res = conn.new_session(cwd, vec![]).await?;
+        let sid = res.get("sessionId").and_then(Value::as_str).unwrap_or_default().to_string();
+        if sid.is_empty() { return Err("适配器未返回 sessionId".into()); }
+        conn.mark_loaded(&sid);
+        conn.cache_caps(&sid, &res);
+        Ok((sid, res))
+    }
+
+    /// 确保助手会话已在当前连接上加载（重启后 session/load 恢复）。
+    pub async fn assistant_session_ensure(&self, agent_type: &str, sid: &str, cwd: &str) -> Result<Value, String> {
+        let conn = self.ensure_connected(agent_type).await?;
+        if !conn.is_loaded(sid) {
+            let lock = self.prompt_lock(&conn, sid);
+            let _g = lock.lock().await;
+            if !conn.is_loaded(sid) {
+                let res = conn.load_session(sid, cwd, vec![]).await?;
+                conn.mark_loaded(sid);
+                if res.get("configOptions").is_some() || res.get("models").is_some() { conn.cache_caps(sid, &res); }
+            }
+        }
+        Ok(conn.cached_caps(sid))
+    }
+
+    pub async fn assistant_set_config(&self, agent_type: &str, sid: &str, option_id: &str, value: Value) -> Result<(), String> {
+        let conn = self.ensure_connected(agent_type).await?;
+        let res = conn.set_session_config(sid, option_id, &value).await?;
+        conn.note_config_option(sid, option_id, &value, &res);
+        Ok(())
+    }
+
+    /// 向助手会话发一轮提示词，等待回合结束，返回整轮回复文本。
+    pub async fn assistant_prompt(&self, agent_type: &str, sid: &str, cwd: &str, text: &str, turn_id: &str) -> Result<String, String> {
+        let conn = self.ensure_connected(agent_type).await?;
+        let lock = self.prompt_lock(&conn, sid);
+        let _session = lock.lock_owned().await;
+        if !conn.is_alive() { return Err("适配器连接已断开，请重试".into()); }
+        if !conn.is_loaded(sid) {
+            conn.load_session(sid, cwd, vec![]).await?;
+            conn.mark_loaded(sid);
+        }
+        conn.begin_turn(sid, ASSISTANT_CONTEXT_ID, turn_id, "assistant")?;
+        // 无论成功、失败还是调用方 future 被丢弃，都要收尾回合（否则该会话再也发不了消息）
+        struct TurnGuard { conn: Arc<AcpConnection>, sid: String, turn: String, done: bool }
+        impl Drop for TurnGuard {
+            fn drop(&mut self) {
+                if !self.done { self.conn.cancel_turn(&self.sid, &self.turn); }
+                let _ = self.conn.end_turn(&self.sid, &self.turn);
+            }
+        }
+        let mut guard = TurnGuard { conn: conn.clone(), sid: sid.to_string(), turn: turn_id.to_string(), done: false };
+        let result = conn.prompt_session(sid, vec![ContentBlock::Text(TextContent::new(text))]).await;
+        let (out, _, _) = conn.end_turn(sid, turn_id);
+        guard.done = true;
+        drop(guard);
+        let res = result?;
+        if res.get("stopReason").and_then(Value::as_str) == Some("cancelled") {
+            return Err(format!("{ASSISTANT_CANCELLED}{out}"));
+        }
+        Ok(out)
+    }
+
+    pub async fn assistant_cancel(&self, agent_type: &str, sid: &str, turn_id: &str) {
+        if let Some(conn) = self.conns.read().await.get(agent_type) {
+            conn.cancel_turn(sid, turn_id);
+        }
     }
 
     pub async fn prompt(&self, context: &Context, agent_type: &str, text: &str, images: &[crate::models::PromptImage]) -> Result<Value, String> {

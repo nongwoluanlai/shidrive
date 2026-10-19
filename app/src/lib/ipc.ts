@@ -26,6 +26,12 @@ import type {
   GlobalLogEntry,
   SearchOpts,
   SearchResult,
+  AssistantConfig,
+  AssistantConfigView,
+  AssistantMemory,
+  AssistantMessage,
+  AssistantPersona,
+  AssistantTurnResult,
 } from "./types";
 
 /** 每个工作流保留的运行历史条数，与后端 db::MAX_RUNS_PER_WORKFLOW 一致 */
@@ -219,4 +225,24 @@ export const api = {
   agentsEnabledSet: (ids: string[]) => invoke<void>("agents_enabled_set", { ids }),
   agentsBootstrap: (id: string) => invoke<string>("agents_bootstrap", { id }),
   agentsUninstall: (id: string) => invoke<string>("agents_uninstall", { id }),
+  // ---- 全局助手 ----
+  assistantConfigGet: () => invoke<AssistantConfigView>("assistant_config_get"),
+  /** apiKey: undefined/null = 保留已保存的密钥；"" = 清除 */
+  assistantConfigSet: (config: AssistantConfig, apiKey?: string | null) => invoke<AssistantConfigView>("assistant_config_set", { config, apiKey: apiKey ?? null }),
+  assistantSend: (text: string, persona: AssistantPersona, appState: string | null, turnId: string) =>
+    invoke<AssistantTurnResult>("assistant_send", { text, persona, appState, turnId }),
+  assistantGreet: (persona: AssistantPersona, appState: string | null, turnId: string, reason: "new" | "resume") =>
+    invoke<AssistantTurnResult>("assistant_greet", { persona, appState, turnId, reason }),
+  assistantCancel: (turnId: string) => invoke<void>("assistant_cancel", { turnId }),
+  assistantSessionReset: () => invoke<AssistantConfigView>("assistant_session_reset"),
+  assistantMessages: (limit?: number) => invoke<AssistantMessage[]>("assistant_messages", { limit: limit ?? null }),
+  assistantMessagesClear: () => invoke<void>("assistant_messages_clear"),
+  assistantMemories: () => invoke<AssistantMemory[]>("assistant_memories"),
+  assistantMemoryAdd: (content: string, pinned = false) => invoke<boolean>("assistant_memory_add", { content, pinned }),
+  assistantMemoryUpdate: (id: string, content: string, pinned: boolean) => invoke<void>("assistant_memory_update", { id, content, pinned }),
+  assistantMemoryDelete: (id: string) => invoke<void>("assistant_memory_delete", { id }),
+  assistantMemorySummarize: (mode: "consolidate" | "extract", persona: AssistantPersona, turnId: string) =>
+    invoke<number>("assistant_memory_summarize", { mode, persona, turnId }),
+  assistantModels: (provider: "acp" | "api", opts: { agentType?: string; baseUrl?: string; apiKey?: string } = {}) =>
+    invoke<{ models?: unknown; configOptions?: unknown }>("assistant_models", { provider, agentType: opts.agentType ?? null, baseUrl: opts.baseUrl ?? null, apiKey: opts.apiKey ?? null }),
 };

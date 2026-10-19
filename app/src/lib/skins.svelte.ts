@@ -19,6 +19,23 @@ export interface SkinManifest {
   globalFx?: unknown;
   /** Chat timeline decoration: { art?: svg/png, mark?: svg/png, height?: px, railColor?: #hex }. */
   timeline?: { art?: string; mark?: string; height?: number; railColor?: string };
+  /** Global assistant persona/bubble: { name?, persona?, greeting?, style?: "generic" | "amadeus", anchor?: [x%, y%] }. */
+  assistant?: unknown;
+}
+
+export interface SkinAssistantSpec { name: string; persona: string; greeting: string; style: string; anchor: [number, number] | null }
+/** Assistant persona/bubble overrides declared by the active custom skin (sanitized). */
+export const skinAssistant = $state({ id: "", spec: null as SkinAssistantSpec | null, character: false });
+
+function sanitizeAssistant(raw: unknown): SkinAssistantSpec | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const str = (v: unknown, n: number) => (typeof v === "string" ? v.trim().slice(0, n) : "");
+  const a = Array.isArray(r.anchor) && r.anchor.length === 2 && r.anchor.every((v) => typeof v === "number" && Number.isFinite(v))
+    ? [Math.min(100, Math.max(0, r.anchor[0] as number)), Math.min(100, Math.max(0, r.anchor[1] as number))] as [number, number]
+    : null;
+  const style = str(r.style, 20);
+  return { name: str(r.name, 40), persona: str(r.persona, 4000), greeting: str(r.greeting, 300), style: /^(generic|amadeus)$/.test(style) ? style : "", anchor: a };
 }
 export const builtinSkins = [
   { id: "steins-gate", name: "命运石之门", en: "Steins;Gate", description: "琥珀暖光 · 复古实验室", descriptionEn: "Amber lab light · retro terminal", preview: "/skins/steins-gate/bg.png" },
@@ -83,6 +100,7 @@ function clearSkin() {
   startGlobalFx(null);
   dynamicSkin.id = ""; dynamicSkin.scene = null; dynamicSkin.urls = null;
   skinTimeline.art = ""; skinTimeline.height = 130;
+  skinAssistant.id = ""; skinAssistant.spec = null; skinAssistant.character = false;
   delete document.body.dataset.skinTlMark;
   for (const url of objectUrls.splice(0)) URL.revokeObjectURL(url);
   // Keep --skin-opacity: the user preference outlives skin switches.
@@ -136,6 +154,7 @@ export function activateSkin(id: string, onError: (message: string) => void): ()
   if (builtin) {
     document.body.dataset.skin = id;
     document.body.dataset.skinCharacter = "true";
+    skinAssistant.id = id; skinAssistant.character = true;
   } else {
     void (async () => {
       try {
@@ -193,6 +212,9 @@ export function activateSkin(id: string, onError: (message: string) => void): ()
         if (tlMark) { setToken("--skin-tl-mark", `url("${tlMark}")`); document.body.dataset.skinTlMark = "true"; }
         if (typeof tl.railColor === "string" && /^#[\da-f]{3}([\da-f]{3})?$/i.test(tl.railColor)) setToken("--skin-tl-rail", tl.railColor);
         startGlobalFx(fx);
+        skinAssistant.spec = sanitizeAssistant(manifest.assistant);
+        skinAssistant.character = !!character || !!(scene && sceneUrls);
+        skinAssistant.id = id;
         document.body.dataset.skin = id;
       } catch (error) {
         if (version === generation) { clearSkin(); onError(String(error)); }

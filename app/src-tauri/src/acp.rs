@@ -562,10 +562,11 @@ impl AcpConnection {
         }
         let (context_id, turn_id, source) = route.unwrap_or((None, String::new(), "chat".into()));
         // Workflow output belongs to the run, never to a context's unrelated binding.
-        let event = if source == "workflow" {
-            "acp://workflow-update"
-        } else {
-            EVT_UPDATE
+        let event = match source.as_str() {
+            "workflow" => "acp://workflow-update",
+            // 全局助手：独立事件，聊天页不会把它当成某个上下文的输出
+            "assistant" => "acp://assistant-update",
+            _ => EVT_UPDATE,
         };
         let _ = self.app.emit(
             event,

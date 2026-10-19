@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod acp;
+mod assistant;
 mod agents;
 mod coding_mcp;
 mod commands;
@@ -255,6 +256,7 @@ fn main() {
             app.manage(db);
             app.manage(agents);
             app.manage(engine);
+            app.manage(Arc::new(crate::assistant::AssistantRuntime::new(data_dir.clone())));
             app.manage(crate::remote_mcp::RemoteManager::new());
             app.manage(crate::toast::ToastState::new());
             app.manage(std::sync::Arc::new(crate::remote_oauth::OAuthState::new()));
@@ -344,6 +346,20 @@ fn main() {
             commands::workflow_stop,
             commands::runs_list,
             commands::settings_get,
+            assistant::assistant_config_get,
+            assistant::assistant_config_set,
+            assistant::assistant_send,
+            assistant::assistant_greet,
+            assistant::assistant_cancel,
+            assistant::assistant_session_reset,
+            assistant::assistant_messages,
+            assistant::assistant_messages_clear,
+            assistant::assistant_memories,
+            assistant::assistant_memory_add,
+            assistant::assistant_memory_update,
+            assistant::assistant_memory_delete,
+            assistant::assistant_memory_summarize,
+            assistant::assistant_models,
             commands::settings_set,
             commands::setup_status,
             commands::remote_mcp_start,

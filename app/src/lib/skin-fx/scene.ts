@@ -198,7 +198,7 @@ function sample(keys: Keys, t: number) {
 }
 const rand = ([a, b]: Vec2) => a + Math.random() * (b - a);
 /** Clicks on real controls are never treated as "poking the character". */
-const INTERACTIVE = "button,a,input,textarea,select,label,[role=button],[role=menuitem],[contenteditable=true],.cm-editor";
+const INTERACTIVE = "button,a,input,textarea,select,label,[role=button],[role=menuitem],[contenteditable=true],.cm-editor,.ga-root";
 
 export interface SceneImages { body: HTMLImageElement; mask: HTMLImageElement; layers: HTMLImageElement[] }
 

@@ -416,3 +416,47 @@ export interface SearchResult {
   cancelled: boolean;
   elapsedMs: number;
 }
+
+// ---------- 全局助手 ----------
+export interface AssistantApiConfig { base_url: string; api_key: string; model: string; temperature: number | null }
+export interface AssistantConfig {
+  enabled: boolean;
+  provider: "acp" | "api";
+  agent_type: string;
+  /** ACP 模型配置值；null = 用适配器默认 */
+  model: unknown;
+  workspace: string;
+  api: AssistantApiConfig;
+  persona_mode: "skin" | "custom";
+  custom_name: string;
+  custom_persona: string;
+  auto_memory: boolean;
+  memory_limit: number;
+  history_turns: number;
+  share_app_state: boolean;
+  bubble_seconds: number;
+}
+export interface AssistantConfigView {
+  config: AssistantConfig;
+  api_key_set: boolean;
+  session_id: string;
+  session_provider: string;
+  session_agent: string;
+  session_created_at: string;
+  default_workspace: string;
+  busy: boolean;
+  /** 当前会话已问候或已有对话 */
+  session_greeted: boolean;
+}
+export interface AssistantPersona { id: string; name: string; persona: string; greeting: string; locale: string }
+export interface AssistantMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  provider: string;
+  created_at: string;
+  interrupted: boolean;
+  greeting: boolean;
+}
+export interface AssistantMemory { id: string; content: string; source: "auto" | "manual" | "summary"; pinned: boolean; created_at: string; updated_at: string }
+export interface AssistantTurnResult { message: AssistantMessage | null; memories_added: number; memories_forgotten: number }

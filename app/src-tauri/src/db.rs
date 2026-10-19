@@ -84,6 +84,9 @@ impl Db {
                 "CREATE TABLE IF NOT EXISTS chat_store (                key TEXT PRIMARY KEY,                items_json TEXT NOT NULL,                updated_at TEXT NOT NULL          )",
             );
 
+            // 全局助手：独立于项目的对话记录与长期记忆
+            let _ = c.execute_batch(crate::assistant::TABLES_SQL);
+
             // 内置「无项目」常驻
             c.execute(
                 "INSERT OR IGNORE INTO projects (id,name,root_path,description,sort,created_at,updated_at) VALUES (?1,?2,'','存放便捷工作流与本地服务，不绑定目录',-1,?3,?3)",

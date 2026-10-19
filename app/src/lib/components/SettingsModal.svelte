@@ -8,10 +8,16 @@
   import AgentsAdmin from "./AgentsAdmin.svelte";
   import RemoteMcpSettings from "./RemoteMcpSettings.svelte";
   import WebAccessSettings from "./WebAccessSettings.svelte";
+  import AssistantSettings from "./AssistantSettings.svelte";
+  import { settingsRequest } from "../assistant/store.svelte";
   import { t } from "../i18n";
   import type { AgentEnvStatusItem, NodeStat } from "../types";
 
-  let tab = $state<"agents" | "remote" | "web" | "theme" | "paths" | "about">("agents");
+  let tab = $state<"agents" | "remote" | "web" | "assistant" | "theme" | "paths" | "about">("agents");
+  // 其它地方（如全局助手卡片）请求打开到指定页签
+  $effect(() => {
+    if (app.settingsOpen && settingsRequest.tab === "assistant") { tab = "assistant"; settingsRequest.tab = ""; }
+  });
   let registry = $state<AgentEnvStatusItem[]>([]);
 
   // --- paths / ports editing state ---
@@ -189,6 +195,7 @@
         <button class:active={tab === "agents"} onclick={() => { tab = "agents"; void loadRegistry(); }}>{t("Agent 管理")}</button>
         <button class:active={tab === "remote"} onclick={() => { tab = "remote"; void loadRegistry(); }}>{t("外部编程接入")}</button>
         <button class:active={tab === "web"} onclick={() => (tab = "web")}>{t("网站接入")}</button>
+        <button class:active={tab === "assistant"} onclick={() => (tab = "assistant")}>{t("全局助手")}</button>
         <button class:active={tab === "paths"} onclick={() => (tab = "paths")}>{t("环境与路径")}</button>
         <button class:active={tab === "theme"} onclick={() => (tab = "theme")}>{t("外观主题")}</button>
         <button class:active={tab === "about"} onclick={() => (tab = "about")}>{t("帮助与关于")}</button>
@@ -244,6 +251,8 @@
           <RemoteMcpSettings />
         {:else if tab === "web"}
           <WebAccessSettings />
+        {:else if tab === "assistant"}
+          <AssistantSettings />
         {:else if tab === "about"}
           <AboutSettings />
         {:else}
