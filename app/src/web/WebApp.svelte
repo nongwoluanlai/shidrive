@@ -1,13 +1,15 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { subscribe, setUnauthorizedHandler } from "./api";
-  import { ui, bootstrap, handleEvent, setTheme, setView, selectProject, selectContext, currentProject, currentContext, logout, type View } from "./store.svelte";
+  import { ui, bootstrap, handleEvent, setTheme, loadDesktopTheme, nextTheme, THEME_LABEL, setView, selectProject, selectContext, currentProject, currentContext, logout, type View } from "./store.svelte";
   import Icon from "./Icon.svelte";
   import Login from "./Login.svelte";
   import ChatPane from "./ChatPane.svelte";
   import FilesPane from "./FilesPane.svelte";
   import WorkflowsPane from "./WorkflowsPane.svelte";
   import ContextPane from "./ContextPane.svelte";
+  import RemotePane from "./RemotePane.svelte";
+  import logo from "../assets/logo.png";
   import PermissionSheet from "./PermissionSheet.svelte";
 
   const NAV: { id: View; label: string; icon: string }[] = [
@@ -15,6 +17,7 @@
     { id: "files", label: "文件", icon: "folder" },
     { id: "workflows", label: "工作流", icon: "flow" },
     { id: "context", label: "上下文", icon: "book" },
+    { id: "remote", label: "编程接入", icon: "plug" },
   ];
 
   let unsub: (() => void) | null = null;
@@ -24,8 +27,13 @@
 
   onMount(() => {
     void bootstrap();
-    return () => unsub?.();
+    void loadDesktopTheme();
+    // 回到页面时同步电脑端可能已切换的配色
+    const onVis = () => { if (document.visibilityState === "visible") void loadDesktopTheme(); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => { unsub?.(); document.removeEventListener("visibilitychange", onVis); };
   });
+  const themeIcon = $derived(ui.theme === "desktop" ? "monitor" : ui.theme === "dark" ? "moon" : "sun");
 
   // 登录状态变化时开 / 关实时通道
   $effect(() => {
@@ -52,7 +60,7 @@
     <!-- 侧栏：宽屏常驻，窄屏为抽屉 -->
     <aside class="side">
       <div class="brand">
-        <span class="logo">驾</span>
+        <img class="logo" src={logo} alt="使驾" draggable="false" />
         <div class="brand-txt"><b>使驾 ShiDrive</b><small>网站接入 · v{ui.version}</small></div>
         <button class="icon-btn only-narrow" onclick={() => (ui.drawer = false)} aria-label="关闭"><Icon name="x" /></button>
       </div>
@@ -87,7 +95,7 @@
         <span class="conn" class:on={ui.connected} title={ui.connected ? "实时连接正常" : "实时连接断开，正在重连"}></span>
         <span class="faint small">{ui.connected ? "已连接" : "重连中…"}</span>
         <span class="grow"></span>
-        <button class="icon-btn" onclick={() => setTheme(ui.theme === "dark" ? "light" : "dark")} aria-label="切换主题"><Icon name={ui.theme === "dark" ? "sun" : "moon"} /></button>
+        <button class="icon-btn" onclick={() => setTheme(nextTheme(ui.theme))} title="主题：{THEME_LABEL[ui.theme]}（点击切换）" aria-label="切换主题"><Icon name={themeIcon} /></button>
         <button class="icon-btn" onclick={() => { if (confirm("退出登录？")) void logout(); }} aria-label="退出登录"><Icon name="logout" /></button>
       </div>
     </aside>
@@ -107,6 +115,7 @@
         {#if ui.view === "chat"}<ChatPane />
         {:else if ui.view === "files"}<FilesPane />
         {:else if ui.view === "workflows"}<WorkflowsPane />
+        {:else if ui.view === "remote"}<RemotePane />
         {:else}<ContextPane />{/if}
       </section>
 
@@ -135,10 +144,7 @@
     display: flex; flex-direction: column; gap: 8px; padding: 14px 12px calc(10px + var(--safe-b)); min-height: 0;
   }
   .brand { display: flex; align-items: center; gap: 10px; padding: 2px 4px 10px; }
-  .logo {
-    width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; font-weight: 700;
-    background: linear-gradient(135deg, var(--accent), #8a6dff); color: #fff; flex: none;
-  }
+  .logo { width: 34px; height: 34px; border-radius: 10px; flex: none; object-fit: contain; }
   .brand-txt { display: flex; flex-direction: column; line-height: 1.25; flex: 1; min-width: 0; }
   .brand-txt small { color: var(--text-faint); font-size: 12px; }
   .lbl { font-size: 12px; color: var(--text-faint); padding: 6px 4px 0; letter-spacing: .04em; }

@@ -154,7 +154,7 @@ impl ActiveTurn {
     fn status(&self, status: &str) {
         // Workflow temp/explicit sessions do not own the context's UI binding.
         if self.source == "chat" {
-            let _ = self.db.set_binding_status(&self.context_id, &self.agent_type, status);
+            let _ = self.db.set_binding_status(&self.context_id, &self.agent_type, status, true);
         }
         let event = if self.source == "chat" { "acp://binding-status" } else { "acp://workflow-status" };
         let _ = self.app.emit(event, json!({
@@ -848,7 +848,7 @@ impl AgentManager {
         // 绑定关系本身仍然落库（会话元数据，不是聊天记录）
         self.db.set_binding_session(&context.id, agent_type, Some(session_id), title, Some(&cwd))?;
         // 绑定了带历史的会话视为一次已完成的对话状态
-        let _ = self.db.set_binding_status(&context.id, agent_type, "completed");
+        let _ = self.db.set_binding_status(&context.id, agent_type, "completed", false);
         let caps = conn.cached_caps(session_id);
         let mut response = caps.as_object().cloned().unwrap_or_default();
         response.insert("bound".to_string(), Value::Bool(true));

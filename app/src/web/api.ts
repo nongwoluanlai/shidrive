@@ -48,6 +48,23 @@ export interface FileHit { path: string; rel: string; score: number; indices: nu
 export interface LineMatch { line: number; col: number; len: number; preview: string; pstart: number; plen: number }
 export interface ContentHit { path: string; rel: string; matches: LineMatch[]; more: boolean }
 
+export interface RemoteStatus {
+  running: boolean; port: number; started_at: string | null; public_url: string | null;
+  grants_active: number; tunnel_running: boolean; logs: string[]; timer_stop_in_secs: number;
+}
+export interface RemoteGrant {
+  id: string; project_id: string; project_name: string; project_root: string;
+  context_id: string | null; context_name: string; context_enabled: boolean;
+  fs_write: boolean; exec_allowed: boolean; created_at: string; revoked_at: string | null; paused_at: string | null;
+}
+export interface OAuthTokenRow { id: string; client_id: string; client_name: string; scopes: string; last_used_at: string | null; revoked_at: string | null }
+export interface OAuthPending { txnId: string; clientId: string; clientName: string; redirectUri: string; scopes: string[] }
+export interface RemoteState {
+  status: RemoteStatus; grants: RemoteGrant[]; oauthTokens: OAuthTokenRow[]; oauthPending: OAuthPending[];
+  cloudflared: { installed: boolean; path: string; version: string };
+  exposure: "custom" | "quick_tunnel"; customUrl: string; port: number; execAllowed: boolean; timerHours: number;
+}
+
 export class ApiError extends Error {
   constructor(public status: number, message: string, public data?: any) { super(message); }
 }
@@ -82,6 +99,24 @@ export const api = {
   login: (code: string) => request<{ ok: boolean }>("POST", "/api/login", { code }),
   logout: () => request<{ ok: boolean }>("POST", "/api/logout", {}),
   projects: () => request<Project[]>("GET", "/api/projects"),
+  /** 电脑端当前配色（CSS 变量 + preset），无需登录 */
+  theme: () => request<Record<string, string>>("GET", "/api/theme"),
+  remote: {
+    state: () => request<RemoteState>("GET", "/api/remote/state"),
+    start: () => request<{ ok: boolean }>("POST", "/api/remote/start", {}),
+    stop: () => request<{ ok: boolean }>("POST", "/api/remote/stop", {}),
+    exposure: (exposure: "custom" | "quick_tunnel") => request<{ ok: boolean }>("POST", "/api/remote/exposure", { exposure }),
+    options: (o: { customUrl?: string; port?: number; execAllowed?: boolean }) => request<{ ok: boolean }>("POST", "/api/remote/options", o),
+    timer: (hours: number) => request<{ ok: boolean }>("POST", "/api/remote/timer", { hours }),
+    create: (g: { projectId: string; contextId: string; fsWrite: boolean; execAllowed: boolean }) =>
+      request<{ grant: RemoteGrant; token: string }>("POST", "/api/remote/grant/create", g),
+    token: (id: string) => request<{ token: string }>("POST", "/api/remote/grant/token", { id }),
+    pause: (id: string) => request<{ ok: boolean }>("POST", "/api/remote/grant/pause", { id }),
+    resume: (id: string) => request<{ ok: boolean }>("POST", "/api/remote/grant/resume", { id }),
+    remove: (id: string) => request<{ ok: boolean }>("POST", "/api/remote/grant/delete", { id }),
+    oauthRevoke: (id: string) => request<{ ok: boolean }>("POST", "/api/remote/oauth/revoke", { id }),
+    oauthDecide: (txnId: string, approve: boolean) => request<{ ok: boolean }>("POST", "/api/remote/oauth/decide", { txnId, approve }),
+  },
   contexts: (project: string) => request<Context[]>("GET", `/api/contexts?${qs({ project })}`),
   context: (id: string) => request<{ context: Context; entries: ContextEntry[]; commits: Commit[] }>("GET", `/api/context?${qs({ id })}`),
   agents: () => request<Agent[]>("GET", "/api/agents"),

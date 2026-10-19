@@ -1,7 +1,9 @@
 // 网站接入：全局状态与事件处理（移植自桌面端 state.svelte.ts 的会话更新逻辑，去掉 Tauri 依赖）。
 import { api, rid, ApiError, type Agent, type Context, type Item, type PermissionReq, type Project, type ReplayRow, type ToolCall, type WorkflowSummary } from "./api";
 
-export type View = "chat" | "files" | "workflows" | "context";
+export type View = "chat" | "files" | "workflows" | "context" | "remote";
+/** desktop = 跟随电脑端当前配色（含皮肤）；dark / light = 网页端内置配色 */
+export type ThemeMode = "desktop" | "dark" | "light";
 
 export interface ChatState {
   sessionId: string | null;
@@ -28,7 +30,9 @@ export const ui = $state({
   authed: null as boolean | null,
   version: "",
   connected: false,
-  theme: (lsGet("theme") || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")) as "dark" | "light",
+  theme: (["desktop", "dark", "light"].includes(lsGet("theme")) ? lsGet("theme") : "desktop") as ThemeMode,
+  /** 电脑端配色快照（/api/theme）；为空 = 电脑端尚未同步 */
+  desktopTheme: null as Record<string, string> | null,
   view: (lsGet("view") || "chat") as View,
   drawer: false,
   projects: [] as Project[],
@@ -61,12 +65,38 @@ export function toast(kind: Toast["kind"], text: string) {
 }
 export const errText = (e: unknown) => (e instanceof ApiError ? e.message : String((e as any)?.message ?? e));
 
-export function setTheme(t: "dark" | "light") {
+let themeApplied: string[] = [];
+export function setTheme(t: ThemeMode) {
   ui.theme = t;
   lsSet("theme", t);
-  document.documentElement.dataset.theme = t;
-  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", t === "dark" ? "#0e1017" : "#f2f4f9");
+  const d = t === "desktop" ? ui.desktopTheme : null;
+  const preset = d ? (d.preset === "light" ? "light" : "dark")
+    : t === "light" || (t === "desktop" && matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
+  const root = document.documentElement;
+  root.dataset.theme = preset;
+  for (const k of themeApplied) root.style.removeProperty(k);
+  themeApplied = [];
+  for (const [k, v] of Object.entries(d ?? {})) {
+    if (/^--[a-z0-9-]+$/.test(k) && typeof v === "string" && v.length < 120 && !/url\(|[;{}<>]/i.test(v)) {
+      root.style.setProperty(k, v);
+      themeApplied.push(k);
+    }
+  }
+  const bg = d?.["--bg"] && /^#[\da-f]{3,8}$/i.test(d["--bg"]) ? d["--bg"] : preset === "dark" ? "#0e1017" : "#f2f4f9";
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", bg);
 }
+/** 拉取电脑端当前配色（启动 / 页面重新可见时），跟随模式下立即应用 */
+export async function loadDesktopTheme() {
+  try {
+    const v = await api.theme();
+    ui.desktopTheme = v && typeof v === "object" && v["--bg"] ? v : null;
+  } catch {
+    return;
+  }
+  if (ui.theme === "desktop") setTheme("desktop");
+}
+export const THEME_LABEL: Record<ThemeMode, string> = { desktop: "跟随电脑端", dark: "深色", light: "浅色" };
+export const nextTheme = (t: ThemeMode): ThemeMode => (t === "desktop" ? "dark" : t === "dark" ? "light" : "desktop");
 export function setView(v: View) { ui.view = v; ui.drawer = false; lsSet("view", v); }
 
 const nid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);

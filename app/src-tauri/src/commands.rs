@@ -869,13 +869,7 @@ pub async fn remote_timer_set(app: tauri::AppHandle, db: DbState<'_>, hours: f64
 pub async fn system_after_action(kind: String, command: String) -> Result<(), String> {
     match kind.as_str() {
         "sound" => {
-            #[cfg(windows)]
-            {
-                let mut c = std::process::Command::new("powershell");
-                c.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", "[console]::beep(880,180); [console]::beep(1175,240)"]);
-                crate::setup::hide_console(&mut c);
-                c.spawn().map_err(|e| format!("提示音播放失败: {e}"))?;
-            }
+            crate::toast::play_chime();
             Ok(())
         }
         "shutdown" => {
@@ -1072,26 +1066,21 @@ pub async fn global_log_push(level: String, category: String, message: String) -
     Ok(())
 }
 
-/// 聊天回合结束后的「弹窗提醒」：text 为「标题:内容」。立即返回；用户点击气泡后
+/// 聊天回合结束后的「弹窗提醒」：text 为「标题:内容」。立即返回；用户点击通知后
 /// 唤出主窗口并发 `notify://clicked`，前端据此切到对应项目/上下文/Agent 会话。
 #[tauri::command]
 pub async fn system_notify(app: tauri::AppHandle, text: String, context_id: String, agent_type: String) -> Result<(), String> {
     let (title, body) = crate::notify::split_title(&text);
-    tauri::async_runtime::spawn_blocking(move || match crate::notify::show_clickable(&title, &body, 10) {
-        Ok(true) => {
-            crate::raise_main_window(&app);
-            let db = tauri::Manager::state::<std::sync::Arc<Db>>(&app);
-            let project_id = db.get_context_row(&context_id).map(|c| c.project_id);
-            let _ = tauri::Emitter::emit(
-                &app,
-                "notify://clicked",
-                serde_json::json!({ "contextId": context_id, "agentType": agent_type, "projectId": project_id }),
-            );
-        }
-        Ok(false) => {}
-        Err(e) => log::warn!("{e}"),
-    });
-    Ok(())
+    crate::toast::show(
+        &app,
+        crate::toast::Toast {
+            title,
+            body,
+            click: crate::toast::ToastClick::Session { context_id, agent_type },
+            sound: false,
+            timeout_secs: 12,
+        },
+    )
 }
 
 /// 前端气泡提示落日志文件（error/warn 记录详情，便于远程排查）。

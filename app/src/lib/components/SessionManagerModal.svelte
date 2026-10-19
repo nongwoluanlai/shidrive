@@ -1,11 +1,11 @@
 <script lang="ts">
   import { t } from "../i18n";
-  // 会话管理: 表格形式展示所有绑定，双击跳转；支持解绑、复制提示词、改标题。
-  import { app, toast, sharedContextPrompt, chatKey, adoptBinding, invalidateBindingRead, clearChat } from "../state.svelte";
+  // 会话管理: 表格形式展示所有绑定，双击跳转；支持复制提示词、改标题（解绑入口已移除，换会话请用聊天页的新建/绑定）。
+  import { app, toast, sharedContextPrompt } from "../state.svelte";
   import { api } from "../ipc";
   import Icon from "./Icon.svelte";
   import type { AgentType, BindingInfo } from "../types";
-  import { confirmDialog, promptDialog } from "../dialog.svelte";
+  import { promptDialog } from "../dialog.svelte";
 
   let bindings = $state<BindingInfo[]>([]);
   let loading = $state(true);
@@ -20,24 +20,6 @@
       .catch((e) => toast("error", String(e)))
       .finally(() => (loading = false));
   });
-
-  async function unbind(b: BindingInfo) {
-    const key = chatKey(b.context_id, b.agent_type);
-    if (app.streaming[key] || app.sessionBusy[key]) return;
-    app.sessionBusy[key] = true;
-    invalidateBindingRead(key);
-    try {
-      if (!(await confirmDialog({ title: t("解绑会话"), message: t("解绑 {p0} × {p1} 的会话？AI 端会话不会删除。", { p0: b.context_name, p1: b.agent_type }), danger: true, confirmText: t("解绑") }))) return;
-      await api.bindingUnbind(b.context_id, b.agent_type);
-      adoptBinding(key, null);
-      clearChat(key);
-      app.bindingTitleMap[key] = null;
-      delete app.sessionInfo[key];
-      bindings = await api.bindingsAll();
-      toast("ok", t("已解绑"));
-    } catch (e) { toast("error", String(e)); }
-    finally { app.sessionBusy[key] = false; }
-  }
 
   async function jump(b: BindingInfo) {
     const p = app.projects.find((x) => x.name === b.project_name);
@@ -114,7 +96,6 @@
                 <td>{b.updated_at.slice(5, 16)}</td>
                 <td class="acts">
                   <button class="btn sm" onclick={(e) => { e.stopPropagation(); void jump(b); }}>{t("前往")}</button>
-                  <button class="btn ghost sm danger" onclick={(e) => { e.stopPropagation(); void unbind(b); }}>{t("解绑")}</button>
                 </td>
               </tr>
             {:else}

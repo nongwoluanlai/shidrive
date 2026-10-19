@@ -30,3 +30,41 @@ export const ACCENTS = [
   { name: "玫红", value: "#ef6b9c" },
   { name: "石墨", value: "#8b95a9" },
 ];
+
+// ---------- 主题色共享：网页端 / 通知弹窗沿用桌面端当前配色 ----------
+
+/** 共享给网页端与通知弹窗的 CSS 变量（取计算值，皮肤覆盖后的颜色也一并带上）。 */
+const SHARED_VARS = [
+  "--bg", "--bg-panel", "--bg-elev", "--bg-elev2", "--border", "--border-soft",
+  "--text", "--text-dim", "--text-faint", "--accent", "--accent-contrast", "--accent-soft",
+  "--ok", "--warn", "--danger", "--code-bg", "--scroll", "--radius", "--user-bubble",
+];
+
+export function exportThemeVars(): Record<string, string> {
+  const cs = getComputedStyle(document.body);
+  const out: Record<string, string> = { preset: document.documentElement.dataset.theme === "light" ? "light" : "dark" };
+  for (const k of SHARED_VARS) {
+    const v = cs.getPropertyValue(k).trim();
+    if (v && v.length < 120 && !/url\(|expression|[;{}<>]/i.test(v)) out[k] = v;
+  }
+  return out;
+}
+
+/** 监听主题 / 皮肤变化，去抖后把计算后的配色写入设置 ui.theme_vars（内容未变不写）。 */
+export function watchThemeVars(save: (json: string) => Promise<unknown>): () => void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let last = "";
+  const flush = () => {
+    const json = JSON.stringify(exportThemeVars());
+    if (json === last) return;
+    last = json;
+    void save(json).catch(() => { last = ""; });
+  };
+  const schedule = () => { clearTimeout(timer); timer = setTimeout(flush, 800); };
+  const mo = new MutationObserver(schedule);
+  mo.observe(document.documentElement, { attributes: true, attributeFilter: ["style", "data-theme", "class"] });
+  mo.observe(document.body, { attributes: true, attributeFilter: ["style", "data-skin", "class"] });
+  mo.observe(document.head, { childList: true, subtree: true, characterData: true });
+  timer = setTimeout(flush, 1500);
+  return () => { mo.disconnect(); clearTimeout(timer); };
+}

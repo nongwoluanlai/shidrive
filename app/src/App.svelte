@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { app, loadProjects, currentProject, currentContext, loadPrompts, isNoProject, loadCfgPrefs, capabilityLists, isFakeDeepseekCaps } from "./lib/state.svelte";
   import { api } from "./lib/ipc";
-  import { applyTheme } from "./lib/theme";
+  import { applyTheme, watchThemeVars } from "./lib/theme";
   import { activateSkin, loadSkinOpacity } from "./lib/skins.svelte";
   import { loadSkinMotion } from "./lib/skin-fx/motion.svelte";
   import { toast as skinToast } from "./lib/state.svelte";
@@ -36,6 +36,8 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
   $effect(() => {
     applyTheme(app.theme);
   });
+  // 当前配色（含皮肤）同步给网页端与通知弹窗
+  onMount(() => watchThemeVars((json) => api.settingsSet("ui.theme_vars", json)));
 
   // 禁用浏览器默认右键菜单（自定义菜单在各自组件内处理 contextmenu 并已 preventDefault）
   // Konami Code（上上下下左右左右BA）唤出 DevTools

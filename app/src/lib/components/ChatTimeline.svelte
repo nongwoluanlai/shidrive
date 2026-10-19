@@ -19,19 +19,36 @@
 
   const STEP = 15; // 每个点占用的最小像素
   const IND = 16; // 上下溢出指示占用的像素
-  let tlH = $state(160);
+  const MIN_H = 160; // 非窗口模式最小高度（与 CSS min-height 一致）
+  let tlH = $state(MIN_H);
+  // 所在行（消息区一整列）的高度：窗口模式的判定只依赖它，不依赖时间线自身高度。
+  // 旧逻辑用时间线自身高度判定，而窗口模式会把时间线从 160px 撑到 62%——
+  // 用户消息数落在两者容量之间（约 11~28 条）时「窗口↔非窗口」每帧来回切换，
+  // 宽度 18↔22px 跟着变，带动消息区重排、贴底重滚，整页持续抖动。
+  let rowH = $state(0);
   let tlEl = $state<HTMLDivElement | null>(null);
   $effect(() => {
     const el = tlEl;
     if (!el) return;
-    const ro = new ResizeObserver(() => (tlH = el.clientHeight || 160));
+    const row = el.parentElement;
+    const ro = new ResizeObserver(() => {
+      const h = el.clientHeight || MIN_H;
+      if (h !== tlH) tlH = h;
+      const rh = row?.clientHeight ?? 0;
+      if (rh && Math.abs(rh - rowH) > 1) rowH = rh;
+    });
     ro.observe(el);
+    if (row) ro.observe(row);
     return () => ro.disconnect();
   });
 
   const n = $derived(markers.length);
-  const fitAll = $derived(Math.floor(tlH / STEP));
+  // 非窗口模式的最大可用高度 = 行高 55% - 上下 margin（与 CSS max-height 对应）
+  const normMax = $derived(rowH ? Math.max(MIN_H, rowH * 0.55 - 20) : MIN_H);
+  const fitAll = $derived(Math.floor(normMax / STEP));
   const windowed = $derived(n > Math.max(fitAll, 6));
+  // 非窗口模式按点数给定高度（点距 >= STEP），上限由 CSS max-height 约束
+  const normH = $derived(Math.max(MIN_H, n * STEP));
   const cap = $derived(windowed ? Math.max(4, Math.floor((tlH - 2 * IND) / STEP)) : n);
 
   // ---- 当前阅读位置（消息区滚动 → 当前所在的用户消息序号）----
@@ -174,7 +191,7 @@
   }
 </script>
 
-<div class="timeline" class:windowed bind:this={tlEl} role="navigation" aria-label={t("会话时间线")}>
+<div class="timeline" class:windowed style={windowed ? undefined : `height:${normH}px`} bind:this={tlEl} role="navigation" aria-label={t("会话时间线")}>
   <SkinTimelineArt />
   <div class="rail"></div>
   {#if windowed}

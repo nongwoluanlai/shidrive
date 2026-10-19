@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api } from "./api";
   import { ui, loadAll, errText } from "./store.svelte";
+  import logo from "../assets/logo.png";
 
   let code = $state("");
   let busy = $state(false);
@@ -28,7 +29,7 @@
 
 <div class="login">
   <form class="panel" onsubmit={submit}>
-    <div class="logo">驾</div>
+    <img class="logo" src={logo} alt="使驾" draggable="false" />
     <h1>使驾 ShiDrive</h1>
     <p class="sub">网站接入 · 请输入访客码</p>
     <div class="field">
@@ -61,10 +62,7 @@
     width: min(380px, 100%); background: var(--bg-panel); border: 1px solid var(--border-soft); border-radius: 18px;
     padding: 32px 26px 24px; box-shadow: var(--shadow); display: flex; flex-direction: column; align-items: stretch; gap: 12px; text-align: center;
   }
-  .logo {
-    width: 56px; height: 56px; border-radius: 16px; margin: 0 auto 4px; display: grid; place-items: center;
-    font-size: 26px; font-weight: 700; color: #fff; background: linear-gradient(135deg, var(--accent), #8a6dff);
-  }
+  .logo { width: 64px; height: 64px; border-radius: 16px; margin: 0 auto 4px; object-fit: contain; }
   h1 { font-size: 22px; }
   .sub { color: var(--text-dim); margin-top: -6px; }
   .field { position: relative; margin-top: 8px; }

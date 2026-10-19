@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "toast",
+  "description": "通知弹窗（toast-*）：仅需核心 IPC 调用 toast_info / toast_action",
+  "windows": ["toast-*"],
+  "permissions": ["core:default"]
+}

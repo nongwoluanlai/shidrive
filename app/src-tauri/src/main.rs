@@ -21,6 +21,7 @@ mod schedule;
 mod node_rt;
 mod setup;
 mod skins;
+mod toast;
 mod web;
 
 use std::sync::Arc;
@@ -255,6 +256,7 @@ fn main() {
             app.manage(agents);
             app.manage(engine);
             app.manage(crate::remote_mcp::RemoteManager::new());
+            app.manage(crate::toast::ToastState::new());
             app.manage(std::sync::Arc::new(crate::remote_oauth::OAuthState::new()));
             // 网站接入：开关为开时随应用自动启动
             app.manage(crate::web::WebManager::new());
@@ -267,7 +269,11 @@ fn main() {
         })
         .on_window_event(|window, event| {
             // 关闭即隐藏到托盘，保持后台运行（MCP / 定时工作流不中断）
+            // 仅主窗口：通知弹窗（toast-*）按正常流程销毁
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() != "main" {
+                    return;
+                }
                 api.prevent_close();
                 let _ = window.hide();
             }
@@ -378,6 +384,8 @@ fn main() {
             commands::global_log_clear,
             commands::global_log_push,
             commands::system_notify,
+            toast::toast_info,
+            toast::toast_action,
             commands::data_export,
             commands::data_import,
             commands::node_status,

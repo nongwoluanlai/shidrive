@@ -366,7 +366,7 @@ impl Db {
                    workspace=COALESCE(excluded.workspace,agent_bindings.workspace),
                    status=CASE WHEN ?8 THEN '' ELSE agent_bindings.status END,
                    model=CASE WHEN ?8 THEN '' ELSE agent_bindings.model END,
-                   updated_at=excluded.updated_at",
+                   updated_at=CASE WHEN ?8 THEN excluded.updated_at ELSE agent_bindings.updated_at END",
                 params![uuid(), context_id, agent_type, session_id, title, workspace, now(), changed],
             )?;
             tx.commit()
@@ -826,11 +826,13 @@ impl Db {
         })
     }
 
-    pub fn set_binding_status(&self, context_id: &str, agent_type: &str, status: &str) -> Result<(), String> {
+    /// `touch`: 是否刷新 updated_at。会话「更新时间」只在发送消息 / 回复结束时变化，
+    /// 打开、查看、重新绑定同一会话、改标题 / 模型都不算。
+    pub fn set_binding_status(&self, context_id: &str, agent_type: &str, status: &str, touch: bool) -> Result<(), String> {
         self.with(|c| {
             c.execute(
-                "UPDATE agent_bindings SET status=?3, updated_at=?4 WHERE context_id=?1 AND agent_type=?2",
-                params![context_id, agent_type, status, now()],
+                "UPDATE agent_bindings SET status=?3, updated_at=CASE WHEN ?5 THEN ?4 ELSE updated_at END WHERE context_id=?1 AND agent_type=?2",
+                params![context_id, agent_type, status, now(), touch],
             )?;
             Ok(())
         })
@@ -839,8 +841,8 @@ impl Db {
     pub fn set_binding_model(&self, context_id: &str, agent_type: &str, model: &str) -> Result<(), String> {
         self.with(|c| {
             c.execute(
-                "UPDATE agent_bindings SET model=?3, updated_at=?4 WHERE context_id=?1 AND agent_type=?2",
-                params![context_id, agent_type, model, now()],
+                "UPDATE agent_bindings SET model=?3 WHERE context_id=?1 AND agent_type=?2",
+                params![context_id, agent_type, model],
             )?;
             Ok(())
         })
@@ -849,8 +851,8 @@ impl Db {
     pub fn set_binding_title(&self, context_id: &str, agent_type: &str, title: &str) -> Result<(), String> {
         self.with(|c| {
             c.execute(
-                "UPDATE agent_bindings SET title=?3, updated_at=?4 WHERE context_id=?1 AND agent_type=?2",
-                params![context_id, agent_type, title, now()],
+                "UPDATE agent_bindings SET title=?3 WHERE context_id=?1 AND agent_type=?2",
+                params![context_id, agent_type, title],
             )?;
             Ok(())
         })
@@ -1589,6 +1591,30 @@ mod tests {
         for new in &ids[extra as usize..] { assert!(kept.contains(new)); }
         // 别的工作流不受影响
         assert_eq!(db.list_runs(&w2.id, 1000).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn binding_updated_at_only_moves_on_turns() {
+        let db = fixture_db();
+        let p = db.create_project("p", "/tmp/p", "").unwrap();
+        let ctx = db.create_context(&p.id, "ctx").unwrap();
+        db.set_binding_session(&ctx.id, "codex", Some("s1"), None, None).unwrap();
+        let old = "2000-01-01T00:00:00";
+        let set_old = || db.with(|c| c.execute("UPDATE agent_bindings SET updated_at=?1", params![old])).unwrap();
+        let ts = || db.get_binding(&ctx.id, "codex").unwrap().unwrap().updated_at;
+        set_old();
+        // 打开 / 重放同一会话、改标题、改模型、绑定时标记完成：都不刷新
+        db.set_binding_session(&ctx.id, "codex", Some("s1"), Some("t"), Some("/w")).unwrap();
+        db.set_binding_status(&ctx.id, "codex", "completed", false).unwrap();
+        db.set_binding_title(&ctx.id, "codex", "t2").unwrap();
+        db.set_binding_model(&ctx.id, "codex", "m").unwrap();
+        assert_eq!(ts(), old);
+        // 发送（running）/ 回复结束（completed）刷新
+        db.set_binding_status(&ctx.id, "codex", "running", true).unwrap();
+        assert_ne!(ts(), old);
+        set_old();
+        db.set_binding_status(&ctx.id, "codex", "completed", true).unwrap();
+        assert_ne!(ts(), old);
     }
 
     /// Populate one project with everything that can hang off it.

@@ -613,20 +613,9 @@
       {#if selected}
         <div class="head">
           <input class="name-input" bind:value={selected.name} placeholder={t("工作流名称")} />
-          {#if selected.trigger_type === "schedule" && selected.enabled}
-            <span class="badge accent" title={t("下次触发")}>⏰ {scheduleText(selected.schedule)} · {t("下次 {time}", { time: selected.next_run_at ?? "—" })}</span>
-          {:else}
-            <span class="badge">{t("手动")}</span>
-          {/if}
-          {#if saveProblem}
-            <span class="badge warn" title={saveProblem}>⚠ {t("未保存")}</span>
-          {:else if unsaved}
-            <span class="badge" title={t("修改将在停止输入后自动保存")}>{t("保存中…")}</span>
-          {/if}
           <div class="trigger-wrap">
-            <button class="btn" onclick={() => (triggerOpen = !triggerOpen)}>
-              ⚡ {t("触发：{schedule}", { schedule: selected.trigger_type === "schedule" ? (selected.enabled ? scheduleText(selected.schedule) : t("已停用")) : t("手动") })}
-            </button>
+            <!-- 按钮文字固定，弹窗锚点不随触发描述长度移动；描述放在按钮右侧 -->
+            <button class="btn" onclick={() => (triggerOpen = !triggerOpen)}>⚡ {t("触发配置")}</button>
             {#if triggerOpen}
               <div class="popover">
                 <div class="row">
@@ -690,6 +679,18 @@
               </div>
             {/if}
           </div>
+          {#if selected.trigger_type === "schedule" && selected.enabled}
+            <span class="badge accent" title={t("下次触发")}>⏰ {scheduleText(selected.schedule)} · {t("下次 {time}", { time: selected.next_run_at ?? "—" })}</span>
+          {:else if selected.trigger_type === "schedule"}
+            <span class="badge">⏰ {scheduleText(selected.schedule)} · {t("已停用")}</span>
+          {:else}
+            <span class="badge">{t("手动")}</span>
+          {/if}
+          {#if saveProblem}
+            <span class="badge warn" title={saveProblem}>⚠ {t("未保存")}</span>
+          {:else if unsaved}
+            <span class="badge" title={t("修改将在停止输入后自动保存")}>{t("保存中…")}</span>
+          {/if}
           <span class="spacer"></span>
           {#if running}
             <button class="btn danger" onclick={stopRun}>■ {t("停止")}</button>
@@ -890,7 +891,7 @@
             <div class="field grow"><label>{t("点击目标（目录路径 或 http(s):// 链接，支持插值）")}</label><input class="grow" bind:value={st.click_target} placeholder={st.click_action === "url" ? "https://…" : t("{variable} 或 {path}", { variable: "{{var.build_dir}}", path: "D:\\dist" })} /></div>
           </div>
           <label class="toggle"><input type="checkbox" bind:checked={st.sound} /> {t("气泡伴随提示音")}</label>
-          <p class="hint">{t("运行到该节点时弹出 Windows 系统气泡提醒；提醒失败不会中断工作流。")}</p>
+          <p class="hint">{t("运行到该节点时在屏幕右下角弹出使驾通知；提醒失败不会中断工作流。")}</p>
         {:else if st.type === "shell"}
           <div class="field"><label>{t("节点名（可留空，显示在画布与日志中）")}</label><input bind:value={st.name} placeholder={t("如：构建 / 下载文件")} /></div>
           <div class="field"><label>{t("命令")}</label><textarea rows="3" class="mono" bind:value={st.command}></textarea></div>

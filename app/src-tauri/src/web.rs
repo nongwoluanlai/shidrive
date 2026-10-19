@@ -977,6 +977,10 @@ fn handle_api(stream: &mut TcpStream, req: &Req, ctx: &Ctx) -> Result<(), String
             return respond_json(stream, 200, &json!({ "authed": authed, "version": env!("CARGO_PKG_VERSION") }), "");
         }
         ("POST", "/api/login") => return login(stream, req, ctx),
+        // 桌面端当前配色（仅颜色变量，不含敏感信息）：登录页也沿用同一主题
+        ("GET", "/api/theme") => {
+            return respond_json(stream, 200, &crate::toast::theme_vars(&ctx.app), "Cache-Control: no-cache\r\n");
+        }
         ("POST", "/api/logout") => {
             ctx.hub.remove_session(&token);
             let cookie = format!("Set-Cookie: {COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0\r\n");
@@ -1336,6 +1340,178 @@ fn route(req: &Req, ctx: &Ctx) -> ApiResult {
             .map_err(|e| e.to_string())?;
             let r = crate::search::search(opts)?;
             Ok(serde_json::to_value(r).unwrap_or(Value::Null))
+        }
+        _ if req.path.starts_with("/api/remote/") => remote_api(req, ctx),
+        _ => Err(ApiErr(404, "接口不存在".into())),
+    }
+}
+
+// ------------------------------------------------------------------ 外部编程接入（MCP）
+
+fn setting(db: &Db, key: &str) -> String {
+    db.get_setting(key).ok().flatten().unwrap_or_default()
+}
+
+fn b(v: &Value, k: &str) -> bool {
+    v.get(k).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// 与桌面端「设置 → 外部编程接入」等价的网页端接口（均需登录；写操作另需 X-SD-Web 头）。
+/// 服务启停沿用桌面端保存的接入方式与端口；cloudflared 安装 / 路径仍在桌面端操作。
+fn remote_api(req: &Req, ctx: &Ctx) -> ApiResult {
+    use crate::remote_mcp as rm;
+    let db = &ctx.db;
+    let remote = ctx.app.state::<rm::RemoteManager>();
+    let oauth = ctx.app.state::<Arc<crate::remote_oauth::OAuthState>>().inner().clone();
+    let id_of = |v: &Value| -> Result<String, ApiErr> {
+        let id = s(v, "id");
+        if id.is_empty() { Err("缺少 id".into()) } else { Ok(id) }
+    };
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/api/remote/state") => {
+            let exposure = match setting(db, "remote.exposure").as_str() {
+                "custom" => "custom",
+                _ => "quick_tunnel",
+            };
+            let port = setting(db, "remote.port").parse::<u16>().ok().filter(|p| *p > 0).unwrap_or(51688);
+            let hours = setting(db, "remote.auto_stop_hours").parse::<f64>().ok().filter(|h| *h > 0.0).unwrap_or(6.0);
+            Ok(json!({
+                "status": remote.status(db),
+                "grants": rm::grants_list(db)?,
+                "oauthTokens": crate::remote_oauth::tokens_list(db)?,
+                "oauthPending": crate::remote_oauth::pending_list(&oauth),
+                "cloudflared": rm::cloudflared_status(db),
+                "exposure": exposure,
+                "customUrl": setting(db, "remote.custom_url"),
+                "port": port,
+                "execAllowed": setting(db, "remote.exec_allowed") == "1",
+                "timerHours": hours,
+            }))
+        }
+        ("POST", "/api/remote/start") => {
+            let quick = setting(db, "remote.exposure") != "custom";
+            if quick && !rm::cloudflared_status(db).installed {
+                return Err("未找到 cloudflared：请先在电脑端「外部编程接入」中快捷安装或指定已有程序".into());
+            }
+            let port = setting(db, "remote.port").parse::<u16>().ok().filter(|p| *p > 0).unwrap_or(51688);
+            remote.start(ctx.app.clone(), db.clone(), engine(ctx), "0.0.0.0", port, quick, oauth)?;
+            ctx.hub.log("外部编程服务已由网页端启动");
+            Ok(json!({ "ok": true }))
+        }
+        ("POST", "/api/remote/stop") => {
+            remote.stop();
+            ctx.hub.log("外部编程服务已由网页端停止");
+            Ok(json!({ "ok": true }))
+        }
+        ("POST", "/api/remote/exposure") => {
+            let v = req.json()?;
+            let exposure = if s(&v, "exposure") == "custom" { "custom" } else { "quick_tunnel" };
+            db.set_setting("remote.exposure", exposure)?;
+            if remote.status(db).running {
+                if exposure == "quick_tunnel" {
+                    if !rm::cloudflared_status(db).installed {
+                        return Err("未找到 cloudflared：请先在电脑端快捷安装或指定已有程序".into());
+                    }
+                    remote.tunnel_start(ctx.app.clone(), db.clone())?;
+                } else {
+                    remote.tunnel_stop();
+                }
+            }
+            Ok(json!({ "ok": true }))
+        }
+        ("POST", "/api/remote/options") => {
+            let v = req.json()?;
+            if let Some(u) = v.get("customUrl").and_then(Value::as_str) {
+                let u = u.trim().trim_end_matches('/');
+                if !u.is_empty() && !(u.starts_with("http://") || u.starts_with("https://")) {
+                    return Err("自定义地址需以 http:// 或 https:// 开头".into());
+                }
+                db.set_setting("remote.custom_url", u)?;
+            }
+            if let Some(p) = v.get("port").and_then(Value::as_i64) {
+                if !(1..=65535).contains(&p) {
+                    return Err("端口需为 1-65535 的整数".into());
+                }
+                db.set_setting("remote.port", &p.to_string())?;
+            }
+            if let Some(e) = v.get("execAllowed").and_then(Value::as_bool) {
+                db.set_setting("remote.exec_allowed", if e { "1" } else { "0" })?;
+            }
+            Ok(json!({ "ok": true }))
+        }
+        ("POST", "/api/remote/timer") => {
+            let v = req.json()?;
+            let hours = v.get("hours").and_then(Value::as_f64).unwrap_or(-1.0);
+            if !hours.is_finite() || hours < 0.0 {
+                return Err("小时数无效".into());
+            }
+            if hours == 0.0 {
+                db.set_setting("remote.auto_stop_hours", "0")?;
+                rm::RemoteManager::arm_timer(&ctx.app, 0.0);
+            } else {
+                let h = hours.clamp(0.05, 24.0 * 7.0);
+                db.set_setting("remote.auto_stop_hours", &format!("{h}"))?;
+                rm::RemoteManager::arm_timer(&ctx.app, h);
+            }
+            Ok(json!({ "ok": true }))
+        }
+        ("POST", "/api/remote/grant/create") => {
+            let v = req.json()?;
+            let project_id = s(&v, "projectId");
+            let project = db
+                .list_projects()?
+                .into_iter()
+                .find(|p| p.id == project_id)
+                .ok_or_else(|| not_found("项目"))?;
+            let context_id = s(&v, "contextId");
+            let context = if context_id.is_empty() {
+                None
+            } else {
+                let c = context_of(ctx, &context_id)?;
+                if c.project_id != project.id {
+                    return Err("上下文不属于该项目".into());
+                }
+                Some(c)
+            };
+            let input = rm::RemoteGrantInput {
+                project_id: project.id.clone(),
+                project_name: project.name.clone(),
+                project_root: project.root_path.clone(),
+                context_id: context.as_ref().map(|c| c.id.clone()),
+                context_name: context.as_ref().map(|c| c.name.clone()).unwrap_or_default(),
+                context_enabled: context.is_some(),
+                fs_write: b(&v, "fsWrite"),
+                exec_allowed: b(&v, "execAllowed"),
+            };
+            let (grant, token) = rm::grant_create(db, &input)?;
+            ctx.hub.log(format!("网页端新建外部编程授权：{}", project.name));
+            Ok(json!({ "grant": grant, "token": token }))
+        }
+        ("POST", "/api/remote/grant/token") => Ok(json!({ "token": rm::grant_token_get(db, &id_of(&req.json()?)?)? })),
+        ("POST", "/api/remote/grant/pause") => {
+            rm::grant_pause(db, &id_of(&req.json()?)?)?;
+            Ok(json!({ "ok": true }))
+        }
+        ("POST", "/api/remote/grant/resume") => {
+            rm::grant_resume(db, &id_of(&req.json()?)?)?;
+            Ok(json!({ "ok": true }))
+        }
+        ("POST", "/api/remote/grant/delete") => {
+            rm::grant_delete(db, &id_of(&req.json()?)?)?;
+            Ok(json!({ "ok": true }))
+        }
+        ("POST", "/api/remote/oauth/revoke") => {
+            crate::remote_oauth::token_revoke(db, &id_of(&req.json()?)?)?;
+            Ok(json!({ "ok": true }))
+        }
+        ("POST", "/api/remote/oauth/decide") => {
+            let v = req.json()?;
+            let txn = s(&v, "txnId");
+            if txn.is_empty() {
+                return Err("缺少 txnId".into());
+            }
+            crate::remote_oauth::oauth_decide(db, &oauth, &txn, b(&v, "approve"))?;
+            Ok(json!({ "ok": true }))
         }
         _ => Err(ApiErr(404, "接口不存在".into())),
     }

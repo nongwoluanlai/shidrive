@@ -576,46 +576,28 @@ impl Engine {
         }
     }
 
-    /// Windows 气泡提醒（系统托盘 balloon，与旧使驾同体验）。
+    /// 气泡提醒：使驾自有通知窗口（右下角，不抢焦点）。
     /// 支持点击行为：open=打开目录/文件位置，url=浏览器打开；sound=伴随提示音。
     fn show_balloon(&self, run_id: &str, title: &str, message: &str, click_action: &str, click_target: &str, sound: bool) -> bool {
-        let ps_escape = |v: &str| v.replace("`", "``").replace("\"", "`\"");
-        let action = if click_target.trim().is_empty() { "none" } else { click_action };
-        let target = ps_escape(click_target.trim());
-        let click_block = match action {
-            "open" => r#"$onClick = { try { Start-Process -FilePath explorer.exe -ArgumentList "`"$tgt`"" } catch {}; $n.Visible=$false; $n.Dispose() }; $n.add_BalloonTipClicked($onClick); $n.add_Click($onClick);"#,
-            "url" => r#"$onClick = { try { Start-Process "`"$tgt`"" } catch {}; $n.Visible=$false; $n.Dispose() }; $n.add_BalloonTipClicked($onClick); $n.add_Click($onClick);"#,
-            _ => "",
+        let target = click_target.trim().to_string();
+        let click = match click_action {
+            _ if target.is_empty() => crate::toast::ToastClick::None,
+            "open" => crate::toast::ToastClick::Open(target),
+            "url" => crate::toast::ToastClick::Url(target),
+            _ => crate::toast::ToastClick::None,
         };
-        let sound_line = if sound { "Add-Type -AssemblyName System; [System.Media.SystemSounds]::Asterisk.Play();" } else { "" };
-        let script = format!(
-            r#"$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $n=New-Object System.Windows.Forms.NotifyIcon; $n.Icon=[System.Drawing.SystemIcons]::Information; $n.Visible=$true; $tgt="{target}"; {click_block} $n.ShowBalloonTip(8000,'{t}','{m}','Info'); {sound_line} Start-Sleep -Seconds 8; $n.Visible=$false; $n.Dispose()"#,
-            target = target,
-            click_block = click_block,
-            t = title.replace('\'', "''"),
-            m = message.replace('\'', "''"),
-            sound_line = sound_line,
-        );
-        let out = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
-            .creation_flags_cfg()
-            .output();
-        match out {
-            Ok(o) if o.status.success() => {
-
-                self.log(run_id, &format!("🔔 已发送气泡提醒：{title}"));
-                true
-            }
-            Ok(o) => {
-                let err_txt = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                self.log(run_id, &format!("⚠ 气泡提醒失败: {}", err_txt.chars().take(180).collect::<String>()));
-                true // 提醒失败不阻塞工作流
-            }
-            Err(e) => {
-                self.log(run_id, &format!("⚠ 气泡提醒启动失败: {e}"));
-                true
-            }
+        let toast = crate::toast::Toast {
+            title: if title.trim().is_empty() { "ShiDrive".into() } else { title.to_string() },
+            body: message.to_string(),
+            click,
+            sound,
+            timeout_secs: 8,
+        };
+        match crate::toast::show(&self.app, toast) {
+            Ok(()) => self.log(run_id, &format!("🔔 已发送气泡提醒：{title}")),
+            Err(e) => self.log(run_id, &format!("⚠ 气泡提醒失败: {}", e.chars().take(180).collect::<String>())),
         }
+        true // 提醒失败不阻塞工作流
     }
 
     fn log(&self, run_id: &str, line: &str) {

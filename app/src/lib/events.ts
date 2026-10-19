@@ -15,7 +15,9 @@ export interface AfterActionCfg {
   msg: string;
 }
 
-export const DEFAULT_POPUP_MSG = "ShiDrive:嘟嘟噜";
+export const DEFAULT_POPUP_MSG = "任务完成，点我查看~:嘟嘟噜";
+/** 旧版默认文案：未自定义过的用户随默认值一起升级 */
+const LEGACY_POPUP_MSG = "ShiDrive:嘟嘟噜";
 const AFTER_ACTION_KINDS: AfterActionKind[] = ["sound", "popup", "shutdown", "command"];
 
 export function loadAfterAction(): AfterActionCfg {
@@ -27,7 +29,7 @@ export function loadAfterAction(): AfterActionCfg {
         return {
           kind: v.kind as AfterActionKind,
           cmd: typeof v.cmd === "string" ? v.cmd : "",
-          msg: typeof v.msg === "string" ? v.msg : DEFAULT_POPUP_MSG,
+          msg: typeof v.msg === "string" && v.msg !== LEGACY_POPUP_MSG ? v.msg : DEFAULT_POPUP_MSG,
         };
       }
     }

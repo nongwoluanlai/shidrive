@@ -788,7 +788,8 @@ import type { DisplayItem } from "../state.svelte";
     app.sessionBusy[opKey] = true;
     invalidateBindingRead(opKey);
     try {
-      if (!(await confirmDialog({ title: t("新建会话"), message: t("创建新会话？当前绑定的 AI 会话将被解绑（AI 端历史仍保留）。") }))) return;
+      // 已绑定时才需确认（旧会话在 AI 端仍保留，可随时用「绑定」切回）
+      if (app.bindingSession[opKey] && !(await confirmDialog({ title: t("新建会话"), message: t("创建新会话？当前绑定的 AI 会话将被解绑（AI 端历史仍保留）。") }))) return;
       // Backend creates first, then atomically replaces binding+snapshot. Failure
       // preserves the old history for every adapter, not only DeepSeek.
       const sid = await api.acpSessionNew(context, agent, true);
@@ -802,19 +803,6 @@ import type { DisplayItem } from "../state.svelte";
     finally { app.sessionBusy[opKey] = false; }
   }
 
-  async function resumeSession() {
-    if (!ctx) return;
-    const context = { ...ctx }, agent = app.agent, opKey = key;
-    if (app.streaming[opKey] || app.sessionBusy[opKey] || app.chatLoading[opKey]) return;
-    app.sessionBusy[opKey] = true;
-    invalidateBindingRead(opKey);
-    try {
-      const sid = await api.acpSessionNew(context, agent);
-      adoptBinding(opKey, sid);
-      toast("ok", t("已恢复绑定的会话"));
-    } catch (e) { toast("error", String(e)); }
-    finally { app.sessionBusy[opKey] = false; }
-  }
 
   async function send() {
     if (!ctx || sending || loadingHere || sessionBusy) return;
@@ -1098,7 +1086,7 @@ import type { DisplayItem } from "../state.svelte";
           void api.settingsSet("caps." + agent, "").catch(() => {});
           toast(
             "error",
-            t("该选项在当前会话不可用（列表已过期）。请点「重新连接」刷新后重试。"),
+            t("该选项在当前会话不可用（列表已过期）。请切换会话或重新打开当前上下文后重试。"),
           );
         } else {
           toast("error", msg);
@@ -1424,8 +1412,8 @@ import type { DisplayItem } from "../state.svelte";
         <span class="badge">{t("未绑定会话")}</span>
       {/if}
       <button class="btn sm" disabled={streaming || loadingHere || sessionBusy} onclick={() => (app.historyBind = app.agent)} title={t("绑定 / 切换适配器中的历史会话")}>绑定</button>
-      <button class="btn sm" disabled={streaming || loadingHere || sessionBusy} onclick={sessionId ? resumeSession : newSession} title={sessionId ? t("重新加载会话") : t("创建新会话")}>
-        {sessionId ? t("重新连接") : t("新会话")}
+      <button class="btn sm" disabled={streaming || loadingHere || sessionBusy} onclick={newSession} title={sessionId ? t("新建一个会话并绑定到当前上下文（原会话在 AI 端保留，可用「绑定」切回）") : t("创建新会话")}>
+        {t("新会话")}
       </button>
       <button
         class="btn sm"

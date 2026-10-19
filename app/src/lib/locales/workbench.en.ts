@@ -80,7 +80,7 @@ export const workbenchEn: Record<string, string> = {
   "点击目标（目录路径 或 http(s):// 链接，支持插值）": "Click target (folder path or http(s):// URL; supports interpolation)",
   "{variable} 或 {path}": "{variable} or {path}",
   "气泡伴随提示音": "Play a notification sound",
-  "运行到该节点时弹出 Windows 系统气泡提醒；提醒失败不会中断工作流。": "Show a Windows notification when this node runs. Notification failures do not interrupt the workflow.",
+  "运行到该节点时在屏幕右下角弹出使驾通知；提醒失败不会中断工作流。": "Show a ShiDrive notification at the bottom-right of the screen when this node runs. Notification failures do not interrupt the workflow.",
   "节点名（可留空，显示在画布与日志中）": "Node name (optional; shown on the canvas and in logs)",
   "如：构建 / 下载文件": "e.g. Build / Download files",
   "解释器": "Interpreter",
@@ -316,7 +316,7 @@ export const workbenchEn: Record<string, string> = {
   "安装": "Install",
   "未在常见安装目录与注册表中找到。可手动选择 DeepSeek Harness 安装目录或 dsh.cmd。": "Not found in common install folders or the registry. You can choose the DeepSeek Harness install folder or dsh.cmd manually.",
   "DeepSeek API Key（platform.deepseek.com 获取）": "DeepSeek API key (from platform.deepseek.com)",
-  "该选项在当前会话不可用（列表已过期）。请点「重新连接」刷新后重试。": "This option is unavailable in the current session (stale list). Click Reconnect to refresh and retry.",
+  "该选项在当前会话不可用（列表已过期）。请切换会话或重新打开当前上下文后重试。": "This option is unavailable in the current session (stale list). Switch sessions or reopen this context and retry.",
   // v0.3.4-oauth：MCP 标准握手
   "OAuth 授权（MCP 标准握手）": "OAuth authorization (MCP standard handshake)",
   "受保护资源元数据": "Protected resource metadata",
@@ -519,4 +519,5 @@ export const workbenchEn: Record<string, string> = {
   "查看日志": "View logs",
   "暂无日志": "No logs yet",
   "网站接入": "Web Access",
+  "触发配置": "Trigger",
 };
