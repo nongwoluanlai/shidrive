@@ -460,3 +460,39 @@ export interface AssistantMessage {
 }
 export interface AssistantMemory { id: string; content: string; source: "auto" | "manual" | "summary"; pinned: boolean; created_at: string; updated_at: string }
 export interface AssistantTurnResult { message: AssistantMessage | null; memories_added: number; memories_forgotten: number }
+
+// ---------------- 全局助手 · 语音 ----------------
+export interface VoiceConfig {
+  input_enabled: boolean;
+  input_engine: "local" | "baidu";
+  baidu_api_key: string;
+  baidu_secret_key: string;
+  input_auto_send: boolean;
+  input_max_seconds: number;
+  output_enabled: boolean;
+  default_voice: "system" | "melo" | "kokoro";
+  kokoro_speaker: number;
+  system_voice: string;
+  character_voice: boolean;
+  bindings: Record<string, string>;
+  rate: number;
+  volume: number;
+  source: "official" | "cn";
+  github_prefix: string;
+  pypi_index: string;
+  proxy: string;
+}
+export interface VoiceTask { id: string; stage: string; received: number; total: number; message: string; running: boolean }
+export interface VoicePack { id: string; name: string; lang: string; engine: string; skins: string[]; characters: string[]; license: string; source: string; credits: string }
+export interface VoiceModelStatus { id: string; kind: "asr" | "tts"; name: string; size_mb: number; installed: boolean }
+export interface VoiceStatus {
+  root: string;
+  runtime_installed: boolean;
+  runtime_info: Record<string, string> | null;
+  models: VoiceModelStatus[];
+  packs: VoicePack[];
+  tasks: VoiceTask[];
+  server_running: boolean;
+}
+export interface VoiceView { config: VoiceConfig; baidu_secret_set: boolean; status: VoiceStatus }
+export interface SpeechHint { enabled: boolean; lang: string; layer: boolean }

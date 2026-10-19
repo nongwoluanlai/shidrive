@@ -203,15 +203,48 @@
   "persona": "18 岁的天才脑科学家，傲娇、理性，讨厌被叫助手……",
   "greeting": "你好，我是牧濑红莉栖。先说明，别叫我助手。",
   "style": "generic",
-  "anchor": [62, 78]
+  "anchor": [62, 78],
+  "voice": "amadeus-kurisu"
 }
 ```
 
 - `name`：角色名（≤40 字）；`persona`：性格与说话风格（≤4000 字）；`greeting`：开场白参考（≤300 字，模型会仿照其风格打招呼）。
-- `style`：`generic`（通用轻量气泡，跟随皮肤配色）或 `amadeus`（琥珀色终端风格，`kurisu-dynamic` 默认使用）。
+- `style`：`generic`（通用轻量气泡，跟随皮肤配色）或 `amadeus`（灰色终端风格、黄色点缀，`kurisu-dynamic` 默认使用）。
 - `anchor`：气泡左下角相对人物舞台的位置 `[x%, y%]`（x 从左、y 从下，0–100），默认 `[62, 78]`。
+- `voice`：可选，角色语音包 id（小写字母 / 数字 / `-`，见下节）。已安装该语音包且开启「语音输出 → 皮肤角色有专属语音包时使用角色语音」时，助手用它朗读。
 - 未声明时按皮肤名生成一个通用设定；没有人物的皮肤按「无皮肤」处理，显示左下角简易助手。
 - 气泡元素可用皮肤 CSS 调整颜色、边框、阴影、字体：`.ga-card`（卡片）、`.ga-head` / `.ga-title`（标题栏）、`.ga-body`（正文）、`.ga-btn` / `.ga-icon`（按钮）、`.ga-input`（输入框）、`.ga-chip`（收起时的小标签）、`.ga-launcher`（简易助手按钮）。
+
+### 角色语音包
+
+设置 → 全局助手 → 语音 → 导入语音包（.zip）。语音包需要先安装「语音运行环境」，全部离线合成。zip 根目录（或唯一子目录）包含：
+
+```
+voice.json      # 清单
+model.onnx      # 模型
+tokens.json     # 音素表（engine 需要时）
+README.md       # 可选：来源与许可
+```
+
+```json
+{
+  "id": "amadeus-kurisu",
+  "name": "牧濑红莉栖 · Amadeus（日语）",
+  "lang": "ja",
+  "engine": "espnet-vits-onnx",
+  "model": "model.onnx",
+  "tokens": "tokens.json",
+  "sample_rate": 22050,
+  "skins": ["kurisu-dynamic", "steins-gate"],
+  "license": "CC-BY-4.0",
+  "source": "https://huggingface.co/mio/amadeus"
+}
+```
+
+- `id`：小写字母 / 数字 / `-`，同 id 再次导入会提示覆盖。
+- `lang`：`zh` / `ja` / `en` / `ko` / `yue`。与界面语言不同时（如日语配音），助手会在每句后附一段 `[[ja: …]]` 台词专门用于朗读，气泡里不显示。
+- `engine`：目前支持 `espnet-vits-onnx`（ESPnet VITS 导出的 ONNX，日语经 pyopenjtalk 转音素）；导出脚本见 `app/scripts/voice/export_amadeus_onnx.py`。
+- 匹配顺序：设置里的手动绑定 → 皮肤 manifest 的 `assistant.voice` → 语音包 `skins` 列表；都没有时使用「通用语音」。
 
 ### 动效档位
 

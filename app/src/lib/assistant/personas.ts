@@ -76,7 +76,7 @@ export interface SkinAssistantInput {
   /** 自定义皮肤显示名 */
   skinName?: string;
   /** 皮肤 manifest.assistant（已清洗） */
-  spec?: { name: string; persona: string; greeting: string; style: string; anchor: [number, number] | null } | null;
+  spec?: { name: string; persona: string; greeting: string; style: string; anchor: [number, number] | null; voice?: string } | null;
   /** 当前皮肤是否显示了人物（无人物的皮肤按无皮肤处理） */
   hasCharacter: boolean;
 }

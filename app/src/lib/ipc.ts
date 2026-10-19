@@ -32,6 +32,11 @@ import type {
   AssistantMessage,
   AssistantPersona,
   AssistantTurnResult,
+  SpeechHint,
+  VoiceConfig,
+  VoicePack,
+  VoiceStatus,
+  VoiceView,
 } from "./types";
 
 /** 每个工作流保留的运行历史条数，与后端 db::MAX_RUNS_PER_WORKFLOW 一致 */
@@ -229,10 +234,22 @@ export const api = {
   assistantConfigGet: () => invoke<AssistantConfigView>("assistant_config_get"),
   /** apiKey: undefined/null = 保留已保存的密钥；"" = 清除 */
   assistantConfigSet: (config: AssistantConfig, apiKey?: string | null) => invoke<AssistantConfigView>("assistant_config_set", { config, apiKey: apiKey ?? null }),
-  assistantSend: (text: string, persona: AssistantPersona, appState: string | null, turnId: string) =>
-    invoke<AssistantTurnResult>("assistant_send", { text, persona, appState, turnId }),
-  assistantGreet: (persona: AssistantPersona, appState: string | null, turnId: string, reason: "new" | "resume") =>
-    invoke<AssistantTurnResult>("assistant_greet", { persona, appState, turnId, reason }),
+  assistantSend: (text: string, persona: AssistantPersona, appState: string | null, turnId: string, speech: SpeechHint | null = null) =>
+    invoke<AssistantTurnResult>("assistant_send", { text, persona, appState, turnId, speech }),
+  assistantGreet: (persona: AssistantPersona, appState: string | null, turnId: string, reason: "new" | "resume", speech: SpeechHint | null = null) =>
+    invoke<AssistantTurnResult>("assistant_greet", { persona, appState, turnId, reason, speech }),
+  voiceConfigGet: () => invoke<VoiceView>("voice_config_get"),
+  voiceConfigSet: (config: VoiceConfig, baiduSecret?: string | null) => invoke<VoiceView>("voice_config_set", { config, baiduSecret: baiduSecret ?? null }),
+  voiceStatus: () => invoke<VoiceStatus>("voice_status"),
+  voiceInstall: (id: string) => invoke<void>("voice_install", { id }),
+  voiceCancelInstall: (id: string) => invoke<void>("voice_cancel_install", { id }),
+  voiceRemove: (id: string) => invoke<VoiceStatus>("voice_remove", { id }),
+  voicePickPack: () => invoke<string | null>("voice_pick_pack"),
+  voiceImportPack: (path: string, overwrite = false) => invoke<VoicePack>("voice_import_pack", { path, overwrite }),
+  voiceOpenDir: () => invoke<void>("voice_open_dir"),
+  voiceStt: (pcm: string, rate = 16000, engine?: "local" | "baidu") => invoke<{ text: string; engine: string }>("voice_stt", { pcm, rate, engine: engine ?? null }),
+  voiceTts: (text: string, voice: string, speaker?: number) => invoke<{ rate: number; pcm: string; seconds: number }>("voice_tts", { text, voice, speaker: speaker ?? null }),
+  voiceStopServer: () => invoke<void>("voice_stop_server"),
   assistantCancel: (turnId: string) => invoke<void>("assistant_cancel", { turnId }),
   assistantSessionReset: () => invoke<AssistantConfigView>("assistant_session_reset"),
   assistantMessages: (limit?: number) => invoke<AssistantMessage[]>("assistant_messages", { limit: limit ?? null }),

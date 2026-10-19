@@ -2,6 +2,7 @@
 
 mod acp;
 mod assistant;
+mod voice;
 mod agents;
 mod coding_mcp;
 mod commands;
@@ -257,6 +258,7 @@ fn main() {
             app.manage(agents);
             app.manage(engine);
             app.manage(Arc::new(crate::assistant::AssistantRuntime::new(data_dir.clone())));
+            app.manage(Arc::new(crate::voice::VoiceRuntime::new(data_dir.clone())));
             app.manage(crate::remote_mcp::RemoteManager::new());
             app.manage(crate::toast::ToastState::new());
             app.manage(std::sync::Arc::new(crate::remote_oauth::OAuthState::new()));
@@ -360,6 +362,18 @@ fn main() {
             assistant::assistant_memory_delete,
             assistant::assistant_memory_summarize,
             assistant::assistant_models,
+            voice::voice_config_get,
+            voice::voice_config_set,
+            voice::voice_status,
+            voice::voice_install,
+            voice::voice_cancel_install,
+            voice::voice_remove,
+            voice::voice_pick_pack,
+            voice::voice_import_pack,
+            voice::voice_open_dir,
+            voice::voice_stt,
+            voice::voice_tts,
+            voice::voice_stop_server,
             commands::settings_set,
             commands::setup_status,
             commands::remote_mcp_start,

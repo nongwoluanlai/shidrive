@@ -8,6 +8,7 @@
   import { t } from "../i18n";
   import { confirmDialog } from "../dialog.svelte";
   import { onSkinEvent } from "../skin-fx/bus";
+  import { vc, inputEnabled, listenOnce, stopCapture, stopSpeaking } from "../assistant/voice.svelte";
   import { ga, enabled, persona, initAssistant, send, cancel, resetSession, hideBubble, loadMemories, summarize, visibleText, isThinking, openComposer, memoNote, clearMessages, settingsRequest } from "../assistant/store.svelte";
 
   const p = $derived(persona());
@@ -119,6 +120,27 @@
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void submit(); }
     else if (e.key === "Escape") { e.preventDefault(); ga.composer = false; if (!ga.panel && !ga.bubble.visible) close(); }
   }
+
+  // ---------------- 语音 ----------------
+  async function onMic() {
+    if (vc.recording) { stopCapture(true); return; }
+    if (vc.transcribing) return;
+    try {
+      const text = (await listenOnce()).trim();
+      if (!text) { toast("info", t("没有听清，请再说一次")); return; }
+      if (vc.view?.config.input_auto_send && !busy) {
+        ga.panel = ga.panel === "chat" ? "chat" : null;
+        await send(text);
+      } else {
+        if (!ga.composer) openComposer();
+        input = input.trim() ? `${input.trim()} ${text}` : text;
+        void tick().then(() => inputEl?.focus());
+      }
+    } catch (e) {
+      toast("error", e instanceof Error ? e.message : String(e));
+    }
+  }
+  const micTitle = $derived(vc.recording ? t("正在听…（说完自动结束，点击提前结束）") : vc.transcribing ? t("识别中…") : t("语音输入"));
 
   function openPanel(tab: "chat" | "memory") {
     ga.panel = ga.panel === tab ? null : tab;
@@ -251,13 +273,18 @@
         {#if mode === "amadeus"}<span class="ga-corner tl"></span><span class="ga-corner tr"></span><span class="ga-corner bl"></span><span class="ga-corner br"></span>{/if}
         <header class="ga-head">
           {#if mode === "amadeus"}
-            <span class="ga-led" class:busy></span>
+            <span class="ga-led" class:busy class:speak={vc.speaking}></span>
             <span class="ga-title">{title}</span>
             <span class="ga-nixie" title={t("世界线变动率")}>{divergence}</span>
           {:else}
             <span class="ga-title">{title}</span>
           {/if}
           <span class="ga-grow"></span>
+          {#if vc.speaking}
+            <button class="ga-icon ga-speaking" title={t("停止朗读")} aria-label={t("停止朗读")} onclick={stopSpeaking}>
+              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M4 9v6h4l5 4V5L8 9H4Zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4Z"/></svg>
+            </button>
+          {/if}
           <button class="ga-icon" class:on={ga.panel === "chat"} title={t("对话记录")} onclick={() => openPanel("chat")}>☰</button>
           <button class="ga-icon" class:on={ga.panel === "memory"} title={t("长期记忆")} onclick={() => openPanel("memory")}>✦</button>
           <button class="ga-icon" title={t("关闭")} onclick={close}>✕</button>
@@ -357,9 +384,14 @@
               rows="1"
               bind:this={inputEl}
               bind:value={input}
-              placeholder={busy ? t("回复中…") : t("和{name}说点什么（Enter 发送，Shift+Enter 换行）", { name: p.name })}
+              placeholder={vc.recording ? t("正在听…") : vc.transcribing ? t("识别中…") : busy ? t("回复中…") : t("和{name}说点什么（Enter 发送，Shift+Enter 换行）", { name: p.name })}
               onkeydown={onKey}
             ></textarea>
+            {#if inputEnabled()}
+              <button class="ga-mic" class:rec={vc.recording} class:wait={vc.transcribing} style="--lv:{vc.level}" disabled={vc.transcribing || (busy && !vc.recording)} title={micTitle} aria-label={micTitle} onclick={onMic}>
+                <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2Z"/></svg>
+              </button>
+            {/if}
             {#if busy}
               <button class="ga-btn" onclick={cancel}>{mode === "amadeus" ? "[ STOP ]" : t("停止")}</button>
             {:else}
@@ -372,6 +404,11 @@
               <button class="ga-btn" onclick={cancel}>{t("停止")}</button>
             {/if}
             <span class="ga-grow"></span>
+            {#if inputEnabled()}
+              <button class="ga-mic" class:rec={vc.recording} class:wait={vc.transcribing} style="--lv:{vc.level}" disabled={vc.transcribing || (busy && !vc.recording)} title={micTitle} aria-label={micTitle} onclick={onMic}>
+                <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2Z"/></svg>
+              </button>
+            {/if}
             <button class="ga-btn" onclick={openComposer}>{t("回复")}</button>
           </div>
         {/if}
@@ -504,72 +541,93 @@
   .ga-chip-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
   .ga-chip.busy .ga-chip-dot { animation: ga-blink .9s steps(2) infinite; }
 
-  /* ---------- Amadeus（牧濑红莉栖·动态） ---------- */
+  .ga-mic {
+    flex: none; width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center;
+    border: 1px solid var(--border); border-radius: 50%; background: transparent; color: var(--text-dim); cursor: pointer; position: relative;
+  }
+  .ga-mic:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+  .ga-mic:disabled { opacity: .5; cursor: default; }
+  .ga-mic.rec { color: #fff; background: #e5484d; border-color: #e5484d; box-shadow: 0 0 0 calc(2px + var(--lv, 0) * 7px) #e5484d40; }
+  .ga-mic.wait { animation: ga-blink .9s steps(2) infinite; }
+  .ga-speaking { color: var(--accent); }
+  .ga-amadeus .ga-mic { border-radius: 0; border-color: var(--am-line-2); color: var(--am-dim); }
+  .ga-amadeus .ga-mic:hover:not(:disabled) { color: var(--am); border-color: #f0b42999; }
+  .ga-amadeus .ga-mic.rec { color: #1a1408; background: var(--am); border-color: var(--am); box-shadow: 0 0 0 calc(1px + var(--lv, 0) * 6px) #f0b42940; }
+  .ga-amadeus .ga-speaking { color: var(--am); }
+
+  /* ---------- Amadeus（牧濑红莉栖·动态） ----------
+     底色取皮肤自己的深灰（--bg-elev / --bg），亮黄只做点缀：指示灯、辉光管时钟、提示符、四角、主按钮与焦点。 */
   .ga-amadeus {
-    --am: #d99a2b;
-    --am-soft: #d99a2b33;
-    --am-text: #f3e2c0;
-    --am-bg: rgba(14, 10, 6, .86);
+    --am: #f0b429;
+    --am-soft: #f0b42922;
+    --am-line: #ffffff1c;
+    --am-line-2: #ffffff2e;
+    --am-text: #dcdde0;
+    --am-dim: #9a9ca3;
+    --am-bg: color-mix(in srgb, var(--bg-elev, #1c1d21) 90%, transparent);
+    --am-bg-2: color-mix(in srgb, var(--bg, #141518) 70%, transparent);
     font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
   }
   .ga-amadeus .ga-card {
     background:
-      repeating-linear-gradient(0deg, #ffffff06 0 1px, transparent 1px 3px),
-      linear-gradient(160deg, #2a1c0c66, transparent 60%),
+      repeating-linear-gradient(0deg, #ffffff04 0 1px, transparent 1px 3px),
       var(--am-bg);
     color: var(--am-text);
-    border: 1px solid #d99a2b88;
+    border: 1px solid var(--am-line-2);
     border-radius: 2px;
-    box-shadow: 0 0 0 1px #000a, 0 0 18px #d99a2b2e, 0 12px 30px #000a;
-    backdrop-filter: blur(6px);
+    box-shadow: 0 0 0 1px #0008, 0 12px 30px #0009;
+    backdrop-filter: blur(8px);
   }
-  .ga-corner { position: absolute; width: 10px; height: 10px; border: 0 solid var(--am); pointer-events: none; z-index: 1; }
+  .ga-corner { position: absolute; width: 9px; height: 9px; border: 0 solid var(--am); pointer-events: none; z-index: 1; opacity: .9; }
   .ga-corner.tl { left: 3px; top: 3px; border-left-width: 2px; border-top-width: 2px; }
   .ga-corner.tr { right: 3px; top: 3px; border-right-width: 2px; border-top-width: 2px; }
   .ga-corner.bl { left: 3px; bottom: 3px; border-left-width: 2px; border-bottom-width: 2px; }
   .ga-corner.br { right: 3px; bottom: 3px; border-right-width: 2px; border-bottom-width: 2px; }
-  .ga-amadeus .ga-head { border-bottom: 1px solid #d99a2b55; padding: 8px 20px 6px 12px; background: linear-gradient(90deg, #d99a2b1f, transparent 70%); }
+  .ga-amadeus .ga-head { border-bottom: 1px solid var(--am-line); padding: 8px 20px 6px 12px; background: var(--am-bg-2); }
   .ga-amadeus .ga-card { width: 356px; }
   .ga-amadeus .ga-card.wide { width: 390px; }
-  .ga-amadeus .ga-title { color: var(--am); letter-spacing: .04em; font-size: 11.5px; }
+  .ga-amadeus .ga-title { color: var(--am-text); letter-spacing: .06em; font-size: 11.5px; }
   .ga-nixie { flex: none; }
   .ga-nixie {
-    font-size: 11.5px; letter-spacing: .1em; color: #ffb347;
-    text-shadow: 0 0 4px #ff8a00, 0 0 9px #ff6a0088; font-variant-numeric: tabular-nums;
+    font-size: 11.5px; letter-spacing: .1em; color: #ffb63d;
+    text-shadow: 0 0 4px #ff8a0099, 0 0 8px #ff6a0044; font-variant-numeric: tabular-nums;
   }
-  .ga-led { width: 7px; height: 7px; border-radius: 50%; background: #5a3c12; box-shadow: inset 0 0 2px #000; flex: none; }
-  .ga-led.busy, .ga-chip.busy .ga-led { background: #ffb347; box-shadow: 0 0 6px #ff8a00; animation: ga-blink .8s steps(2) infinite; }
-  .ga-amadeus .ga-icon { color: #d99a2bcc; border-radius: 0; }
-  .ga-amadeus .ga-icon:hover:not(:disabled), .ga-amadeus .ga-icon.on { background: var(--am-soft); color: #ffd28a; }
-  .ga-amadeus .ga-body { line-height: 1.65; text-shadow: 0 0 1px #0008; }
-  .ga-amadeus .ga-md :global(a) { color: #ffc067; }
-  .ga-amadeus .ga-md :global(pre) { background: #0008; border: 1px solid #d99a2b33; border-radius: 0; }
-  .ga-amadeus .ga-sub, .ga-amadeus .ga-pager, .ga-amadeus .ga-msg-meta, .ga-amadeus .ga-mem-src, .ga-amadeus .ga-empty, .ga-amadeus .ga-hint { color: #c9a874aa; }
+  .ga-led { width: 7px; height: 7px; border-radius: 50%; background: #4a4c52; box-shadow: inset 0 0 2px #000; flex: none; }
+  .ga-led.busy, .ga-chip.busy .ga-led { background: var(--am, #f0b429); box-shadow: 0 0 6px #ffa000; animation: ga-blink .8s steps(2) infinite; }
+  .ga-led.speak { background: var(--am, #f0b429); box-shadow: 0 0 6px #ffa000; }
+  .ga-amadeus .ga-icon { color: var(--am-dim); border-radius: 0; }
+  .ga-amadeus .ga-icon:hover:not(:disabled), .ga-amadeus .ga-icon.on { background: #ffffff10; color: var(--am); }
+  .ga-amadeus .ga-body { line-height: 1.65; }
+  .ga-amadeus .ga-md :global(a) { color: var(--am); }
+  .ga-amadeus .ga-md :global(pre) { background: #0006; border: 1px solid var(--am-line); border-radius: 0; }
+  .ga-amadeus .ga-md :global(code) { color: #e9e3d2; }
+  .ga-amadeus .ga-sub, .ga-amadeus .ga-pager, .ga-amadeus .ga-msg-meta, .ga-amadeus .ga-mem-src, .ga-amadeus .ga-empty, .ga-amadeus .ga-hint { color: var(--am-dim); }
   .ga-amadeus .ga-dots i { background: var(--am); }
-  .ga-amadeus .ga-caret { background: var(--am); opacity: .9; }
+  .ga-amadeus .ga-caret { background: var(--am); opacity: .85; }
   .ga-amadeus .ga-btn {
-    background: transparent; color: var(--am); border: 1px solid #d99a2b88; border-radius: 0;
+    background: transparent; color: var(--am-text); border: 1px solid var(--am-line-2); border-radius: 0;
     font-family: inherit; letter-spacing: .04em;
   }
-  .ga-amadeus .ga-btn:hover:not(:disabled) { background: var(--am-soft); color: #ffd28a; border-color: var(--am); }
-  .ga-amadeus .ga-btn.primary { background: #d99a2b26; color: #ffd28a; }
-  .ga-amadeus .ga-compose { border-top: 1px dashed #d99a2b55; align-items: center; }
-  .ga-prompt { color: var(--am); font-weight: 700; text-shadow: 0 0 5px #ff8a00aa; }
-  .ga-amadeus .ga-input { background: #0007; color: var(--am-text); border: 1px solid #d99a2b55; border-radius: 0; font-family: inherit; caret-color: var(--am); }
-  .ga-amadeus .ga-input:focus { border-color: var(--am); box-shadow: 0 0 0 1px #d99a2b44; }
-  .ga-amadeus .ga-input::placeholder { color: #c9a87466; }
-  .ga-amadeus .ga-tools { border-top-color: #d99a2b40; }
-  .ga-amadeus .ga-msg .ga-md { background: #ffffff0a; border: 1px solid #d99a2b2a; border-radius: 0; }
-  .ga-amadeus .ga-msg.user .ga-md { background: #d99a2b1c; border-color: #d99a2b55; }
-  .ga-amadeus .ga-mem { background: #ffffff08; border-color: #d99a2b33; border-radius: 0; }
-  .ga-amadeus .ga-mem.pinned { border-color: var(--am); }
-  .ga-amadeus .ga-memo { color: #ffc067; }
+  .ga-amadeus .ga-btn:hover:not(:disabled) { background: #ffffff0d; color: #fff; border-color: #ffffff55; }
+  .ga-amadeus .ga-btn.primary { background: var(--am-soft); color: var(--am); border-color: #f0b42999; }
+  .ga-amadeus .ga-btn.primary:hover:not(:disabled) { background: #f0b42933; color: #ffd36b; border-color: var(--am); }
+  .ga-amadeus .ga-compose { border-top: 1px dashed var(--am-line-2); align-items: center; }
+  .ga-prompt { color: var(--am); font-weight: 700; text-shadow: 0 0 4px #ff9d0088; }
+  .ga-amadeus .ga-input { background: #0005; color: var(--am-text); border: 1px solid var(--am-line-2); border-radius: 0; font-family: inherit; caret-color: var(--am); }
+  .ga-amadeus .ga-input:focus { border-color: #f0b429aa; box-shadow: 0 0 0 1px #f0b42933; }
+  .ga-amadeus .ga-input::placeholder { color: #8b8d9488; }
+  .ga-amadeus .ga-tools { border-top-color: var(--am-line); }
+  .ga-amadeus .ga-msg .ga-md { background: #ffffff08; border: 1px solid var(--am-line); border-radius: 0; }
+  .ga-amadeus .ga-msg.user .ga-md { background: #ffffff10; border-color: var(--am-line-2); border-left: 2px solid #f0b429aa; }
+  .ga-amadeus .ga-mem { background: #ffffff06; border-color: var(--am-line); border-radius: 0; }
+  .ga-amadeus .ga-mem.pinned { border-left: 2px solid var(--am); }
+  .ga-amadeus .ga-memo { color: var(--am); }
   .ga-amadeus .ga-error { color: #ff7a6b; }
   .ga-amadeus .ga-chip {
     font-family: inherit; letter-spacing: .14em; font-size: 11px; border-radius: 0;
-    background: var(--am-bg); color: var(--am); border: 1px solid #d99a2b88; box-shadow: 0 0 10px #d99a2b33;
+    background: var(--am-bg); color: var(--am-text); border: 1px solid var(--am-line-2); box-shadow: 0 4px 12px #0006;
   }
-  .ga-amadeus .ga-chip:hover { color: #ffd28a; border-color: var(--am); }
+  .ga-amadeus .ga-chip:hover { color: #fff; border-color: #f0b42999; }
   @media (prefers-reduced-motion: reduce) {
     .ga-card, .ga-page { animation: none; }
   }

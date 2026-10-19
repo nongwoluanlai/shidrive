@@ -19,11 +19,11 @@ export interface SkinManifest {
   globalFx?: unknown;
   /** Chat timeline decoration: { art?: svg/png, mark?: svg/png, height?: px, railColor?: #hex }. */
   timeline?: { art?: string; mark?: string; height?: number; railColor?: string };
-  /** Global assistant persona/bubble: { name?, persona?, greeting?, style?: "generic" | "amadeus", anchor?: [x%, y%] }. */
+  /** Global assistant persona/bubble: { name?, persona?, greeting?, style?: "generic" | "amadeus", anchor?: [x%, y%], voice?: voice-pack id }. */
   assistant?: unknown;
 }
 
-export interface SkinAssistantSpec { name: string; persona: string; greeting: string; style: string; anchor: [number, number] | null }
+export interface SkinAssistantSpec { name: string; persona: string; greeting: string; style: string; anchor: [number, number] | null; voice: string }
 /** Assistant persona/bubble overrides declared by the active custom skin (sanitized). */
 export const skinAssistant = $state({ id: "", spec: null as SkinAssistantSpec | null, character: false });
 
@@ -35,7 +35,8 @@ function sanitizeAssistant(raw: unknown): SkinAssistantSpec | null {
     ? [Math.min(100, Math.max(0, r.anchor[0] as number)), Math.min(100, Math.max(0, r.anchor[1] as number))] as [number, number]
     : null;
   const style = str(r.style, 20);
-  return { name: str(r.name, 40), persona: str(r.persona, 4000), greeting: str(r.greeting, 300), style: /^(generic|amadeus)$/.test(style) ? style : "", anchor: a };
+  const voice = str(r.voice, 48);
+  return { name: str(r.name, 40), persona: str(r.persona, 4000), greeting: str(r.greeting, 300), style: /^(generic|amadeus)$/.test(style) ? style : "", anchor: a, voice: /^[a-z0-9][a-z0-9._-]*$/.test(voice) ? voice : "" };
 }
 export const builtinSkins = [
   { id: "steins-gate", name: "命运石之门", en: "Steins;Gate", description: "琥珀暖光 · 复古实验室", descriptionEn: "Amber lab light · retro terminal", preview: "/skins/steins-gate/bg.png" },

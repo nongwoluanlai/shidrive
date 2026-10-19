@@ -450,6 +450,57 @@ fn state_line(app_state: Option<&str>, cfg: &AssistantConfig) -> String {
     }
 }
 
+/// 语音输出提示（前端按当前语音设置传入）：开启时约束模型用短句、尽快出第一句；
+/// `layer` = 角色语音与显示语言不同（如日语配音），每句后附 `[[ja: …]]` 供朗读。
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct SpeechHint {
+    pub enabled: bool,
+    pub lang: String,
+    pub layer: bool,
+}
+
+fn speech_lang_name(lang: &str) -> &'static str {
+    match lang {
+        "ja" => "日语",
+        "en" => "英语",
+        "ko" => "韩语",
+        "yue" => "粤语",
+        _ => "中文",
+    }
+}
+
+fn valid_speech_lang(lang: &str) -> bool {
+    matches!(lang, "ja" | "en" | "ko" | "yue" | "zh")
+}
+
+pub fn speech_rule(h: Option<&SpeechHint>) -> Option<String> {
+    let h = h.filter(|h| h.enabled)?;
+    if h.layer && valid_speech_lang(&h.lang) {
+        let ln = speech_lang_name(&h.lang);
+        let tag = &h.lang;
+        return Some(format!(
+            "[语音输出已开启 · {ln}配音] 你的回复会用角色的{ln}原声逐句朗读，文字照常显示。要求：\
+1) 用口语短句，每句不超过 30 字，第一句尽快给出；\
+2) 每写完一句，紧跟着写出这句的{ln}版本，格式 [[{tag}: …]]，只放{ln}，口吻符合角色，数字、英文缩写写成{ln}读法；\
+3) 代码、命令、路径、链接等不需要朗读的内容不加标记，少用列表和表格；\
+4) 这些标记不会显示给用户，也不要解释它们。"
+        ));
+    }
+    Some("[语音输出已开启] 你的回复会被逐句朗读：用自然口语的短句（每句不超过 30 字），第一句尽快给出；少用 Markdown、列表、表格和表情符号；需要给代码时先用一句话说明，代码单独放在代码块里（代码不会被朗读）。".to_string())
+}
+
+/// 去掉配音标记 `[[ja: …]]`（存库与展示只保留正文）
+pub fn strip_speech_tags(text: &str) -> String {
+    let re = regex::Regex::new(r"(?i)[ \t]*\[\[\s*(ja|en|ko|yue|zh)\s*[:：][^\[\]]*\]\]").unwrap();
+    let out = re.replace_all(text, "").to_string();
+    let mut lines: Vec<&str> = out.lines().map(|l| l.trim_end()).collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) { lines.pop(); }
+    let mut out = lines.join("\n");
+    while out.contains("\n\n\n") { out = out.replace("\n\n\n", "\n\n"); }
+    out.trim().to_string()
+}
+
 /// 一轮要发出的内容
 enum Turn<'a> {
     /// 用户消息
@@ -636,8 +687,9 @@ fn api_chat(app: &AppHandle, api: &ApiConfig, messages: Vec<Value>, session: &st
 async fn run_turn(
     app: &AppHandle, db: &Arc<Db>, agents: &AgentManager, rt: &AssistantRuntime,
     cfg: &AssistantConfig, persona: &Persona, app_state: Option<&str>, turn: Turn<'_>,
-    turn_id: &str, cancel: Arc<AtomicBool>,
+    turn_id: &str, cancel: Arc<AtomicBool>, speech: Option<&SpeechHint>,
 ) -> Result<String, String> {
+    let speech_line = speech_rule(speech);
     let mems = list_memories(db)?;
     let name = persona.display_name().to_string();
     let body = match &turn {
@@ -646,7 +698,9 @@ async fn run_turn(
     };
     if cfg.provider == "api" {
         let st = ensure_api_session(db)?;
-        let mut messages = vec![json!({ "role": "system", "content": format!("{}\n\n{}", system_prompt(persona, &mems, cfg), state_line(app_state, cfg)) })];
+        let mut sys = format!("{}\n\n{}", system_prompt(persona, &mems, cfg), state_line(app_state, cfg));
+        if let Some(l) = &speech_line { sys.push_str("\n"); sys.push_str(l); }
+        let mut messages = vec![json!({ "role": "system", "content": sys })];
         // 本轮用户消息已先入库：历史里排除最后一条（就是它）
         let mut hist = recent_messages(db, cfg.history_turns + 1)?;
         if matches!(turn, Turn::User(_)) && hist.last().is_some_and(|m| m.role == "user") { hist.pop(); }
@@ -686,6 +740,7 @@ async fn run_turn(
         text.push_str("\n\n");
     }
     text.push_str(&state_line(app_state, cfg));
+    if let Some(l) = &speech_line { text.push('\n'); text.push_str(l); }
     text.push_str("\n\n");
     match &turn {
         Turn::User(t) => { text.push_str("[用户消息]\n"); text.push_str(t); }
@@ -716,6 +771,7 @@ fn finish_reply(db: &Db, cfg: &AssistantConfig, raw: Result<String, String>, gre
         Err(e) => return Err(e),
     };
     let (clean, remember, forget) = extract_directives(&raw);
+    let clean = strip_speech_tags(&clean);
     let mut added = 0;
     let mut forgotten = 0;
     if !interrupted {
@@ -806,7 +862,7 @@ pub async fn assistant_config_set(db: DbState<'_>, rt: RtState<'_>, config: Assi
 #[tauri::command]
 pub async fn assistant_send(
     app: AppHandle, db: DbState<'_>, agents: AgentsState<'_>, rt: RtState<'_>,
-    text: String, persona: Persona, app_state: Option<String>, turn_id: String,
+    text: String, persona: Persona, app_state: Option<String>, turn_id: String, speech: Option<SpeechHint>,
 ) -> Result<TurnResult, String> {
     let cfg = load_config(&db);
     check_enabled(&cfg)?;
@@ -815,7 +871,7 @@ pub async fn assistant_send(
     let (_g, cancel) = acquire(&rt, &turn_id)?;
     let db = db.inner().clone();
     insert_message(&db, "user", &text, &cfg.provider, &[])?;
-    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::User(&text), &turn_id, cancel).await;
+    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::User(&text), &turn_id, cancel, speech.as_ref()).await;
     mark_greeted(&db, &raw);
     finish_reply(&db, &cfg, raw, false)
 }
@@ -823,7 +879,7 @@ pub async fn assistant_send(
 #[tauri::command]
 pub async fn assistant_greet(
     app: AppHandle, db: DbState<'_>, agents: AgentsState<'_>, rt: RtState<'_>,
-    persona: Persona, app_state: Option<String>, turn_id: String, reason: Option<String>,
+    persona: Persona, app_state: Option<String>, turn_id: String, reason: Option<String>, speech: Option<SpeechHint>,
 ) -> Result<TurnResult, String> {
     let cfg = load_config(&db);
     check_enabled(&cfg)?;
@@ -836,7 +892,7 @@ pub async fn assistant_greet(
     if !persona.greeting.trim().is_empty() {
         ev.push_str(&format!("\n参考开场白风格（不必照抄）：{}", persona.greeting.trim()));
     }
-    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(ev), &turn_id, cancel).await;
+    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(ev), &turn_id, cancel, speech.as_ref()).await;
     mark_greeted(&db, &raw);
     finish_reply(&db, &cfg, raw, true)
 }
@@ -942,7 +998,7 @@ pub async fn assistant_memory_summarize(
             recap_block(&hist, persona.display_name())
         )
     };
-    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, None, Turn::Event(task), &turn_id, cancel).await
+    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, None, Turn::Event(task), &turn_id, cancel, None).await
         .map_err(|e| if e.starts_with(ASSISTANT_CANCELLED) { "已停止".to_string() } else { e })?;
     let items = parse_bullets(&raw);
     if mode == "consolidate" {
@@ -1007,6 +1063,20 @@ mod tests {
         let (clean, rem, _) = extract_directives("没有标记的普通回复 [[链接]]");
         assert_eq!(clean, "没有标记的普通回复 [[链接]]");
         assert!(rem.is_empty());
+    }
+
+    #[test]
+    fn speech_tags_and_rules() {
+        let raw = "嗯，构建通过了。[[ja: ビルドは通ったわ。]]\n接下来跑测试吧。 [[ja：次はテストね。]]\n[[记忆: 用户在做使驾]]";
+        let (clean, rem, _) = extract_directives(raw);
+        assert_eq!(rem, vec!["用户在做使驾".to_string()]);
+        assert_eq!(strip_speech_tags(&clean), "嗯，构建通过了。\n接下来跑测试吧。");
+        assert!(speech_rule(None).is_none());
+        assert!(speech_rule(Some(&SpeechHint { enabled: false, ..Default::default() })).is_none());
+        let ja = speech_rule(Some(&SpeechHint { enabled: true, lang: "ja".into(), layer: true })).unwrap();
+        assert!(ja.contains("[[ja: …]]") && ja.contains("日语"));
+        let plain = speech_rule(Some(&SpeechHint { enabled: true, lang: "zh".into(), layer: false })).unwrap();
+        assert!(plain.contains("短句") && !plain.contains("[["));
     }
 
     #[test]

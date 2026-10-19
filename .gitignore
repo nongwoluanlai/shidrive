@@ -40,3 +40,6 @@ website/
 .merge-backup-oauth/
 /.tmp-verify-dist
 /.shidrive-patch-backup
+
+# 角色语音包（大文件，不入库）
+/voice-packs/

@@ -5,6 +5,7 @@ import { workbenchEn } from "./locales/workbench.en";
 import { chatEn } from "./locales/chat.en";
 import { skinEn } from "./locales/skin.en";
 import { assistantEn } from "./locales/assistant.en";
+import { voiceEn } from "./locales/voice.en";
 
 const en: Record<string, string> = {
   // 通用
@@ -324,6 +325,7 @@ const en: Record<string, string> = {
   ...chatEn,
   ...skinEn,
   ...assistantEn,
+  ...voiceEn,
 };
 
 export type TranslationParams = Record<string, string | number>;

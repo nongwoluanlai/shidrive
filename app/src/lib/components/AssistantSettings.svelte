@@ -7,6 +7,7 @@
   import { confirmDialog } from "../dialog.svelte";
   import { ga, persona, afterConfigSaved, resetSession, clearMessages } from "../assistant/store.svelte";
   import type { AssistantConfig, AssistantConfigView } from "../types";
+  import VoiceSettings from "./VoiceSettings.svelte";
 
   let view = $state<AssistantConfigView | null>(null);
   let draft = $state<AssistantConfig | null>(null);
@@ -243,6 +244,8 @@
         <input class="num" type="number" min="0" max="600" bind:value={draft.bubble_seconds} /><span class="pend">{t("秒（0 = 不自动收起）")}</span>
       </div>
     </div>
+
+    <VoiceSettings />
 
     <div class="sec">
       <h3>{t("长期会话")}</h3>

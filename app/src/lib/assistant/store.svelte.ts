@@ -6,6 +6,7 @@ import { skinAssistant } from "../skins.svelte";
 import { emitSkinEvent } from "../skin-fx/bus";
 import { skinPersona, toWire, type ResolvedPersona } from "./personas";
 import { t } from "../i18n";
+import { beginSpeech, feedSpeech, initVoice, speechHint, stopSpeaking } from "./voice.svelte";
 import type { AssistantConfigView, AssistantMemory, AssistantMessage, AssistantTurnResult } from "../types";
 
 type Busy = "" | "send" | "greet" | "summarize" | "reset";
@@ -68,6 +69,7 @@ export function visibleText(raw: string): string {
   return raw
     .replace(/^[ \t]*\[\[\s*(记忆|忘记|memory|forget)\s*[:：][^\]]*\]\][ \t]*$/gim, "")
     .replace(/\[\[\s*(记忆|忘记|memory|forget)\s*[:：][^\]]*\]\]/gi, "")
+    .replace(/[ \t]*\[\[\s*(ja|en|ko|yue|zh)\s*[:：][^\[\]]*\]\]/gi, "")
     .replace(/\[\[[^\]]*$/, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
@@ -134,6 +136,7 @@ export async function initAssistant() {
       if (u?.sessionUpdate !== "agent_message_chunk" || u.content?.type !== "text" || typeof u.content.text !== "string") return;
       const first = !ga.streaming;
       ga.streaming += u.content.text;
+      feedSpeech(ga.streaming, false);
       if (first) {
         emitSkinEvent("agent.streaming");
         if (!ga.bubble.visible || ga.bubble.pages.length) ga.bubble = { visible: true, pages: [], index: 0, error: "", rev: ga.bubble.rev + 1 };
@@ -141,6 +144,7 @@ export async function initAssistant() {
     });
   }
   await reload();
+  await initVoice();
   if (enabled() && needsNewSession()) {
     // 等皮肤装载完再问候，人设才是左下角的角色
     await waitUntil(() => app.ready, 8000);
@@ -202,9 +206,11 @@ async function runTurn(kind: Busy, call: (turnId: string) => Promise<AssistantTu
   ga.busy = kind;
   ga.streaming = "";
   ga.bubble = { visible: true, pages: [], index: 0, error: "", rev: ga.bubble.rev + 1 };
+  beginSpeech();
   try {
     const r = await call(turnId);
     if (ga.turnId !== turnId) return;
+    feedSpeech(ga.streaming || r.message?.content || "", true);
     if (r.message) {
       ga.messages = [...ga.messages, r.message].slice(-400);
       showBubble(r.message.content);
@@ -222,6 +228,8 @@ async function runTurn(kind: Busy, call: (turnId: string) => Promise<AssistantTu
     emitSkinEvent("agent.done");
   } catch (e) {
     if (ga.turnId !== turnId) return;
+    if (String(e).includes("已停止") || String(e).toLowerCase().includes("cancel")) stopSpeaking();
+    else feedSpeech(ga.streaming, true);
     const partial = visibleText(ga.streaming);
     showBubble(partial, String(e));
     emitSkinEvent("agent.error");
@@ -248,7 +256,7 @@ export async function send(text: string) {
   emitSkinEvent("message.send");
   await runTurn("send", async (turnId) => {
     ga.messages = [...ga.messages, pending];
-    return api.assistantSend(body, toWire(persona(), app.locale), appState(), turnId);
+    return api.assistantSend(body, toWire(persona(), app.locale), appState(), turnId, speechHint());
   });
   // 用库里的记录替换本地占位（拿到真实 id）
   if (!ga.busy) ga.messages = await api.assistantMessages(200).catch(() => ga.messages);
@@ -256,11 +264,12 @@ export async function send(text: string) {
 
 export async function greet(reason: "new" | "resume") {
   if (!enabled()) return;
-  await runTurn("greet", (turnId) => api.assistantGreet(toWire(persona(), app.locale), appState(), turnId, reason));
+  await runTurn("greet", (turnId) => api.assistantGreet(toWire(persona(), app.locale), appState(), turnId, reason, speechHint()));
 }
 
 export async function cancel() {
   const id = ga.turnId;
+  stopSpeaking();
   if (!id || !ga.busy) return;
   await api.assistantCancel(id).catch((e) => toast("error", String(e)));
 }
