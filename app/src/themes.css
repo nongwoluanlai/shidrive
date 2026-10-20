@@ -82,6 +82,9 @@ body[data-skin-character="true"] .skin-character-stage {
   user-select: none;
   isolation: isolate;
 }
+/* 聊天输入框聚焦时，人物与聊天区重叠的那块淡出（mask 由 SkinCharacter 按重叠矩形生成） */
+@property --see { syntax: "<number>"; inherits: true; initial-value: 1; }
+.skin-character-stage { --see: 1; transition: --see .22s ease-out; }
 .skin-character {
   position: absolute;
   inset: 0;

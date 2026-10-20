@@ -131,7 +131,7 @@
     try { await clearMessages(); toast("ok", t("对话记录已清空")); } catch (e) { toast("error", String(e)); }
   }
 
-  const styleLabel = (s: string) => (s === "amadeus" ? t("Amadeus 主题气泡") : s === "generic" ? t("人物旁通用气泡") : t("左下角简易助手"));
+  const styleLabel = (s: string) => (s === "amadeus" ? t("终端风格气泡") : s === "generic" ? t("人物旁通用气泡") : t("左下角简易助手"));
 </script>
 
 {#if draft && view}
@@ -224,7 +224,7 @@
         <div><b>{t("当前角色")}：</b>{draft.persona_mode === "custom" && draft.custom_name.trim() ? draft.custom_name.trim() : current.name}<span class="sep"> · </span>{styleLabel(current.style)}</div>
         {#if draft.persona_mode !== "custom"}<div class="dim clamp">{current.persona}</div>{/if}
       </div>
-      <p class="note">{t("无皮肤时是左下角的简易助手；带人物的皮肤会在人物右上方显示对话气泡（牧濑红莉栖·动态 为 Amadeus 主题）。皮肤作者可在 manifest 里用 assistant 字段自定义角色设定。")}</p>
+      <p class="note">{t("无皮肤时是左下角的简易助手；带人物的皮肤会在人物头部旁显示说话气泡（朗读时显示同步字幕），脚下是输入控制台，点击人物或按 Alt+A 打开（牧濑红莉栖·动态 为终端风格）。皮肤作者可在 manifest 里用 assistant 字段自定义角色设定。")}</p>
     </div>
 
     <div class="sec">

@@ -1,6 +1,8 @@
 <script lang="ts">
-  // 全局助手：无皮肤 → 左下角简易助手；有皮肤人物 → 人物右上方的对话气泡
-  // （牧濑红莉栖·动态 用 Amadeus 主题，其它皮肤用通用轻量气泡）。
+  // 全局助手：无皮肤 → 左下角简易助手（一张卡片）；有皮肤人物 → 拆成两块：
+  //   · 说话气泡：贴在人物头部旁，显示回复（朗读时显示与音频同步的字幕）；
+  //   · 控制台：在人物脚下（舞台底部），平时只有输入框 + 语音 / 状态反馈，对话记录和记忆是可展开的面板。
+  // 牧濑红莉栖·动态 用终端风格（style id 仍叫 amadeus），其它皮肤用通用轻量样式。关闭后不留浮标，点人物或 Alt+A 唤起。
   import { onMount, tick } from "svelte";
   import { app, toast } from "../state.svelte";
   import { api } from "../ipc";
@@ -8,12 +10,14 @@
   import { t } from "../i18n";
   import { confirmDialog } from "../dialog.svelte";
   import { onSkinEvent } from "../skin-fx/bus";
+  import { see } from "../skin-fx/seethrough.svelte";
   import { vc, inputEnabled, listenOnce, stopCapture, stopSpeaking } from "../assistant/voice.svelte";
   import { ga, enabled, persona, initAssistant, send, cancel, resetSession, hideBubble, loadMemories, summarize, visibleText, isThinking, openComposer, memoNote, clearMessages, settingsRequest } from "../assistant/store.svelte";
 
   const p = $derived(persona());
   const style = $derived(p.style);
-  const title = $derived(p.title || p.name);
+  const title = $derived(t(p.title || p.name));
+  const nick = $derived(p.nick || p.name);
 
   // ---------------- 位置：贴着人物舞台 ----------------
   let stage = $state<{ left: number; top: number; width: number; height: number } | null>(null);
@@ -44,12 +48,33 @@
     return { left: Math.max(8, left), bottom: Math.min(Math.max(8, bottom), winH - 160) };
   });
 
+  /** 控制台：舞台底部（人物脚下），宽度跟舞台走；展开的面板不高过说话气泡的底边 */
+  const dock = $derived.by(() => {
+    if (!stage) return { left: 10, bottom: 10, width: 320, panelMax: 300 };
+    const bottom = Math.max(8, Math.round(winH - (stage.top + stage.height)) + 10);
+    const left = Math.max(8, Math.round(stage.left + 10));
+    const width = Math.round(Math.min(380, Math.max(260, stage.width - 20)));
+    const room = ga.bubble.visible ? pos.bottom - bottom - 96 : Math.min(winH * 0.62, 540);
+    return { left, bottom, width, panelMax: Math.round(Math.max(140, room)) };
+  });
+  /** 聊天输入框聚焦且控制台压在聊天区上：控制台淡出（悬停恢复） */
+  const dockFaded = $derived(see.active && !!see.client && dock.left + dock.width > see.client.x);
+
   // ---------------- 卡片内容 ----------------
   const cardOpen = $derived(ga.bubble.visible || ga.composer || ga.panel !== null);
   const streamingText = $derived(visibleText(ga.streaming));
   const page = $derived(ga.bubble.pages[ga.bubble.index] ?? "");
   const pageCount = $derived(ga.bubble.pages.length);
   const busy = $derived(ga.busy === "send" || ga.busy === "greet" || ga.busy === "reset");
+  /** 人物气泡在朗读：显示与音频同步的字幕 */
+  const subtitleOn = $derived(mode !== "plain" && vc.voiceTurn);
+  const status = $derived(
+    vc.recording ? t("正在听…") : vc.transcribing ? t("识别中…") : ga.busy === "reset" ? t("正在新建会话…") : busy ? t("回复中…") : vc.speaking ? t("朗读中…") : ga.busy === "summarize" ? t("处理中…") : "",
+  );
+  const keysHint = $derived(app.enterSend ? t("Enter 发送，Shift+Enter 换行") : t("Enter 换行，Ctrl+Enter 发送"));
+  const placeholder = $derived(
+    vc.recording ? t("正在听…") : vc.transcribing ? t("识别中…") : busy ? t("回复中…") : t("和{name}说点什么（{keys}）", { name: nick, keys: keysHint }),
+  );
   const divergence = $derived.by(() => {
     // Amadeus 头部的世界线变动率：随消息数轻微跳动，只是装饰
     const n = ga.messages.length;
@@ -76,7 +101,8 @@
   $effect(() => {
     void ga.bubble.rev;
     const idx = ga.bubble.index, n = pageCount, text = page;
-    if (!ga.bubble.visible || busy || hovered || ga.composer || ga.panel) return;
+    // 简易卡片：输入框 / 面板开着时不自动收起；人物气泡与控制台分开，只在悬停或朗读字幕时暂停
+    if (!ga.bubble.visible || busy || hovered || vc.voiceTurn || (mode === "plain" && (ga.composer || ga.panel))) return;
     if (idx < n - 1) {
       const ms = Math.min(12000, Math.max(3500, 1200 + text.length * 70));
       const id = setTimeout(() => { if (ga.bubble.index === idx) ga.bubble.index = idx + 1; }, ms);
@@ -87,6 +113,9 @@
     const id = setTimeout(() => hideBubble(), secs * 1000 + Math.min(8000, text.length * 40));
     return () => clearTimeout(id);
   });
+
+  // 气泡被关掉时 mouseleave 不会触发：复位悬停，免得下一条回复不再自动收起
+  $effect(() => { if (!ga.bubble.visible) hovered = false; });
 
   // 记忆提示：显示 4 秒
   let memoShown = $state("");
@@ -117,8 +146,21 @@
 
   function onKey(e: KeyboardEvent) {
     if (e.isComposing) return;
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void submit(); }
-    else if (e.key === "Escape") { e.preventDefault(); ga.composer = false; if (!ga.panel && !ga.bubble.visible) close(); }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      if (mode !== "plain") { ga.composer = false; ga.panel = null; return; }
+      ga.composer = false;
+      if (!ga.panel && !ga.bubble.visible) close();
+      return;
+    }
+    if (e.key !== "Enter") return;
+    // 与聊天输入框同一个设置（设置 → Enter 发送消息）
+    if (app.enterSend) {
+      if (!e.shiftKey && !e.ctrlKey && !e.metaKey) { e.preventDefault(); void submit(); }
+    } else if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      void submit();
+    }
   }
 
   // ---------------- 语音 ----------------
@@ -142,8 +184,10 @@
   }
   const micTitle = $derived(vc.recording ? t("正在听…（说完自动结束，点击提前结束）") : vc.transcribing ? t("识别中…") : t("语音输入"));
 
-  function openPanel(tab: "chat" | "memory") {
-    ga.panel = ga.panel === tab ? null : tab;
+  function openPanel(tab: "chat" | "memory", keep = false) {
+    ga.panel = ga.panel === tab && !keep ? null : tab;
+    // 人物模式下面板在控制台里：展开面板时控制台跟着出现
+    if (ga.panel && mode !== "plain" && !ga.composer) openComposer();
     if (ga.panel === "memory") void loadMemories();
     if (ga.panel === "chat") void tick().then(() => { if (listEl) listEl.scrollTop = listEl.scrollHeight; });
   }
@@ -243,193 +287,269 @@
     const off = onSkinEvent((ev) => { if (ev === "character.click" && enabled()) onChip(); });
     const onResize = () => measure();
     addEventListener("resize", onResize);
+    // 输入框的 Enter 行为跟随聊天设置（聊天页没打开过时这里自己读一次）
+    void api.settingsGet("chat.enter_send").then((v) => (app.enterSend = v === "1")).catch(() => {});
     return () => { off(); removeEventListener("resize", onResize); };
   });
 </script>
 
-{#if enabled()}
-  <div
-    class="ga-root ga-{mode}"
-    style="--ga-left:{pos.left}px; --ga-bottom:{pos.bottom}px"
-    role="complementary"
-    aria-label={t("全局助手")}
-  >
-    {#if mode === "plain"}
-      <button class="ga-launcher" class:on={cardOpen} class:busy title={t("全局助手（Alt+A）")} onclick={onLauncher}>
-        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M12 3C6.9 3 3 6.4 3 10.6c0 2.3 1.2 4.4 3.1 5.8L5.4 20l4-2.1c.8.2 1.7.3 2.6.3 5.1 0 9-3.4 9-7.6S17.1 3 12 3Zm-4 8.8a1.2 1.2 0 1 1 0-2.4 1.2 1.2 0 0 1 0 2.4Zm4 0a1.2 1.2 0 1 1 0-2.4 1.2 1.2 0 0 1 0 2.4Zm4 0a1.2 1.2 0 1 1 0-2.4 1.2 1.2 0 0 1 0 2.4Z"/></svg>
-      </button>
+{#snippet micBtn()}
+  {#if inputEnabled()}
+    <button class="ga-mic" class:rec={vc.recording} class:wait={vc.transcribing} style="--lv:{vc.level}" disabled={vc.transcribing || (busy && !vc.recording)} title={micTitle} aria-label={micTitle} onclick={onMic}>
+      <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2Z"/></svg>
+    </button>
+  {/if}
+{/snippet}
+
+{#snippet stopSpeakBtn()}
+  {#if vc.speaking}
+    <button class="ga-icon ga-speaking" title={t("停止朗读")} aria-label={t("停止朗读")} onclick={stopSpeaking}>
+      <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M4 9v6h4l5 4V5L8 9H4Zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4Z"/></svg>
+    </button>
+  {/if}
+{/snippet}
+
+{#snippet corners()}
+  {#if mode === "amadeus"}<span class="ga-corner tl"></span><span class="ga-corner tr"></span><span class="ga-corner bl"></span><span class="ga-corner br"></span>{/if}
+{/snippet}
+
+{#snippet chatPanel()}
+  <div class="ga-list" bind:this={listEl}>
+    {#each ga.messages as m (m.id)}
+      <div class="ga-msg {m.role}">
+        <div class="ga-msg-meta">{m.role === "user" ? t("你") : p.name} · {fmtTime(m.created_at)}{m.interrupted ? ` · ${t("已停止")}` : ""}</div>
+        <!-- svelte-ignore a11y_click_events_have_key_events -->
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="ga-md" onclick={onMdClick}>{@html md(m.content)}</div>
+      </div>
+    {:else}
+      <div class="ga-empty">{t("还没有对话。")}</div>
+    {/each}
+    {#if busy}
+      <div class="ga-msg assistant"><div class="ga-msg-meta">{p.name}</div><div class="ga-md">{#if streamingText}{@html md(streamingText)}{:else}<span class="ga-dots"><i></i><i></i><i></i></span>{/if}</div></div>
     {/if}
+  </div>
+  <div class="ga-tools">
+    <button class="ga-btn" disabled={!!ga.busy} onclick={newSession}>{t("新建长期会话")}</button>
+    <button class="ga-btn" disabled={!!ga.busy || !ga.messages.length} onclick={doClear}>{t("清空记录")}</button>
+    <span class="ga-grow"></span>
+    <button class="ga-btn" onclick={openSettings}>{t("设置")}</button>
+  </div>
+{/snippet}
 
-    {#if cardOpen}
-      <div
-        class="ga-card"
-        class:wide={ga.panel !== null}
-        role="dialog"
-        tabindex="-1"
-        aria-label={title}
-        onmouseenter={() => (hovered = true)}
-        onmouseleave={() => (hovered = false)}
-      >
-        {#if mode === "amadeus"}<span class="ga-corner tl"></span><span class="ga-corner tr"></span><span class="ga-corner bl"></span><span class="ga-corner br"></span>{/if}
-        <header class="ga-head">
-          {#if mode === "amadeus"}
-            <span class="ga-led" class:busy class:speak={vc.speaking}></span>
-            <span class="ga-title">{title}</span>
-            <span class="ga-nixie" title={t("世界线变动率")}>{divergence}</span>
-          {:else}
-            <span class="ga-title">{title}</span>
-          {/if}
-          <span class="ga-grow"></span>
-          {#if vc.speaking}
-            <button class="ga-icon ga-speaking" title={t("停止朗读")} aria-label={t("停止朗读")} onclick={stopSpeaking}>
-              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M4 9v6h4l5 4V5L8 9H4Zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4Z"/></svg>
-            </button>
-          {/if}
-          <button class="ga-icon" class:on={ga.panel === "chat"} title={t("对话记录")} onclick={() => openPanel("chat")}>☰</button>
-          <button class="ga-icon" class:on={ga.panel === "memory"} title={t("长期记忆")} onclick={() => openPanel("memory")}>✦</button>
-          <button class="ga-icon" title={t("关闭")} onclick={close}>✕</button>
-        </header>
-
-        {#if ga.panel === "chat"}
-          <div class="ga-list" bind:this={listEl}>
-            {#each ga.messages as m (m.id)}
-              <div class="ga-msg {m.role}">
-                <div class="ga-msg-meta">{m.role === "user" ? t("你") : p.name} · {fmtTime(m.created_at)}{m.interrupted ? ` · ${t("已停止")}` : ""}</div>
-                <!-- svelte-ignore a11y_click_events_have_key_events -->
-                <!-- svelte-ignore a11y_no_static_element_interactions -->
-                <div class="ga-md" onclick={onMdClick}>{@html md(m.content)}</div>
-              </div>
-            {:else}
-              <div class="ga-empty">{t("还没有对话。")}</div>
-            {/each}
-            {#if busy}
-              <div class="ga-msg assistant"><div class="ga-msg-meta">{p.name}</div><div class="ga-md">{#if streamingText}{@html md(streamingText)}{:else}<span class="ga-dots"><i></i><i></i><i></i></span>{/if}</div></div>
-            {/if}
-          </div>
-          <div class="ga-tools">
-            <button class="ga-btn" disabled={!!ga.busy} onclick={newSession}>{t("新建长期会话")}</button>
-            <button class="ga-btn" disabled={!!ga.busy || !ga.messages.length} onclick={doClear}>{t("清空记录")}</button>
-            <span class="ga-grow"></span>
-            <button class="ga-btn" onclick={openSettings}>{t("设置")}</button>
-          </div>
-        {:else if ga.panel === "memory"}
-          <div class="ga-list">
-            <p class="ga-hint">{t("长期记忆独立于各客户端会话保存，切换客户端或新建会话后仍然有效。")}</p>
-            {#each ga.memories as m (m.id)}
-              <div class="ga-mem" class:pinned={m.pinned}>
-                {#if editing?.id === m.id}
-                  <textarea class="ga-input" rows="2" bind:value={editing.content} onkeydown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); void saveEdit(); } else if (e.key === "Escape") editing = null; }}></textarea>
-                  <div class="ga-mem-acts"><button class="ga-btn" onclick={saveEdit}>{t("保存")}</button><button class="ga-btn" onclick={() => (editing = null)}>{t("取消")}</button></div>
-                {:else}
-                  <div class="ga-mem-text">{m.content}</div>
-                  <div class="ga-mem-acts">
-                    <span class="ga-mem-src">{t(srcLabel[m.source] ?? m.source)} · {fmtTime(m.updated_at)}</span>
-                    <span class="ga-grow"></span>
-                    <button class="ga-icon sm" class:on={m.pinned} title={m.pinned ? t("取消置顶") : t("置顶（总是带上，整理时不改动）")} onclick={() => togglePin(m.id, m.content, m.pinned)}>📌</button>
-                    <button class="ga-icon sm" title={t("编辑")} onclick={() => (editing = { id: m.id, content: m.content })}>✎</button>
-                    <button class="ga-icon sm" title={t("删除")} onclick={() => delMemory(m.id)}>✕</button>
-                  </div>
-                {/if}
-              </div>
-            {:else}
-              <div class="ga-empty">{t("还没有记忆。聊天中提到的偏好、约定等会被自动记住，也可以手动添加。")}</div>
-            {/each}
-          </div>
-          <div class="ga-tools">
-            <input class="ga-input grow" placeholder={t("手动添加一条记忆…")} bind:value={memDraft} onkeydown={(e) => { if (e.key === "Enter" && !e.isComposing) void addMemory(); }} />
-            <button class="ga-btn" disabled={!memDraft.trim()} onclick={addMemory}>{t("添加")}</button>
-          </div>
-          <div class="ga-tools">
-            <button class="ga-btn" disabled={!!ga.busy || memBusy} onclick={() => doSummarize("extract")}>{memBusy && ga.busy === "summarize" ? t("处理中…") : t("从最近对话提炼")}</button>
-            <button class="ga-btn" disabled={!!ga.busy || memBusy || ga.memories.filter((m) => !m.pinned).length < 2} onclick={() => doSummarize("consolidate")}>{t("整理记忆")}</button>
-          </div>
+{#snippet memoryPanel()}
+  <div class="ga-list">
+    <p class="ga-hint">{t("长期记忆独立于各客户端会话保存，切换客户端或新建会话后仍然有效。")}</p>
+    {#each ga.memories as m (m.id)}
+      <div class="ga-mem" class:pinned={m.pinned}>
+        {#if editing?.id === m.id}
+          <textarea class="ga-input" rows="2" bind:value={editing.content} onkeydown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); void saveEdit(); } else if (e.key === "Escape") editing = null; }}></textarea>
+          <div class="ga-mem-acts"><button class="ga-btn" onclick={saveEdit}>{t("保存")}</button><button class="ga-btn" onclick={() => (editing = null)}>{t("取消")}</button></div>
         {:else}
-          <div class="ga-body" bind:this={bodyEl}>
-            {#if busy && !streamingText}
-              <span class="ga-dots" aria-label={t("思考中")}><i></i><i></i><i></i></span>
-              {#if ga.busy === "reset"}<span class="ga-sub">{t("正在新建会话…")}</span>{/if}
-            {:else if busy}
-              <!-- svelte-ignore a11y_click_events_have_key_events -->
-              <!-- svelte-ignore a11y_no_static_element_interactions -->
-              <div class="ga-md" onclick={onMdClick}>{@html md(streamingText)}<span class="ga-caret"></span></div>
-            {:else}
-              {#if page}
-                {#key ga.bubble.index + ga.bubble.rev * 1000}
-                  <!-- svelte-ignore a11y_click_events_have_key_events -->
-                  <!-- svelte-ignore a11y_no_static_element_interactions -->
-                  <div class="ga-md ga-page" onclick={onMdClick}>{@html md(page)}</div>
-                {/key}
-              {:else if !ga.bubble.error}
-                <div class="ga-sub">{t("想聊点什么？")}</div>
-              {/if}
-              {#if ga.bubble.error}<div class="ga-error">{ga.bubble.error}</div>{/if}
-            {/if}
-          </div>
-          {#if pageCount > 1 && !busy}
-            <div class="ga-pager">
-              <button class="ga-icon sm" disabled={ga.bubble.index === 0} onclick={prev} aria-label={t("上一页")}>‹</button>
-              <span>{ga.bubble.index + 1} / {pageCount}</span>
-              <button class="ga-icon sm" disabled={ga.bubble.index >= pageCount - 1} onclick={next} aria-label={t("下一页")}>›</button>
-            </div>
-          {/if}
-        {/if}
-
-        {#if memoShown}<div class="ga-memo">✦ {memoShown}</div>{/if}
-
-        {#if ga.composer}
-          <div class="ga-compose">
-            {#if mode === "amadeus"}<span class="ga-prompt">&gt;</span>{/if}
-            <textarea
-              class="ga-input grow"
-              rows="1"
-              bind:this={inputEl}
-              bind:value={input}
-              placeholder={vc.recording ? t("正在听…") : vc.transcribing ? t("识别中…") : busy ? t("回复中…") : t("和{name}说点什么（Enter 发送，Shift+Enter 换行）", { name: p.name })}
-              onkeydown={onKey}
-            ></textarea>
-            {#if inputEnabled()}
-              <button class="ga-mic" class:rec={vc.recording} class:wait={vc.transcribing} style="--lv:{vc.level}" disabled={vc.transcribing || (busy && !vc.recording)} title={micTitle} aria-label={micTitle} onclick={onMic}>
-                <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2Z"/></svg>
-              </button>
-            {/if}
-            {#if busy}
-              <button class="ga-btn" onclick={cancel}>{mode === "amadeus" ? "[ STOP ]" : t("停止")}</button>
-            {:else}
-              <button class="ga-btn primary" disabled={!input.trim()} onclick={submit}>{mode === "amadeus" ? "[ SEND ]" : t("发送")}</button>
-            {/if}
-          </div>
-        {:else}
-          <div class="ga-foot">
-            {#if busy}
-              <button class="ga-btn" onclick={cancel}>{t("停止")}</button>
-            {/if}
+          <div class="ga-mem-text">{m.content}</div>
+          <div class="ga-mem-acts">
+            <span class="ga-mem-src">{t(srcLabel[m.source] ?? m.source)} · {fmtTime(m.updated_at)}</span>
             <span class="ga-grow"></span>
-            {#if inputEnabled()}
-              <button class="ga-mic" class:rec={vc.recording} class:wait={vc.transcribing} style="--lv:{vc.level}" disabled={vc.transcribing || (busy && !vc.recording)} title={micTitle} aria-label={micTitle} onclick={onMic}>
-                <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2Z"/></svg>
-              </button>
-            {/if}
-            <button class="ga-btn" onclick={openComposer}>{t("回复")}</button>
+            <button class="ga-icon sm" class:on={m.pinned} title={m.pinned ? t("取消置顶") : t("置顶（总是带上，整理时不改动）")} onclick={() => togglePin(m.id, m.content, m.pinned)}>📌</button>
+            <button class="ga-icon sm" title={t("编辑")} onclick={() => (editing = { id: m.id, content: m.content })}>✎</button>
+            <button class="ga-icon sm" title={t("删除")} onclick={() => delMemory(m.id)}>✕</button>
           </div>
         {/if}
       </div>
-    {:else if mode !== "plain"}
-      <button class="ga-chip" class:busy title={t("和{name}聊天（Alt+A）", { name: p.name })} onclick={onChip}>
-        {#if mode === "amadeus"}<span class="ga-led" class:busy></span>AMADEUS{:else}<span class="ga-chip-dot"></span>{p.name}{/if}
-      </button>
+    {:else}
+      <div class="ga-empty">{t("还没有记忆。聊天中提到的偏好、约定等会被自动记住，也可以手动添加。")}</div>
+    {/each}
+  </div>
+  <div class="ga-tools">
+    <input class="ga-input grow" placeholder={t("手动添加一条记忆…")} bind:value={memDraft} onkeydown={(e) => { if (e.key === "Enter" && !e.isComposing) void addMemory(); }} />
+    <button class="ga-btn" disabled={!memDraft.trim()} onclick={addMemory}>{t("添加")}</button>
+  </div>
+  <div class="ga-tools">
+    <button class="ga-btn" disabled={!!ga.busy || memBusy} onclick={() => doSummarize("extract")}>{memBusy && ga.busy === "summarize" ? t("处理中…") : t("从最近对话提炼")}</button>
+    <button class="ga-btn" disabled={!!ga.busy || memBusy || ga.memories.filter((m) => !m.pinned).length < 2} onclick={() => doSummarize("consolidate")}>{t("整理记忆")}</button>
+  </div>
+{/snippet}
+
+{#snippet replyView()}
+  {#if busy && !streamingText}
+    <span class="ga-dots" aria-label={t("思考中")}><i></i><i></i><i></i></span>
+    {#if ga.busy === "reset"}<span class="ga-sub">{t("正在新建会话…")}</span>{/if}
+  {:else if busy}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="ga-md" onclick={onMdClick}>{@html md(streamingText)}<span class="ga-caret"></span></div>
+  {:else}
+    {#if page}
+      {#key ga.bubble.index + ga.bubble.rev * 1000}
+        <!-- svelte-ignore a11y_click_events_have_key_events -->
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="ga-md ga-page" onclick={onMdClick}>{@html md(page)}</div>
+      {/key}
+    {:else if !ga.bubble.error}
+      <div class="ga-sub">{t("想聊点什么？")}</div>
+    {/if}
+    {#if ga.bubble.error}<div class="ga-error">{ga.bubble.error}</div>{/if}
+  {/if}
+{/snippet}
+
+{#snippet pager()}
+  <button class="ga-icon sm" disabled={ga.bubble.index === 0} onclick={prev} aria-label={t("上一页")}>‹</button>
+  <span>{ga.bubble.index + 1} / {pageCount}</span>
+  <button class="ga-icon sm" disabled={ga.bubble.index >= pageCount - 1} onclick={next} aria-label={t("下一页")}>›</button>
+{/snippet}
+
+{#snippet composeRow()}
+  <div class="ga-compose">
+    {#if mode === "amadeus"}<span class="ga-prompt">&gt;</span>{/if}
+    <textarea class="ga-input grow" rows="1" bind:this={inputEl} bind:value={input} {placeholder} onkeydown={onKey}></textarea>
+    {@render micBtn()}
+    {#if busy}
+      <button class="ga-btn" onclick={cancel}>{mode === "amadeus" ? "[ STOP ]" : t("停止")}</button>
+    {:else}
+      <button class="ga-btn primary" disabled={!input.trim()} onclick={submit}>{mode === "amadeus" ? "[ SEND ]" : t("发送")}</button>
     {/if}
   </div>
+{/snippet}
+
+{#if enabled()}
+  {#if mode === "plain"}
+    <div class="ga-root ga-plain" role="complementary" aria-label={t("全局助手")}>
+      <button class="ga-launcher" class:on={cardOpen} class:busy title={t("全局助手（Alt+A）")} onclick={onLauncher}>
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M12 3C6.9 3 3 6.4 3 10.6c0 2.3 1.2 4.4 3.1 5.8L5.4 20l4-2.1c.8.2 1.7.3 2.6.3 5.1 0 9-3.4 9-7.6S17.1 3 12 3Zm-4 8.8a1.2 1.2 0 1 1 0-2.4 1.2 1.2 0 0 1 0 2.4Zm4 0a1.2 1.2 0 1 1 0-2.4 1.2 1.2 0 0 1 0 2.4Zm4 0a1.2 1.2 0 1 1 0-2.4 1.2 1.2 0 0 1 0 2.4Z"/></svg>
+      </button>
+
+      {#if cardOpen}
+        <div
+          class="ga-card"
+          class:wide={ga.panel !== null}
+          role="dialog"
+          tabindex="-1"
+          aria-label={title}
+          onmouseenter={() => (hovered = true)}
+          onmouseleave={() => (hovered = false)}
+        >
+          <header class="ga-head">
+            <span class="ga-title">{title}</span>
+            <span class="ga-grow"></span>
+            {@render stopSpeakBtn()}
+            <button class="ga-icon" class:on={ga.panel === "chat"} title={t("对话记录")} onclick={() => openPanel("chat")}>☰</button>
+            <button class="ga-icon" class:on={ga.panel === "memory"} title={t("长期记忆")} onclick={() => openPanel("memory")}>✦</button>
+            <button class="ga-icon" title={t("关闭")} onclick={close}>✕</button>
+          </header>
+
+          {#if ga.panel === "chat"}
+            {@render chatPanel()}
+          {:else if ga.panel === "memory"}
+            {@render memoryPanel()}
+          {:else}
+            <div class="ga-body" bind:this={bodyEl}>{@render replyView()}</div>
+            {#if pageCount > 1 && !busy}<div class="ga-pager">{@render pager()}</div>{/if}
+          {/if}
+
+          {#if memoShown}<div class="ga-memo">✦ {memoShown}</div>{/if}
+
+          {#if ga.composer}
+            {@render composeRow()}
+          {:else}
+            <div class="ga-foot">
+              {#if busy}<button class="ga-btn" onclick={cancel}>{t("停止")}</button>{/if}
+              <span class="ga-grow"></span>
+              {@render micBtn()}
+              <button class="ga-btn" onclick={openComposer}>{t("回复")}</button>
+            </div>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {:else}
+    <div class="ga-root ga-{mode} ga-staged" role="complementary" aria-label={t("全局助手")}>
+      {#if ga.bubble.visible}
+        <!-- 说话气泡：人物头部旁 -->
+        <div
+          class="ga-say"
+          class:subtitle={subtitleOn}
+          style="left:{pos.left}px; bottom:{pos.bottom}px; --say-max:{Math.max(140, winH - pos.bottom - 12)}px"
+          role="status"
+          aria-live="polite"
+          onmouseenter={() => (hovered = true)}
+          onmouseleave={() => (hovered = false)}
+        >
+          {@render corners()}
+          <header class="ga-say-head">
+            {#if mode === "amadeus"}<span class="ga-led" class:busy class:speak={vc.speaking}></span>{/if}
+            <span class="ga-title">{title}</span>
+            <span class="ga-grow"></span>
+            {#if mode === "amadeus"}<span class="ga-nixie" title={t("世界线变动率")}>{divergence}</span>{/if}
+          </header>
+          <div class="ga-body" bind:this={bodyEl}>
+            {#if subtitleOn}
+              {#if vc.subtitle}
+                {#key vc.subRev}<div class="ga-subline">{vc.subtitle}</div>{/key}
+              {:else}
+                <span class="ga-dots" aria-label={t("思考中")}><i></i><i></i><i></i></span>
+              {/if}
+            {:else}
+              {@render replyView()}
+            {/if}
+          </div>
+          <footer class="ga-say-foot">
+            {#if !subtitleOn && pageCount > 1 && !busy}{@render pager()}{/if}
+            <span class="ga-grow"></span>
+            {@render stopSpeakBtn()}
+            {#if !ga.composer}
+              <button class="ga-icon sm" title={t("回复")} aria-label={t("回复")} onclick={openComposer}>✎</button>
+            {/if}
+            <button class="ga-icon sm" class:on={ga.panel === "chat"} title={t("对话记录")} aria-label={t("对话记录")} onclick={() => openPanel("chat", true)}>☰</button>
+            <button class="ga-icon sm" title={t("收起气泡")} aria-label={t("收起气泡")} onclick={hideBubble}>✕</button>
+          </footer>
+        </div>
+      {/if}
+
+      {#if ga.composer}
+        <!-- 控制台：人物脚下 -->
+        <div
+          class="ga-dock"
+          class:faded={dockFaded}
+          style="left:{dock.left}px; bottom:{dock.bottom}px; width:{dock.width}px; --panel-max:{dock.panelMax}px"
+          role="dialog"
+          tabindex="-1"
+          aria-label={title}
+        >
+          {@render corners()}
+          {#if ga.panel}
+            <section class="ga-panel">
+              <header class="ga-panel-head">
+                <button class="ga-tab" class:on={ga.panel === "chat"} onclick={() => openPanel("chat", true)}>{t("对话记录")}</button>
+                <button class="ga-tab" class:on={ga.panel === "memory"} onclick={() => openPanel("memory", true)}>{t("长期记忆")}</button>
+                <span class="ga-grow"></span>
+                <button class="ga-icon sm" title={t("收起面板")} aria-label={t("收起面板")} onclick={() => (ga.panel = null)}>▾</button>
+              </header>
+              {#if ga.panel === "chat"}{@render chatPanel()}{:else}{@render memoryPanel()}{/if}
+            </section>
+          {/if}
+          <div class="ga-bar">
+            {#if mode === "amadeus"}<span class="ga-led" class:busy class:speak={vc.speaking}></span>{:else}<span class="ga-chip-dot" class:busy class:speak={vc.speaking}></span>{/if}
+            <span class="ga-status" class:live={!!status}>{status || title}</span>
+            {#if memoShown}<span class="ga-memo">✦ {memoShown}</span>{/if}
+            <span class="ga-grow"></span>
+            {@render stopSpeakBtn()}
+            <button class="ga-icon sm" class:on={ga.panel === "chat"} title={t("对话记录")} aria-label={t("对话记录")} onclick={() => openPanel("chat")}>☰</button>
+            <button class="ga-icon sm" class:on={ga.panel === "memory"} title={t("长期记忆")} aria-label={t("长期记忆")} onclick={() => openPanel("memory")}>✦</button>
+            <button class="ga-icon sm" title={t("关闭（点击人物或 Alt+A 重新打开）")} aria-label={t("关闭")} onclick={close}>✕</button>
+          </div>
+          {@render composeRow()}
+        </div>
+      {/if}
+    </div>
+  {/if}
 {/if}
 
 <style>
   .ga-root {
     position: fixed;
-    left: var(--ga-left);
-    bottom: var(--ga-bottom);
     z-index: 320;
     pointer-events: none;
     font-size: 13px;
-    max-width: calc(100vw - var(--ga-left) - 12px);
   }
   .ga-root > * { pointer-events: auto; }
   .ga-root.ga-plain { left: 14px; bottom: 14px; }
@@ -439,7 +559,7 @@
     position: relative;
     width: 300px;
     max-width: 100%;
-    max-height: min(46vh, 420px, calc(100vh - var(--ga-bottom) - 44px));
+    max-height: min(46vh, 420px);
     display: flex;
     flex-direction: column;
     background: var(--bg-elev);
@@ -450,10 +570,9 @@
     overflow: hidden;
     animation: ga-pop .16s ease-out;
   }
-  .ga-card.wide { width: 360px; max-height: min(64vh, 560px, calc(100vh - var(--ga-bottom) - 44px)); }
+  .ga-card.wide { width: 360px; max-height: min(64vh, 560px); }
   .ga-plain .ga-card { position: absolute; left: 0; bottom: 48px; border-radius: 12px; max-width: calc(100vw - 28px); max-height: min(46vh, 420px, calc(100vh - 110px)); }
   .ga-plain .ga-card.wide { max-height: min(64vh, 560px, calc(100vh - 110px)); }
-  .ga-generic .ga-card { border-bottom-left-radius: 4px; }
   @keyframes ga-pop { from { opacity: 0; transform: translateY(6px) scale(.98); } to { opacity: 1; transform: none; } }
 
   .ga-head { display: flex; align-items: center; gap: 6px; padding: 7px 8px 5px 12px; border-bottom: 1px solid var(--border-soft); flex: none; }
@@ -531,15 +650,7 @@
   .ga-launcher.busy { animation: ga-pulse 1.4s ease-in-out infinite; }
   @keyframes ga-pulse { 50% { box-shadow: 0 0 0 5px var(--accent-soft); } }
 
-  /* ---------- 通用气泡的收起态 ---------- */
-  .ga-chip {
-    display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px;
-    border-radius: 12px 12px 12px 3px; border: 1px solid var(--border); background: var(--bg-elev);
-    color: var(--text-dim); font-size: 12px; cursor: pointer; box-shadow: 0 4px 12px #0003; opacity: .88;
-  }
-  .ga-chip:hover { opacity: 1; color: var(--text); border-color: var(--accent); }
-  .ga-chip-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
-  .ga-chip.busy .ga-chip-dot { animation: ga-blink .9s steps(2) infinite; }
+  .ga-chip-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
 
   .ga-mic {
     flex: none; width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center;
@@ -555,7 +666,7 @@
   .ga-amadeus .ga-mic.rec { color: #1a1408; background: var(--am); border-color: var(--am); box-shadow: 0 0 0 calc(1px + var(--lv, 0) * 6px) #f0b42940; }
   .ga-amadeus .ga-speaking { color: var(--am); }
 
-  /* ---------- Amadeus（牧濑红莉栖·动态） ----------
+  /* ---------- 终端风格（牧濑红莉栖·动态；style id 沿用 amadeus） ----------
      底色取皮肤自己的深灰（--bg-elev / --bg），亮黄只做点缀：指示灯、辉光管时钟、提示符、四角、主按钮与焦点。 */
   .ga-amadeus {
     --am: #f0b429;
@@ -568,32 +679,18 @@
     --am-bg-2: color-mix(in srgb, var(--bg, #141518) 70%, transparent);
     font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
   }
-  .ga-amadeus .ga-card {
-    background:
-      repeating-linear-gradient(0deg, #ffffff04 0 1px, transparent 1px 3px),
-      var(--am-bg);
-    color: var(--am-text);
-    border: 1px solid var(--am-line-2);
-    border-radius: 2px;
-    box-shadow: 0 0 0 1px #0008, 0 12px 30px #0009;
-    backdrop-filter: blur(8px);
-  }
   .ga-corner { position: absolute; width: 9px; height: 9px; border: 0 solid var(--am); pointer-events: none; z-index: 1; opacity: .9; }
   .ga-corner.tl { left: 3px; top: 3px; border-left-width: 2px; border-top-width: 2px; }
   .ga-corner.tr { right: 3px; top: 3px; border-right-width: 2px; border-top-width: 2px; }
   .ga-corner.bl { left: 3px; bottom: 3px; border-left-width: 2px; border-bottom-width: 2px; }
   .ga-corner.br { right: 3px; bottom: 3px; border-right-width: 2px; border-bottom-width: 2px; }
-  .ga-amadeus .ga-head { border-bottom: 1px solid var(--am-line); padding: 8px 20px 6px 12px; background: var(--am-bg-2); }
-  .ga-amadeus .ga-card { width: 356px; }
-  .ga-amadeus .ga-card.wide { width: 390px; }
-  .ga-amadeus .ga-title { color: var(--am-text); letter-spacing: .06em; font-size: 11.5px; }
   .ga-nixie { flex: none; }
   .ga-nixie {
     font-size: 11.5px; letter-spacing: .1em; color: #ffb63d;
     text-shadow: 0 0 4px #ff8a0099, 0 0 8px #ff6a0044; font-variant-numeric: tabular-nums;
   }
   .ga-led { width: 7px; height: 7px; border-radius: 50%; background: #4a4c52; box-shadow: inset 0 0 2px #000; flex: none; }
-  .ga-led.busy, .ga-chip.busy .ga-led { background: var(--am, #f0b429); box-shadow: 0 0 6px #ffa000; animation: ga-blink .8s steps(2) infinite; }
+  .ga-led.busy { background: var(--am, #f0b429); box-shadow: 0 0 6px #ffa000; animation: ga-blink .8s steps(2) infinite; }
   .ga-led.speak { background: var(--am, #f0b429); box-shadow: 0 0 6px #ffa000; }
   .ga-amadeus .ga-icon { color: var(--am-dim); border-radius: 0; }
   .ga-amadeus .ga-icon:hover:not(:disabled), .ga-amadeus .ga-icon.on { background: #ffffff10; color: var(--am); }
@@ -623,12 +720,78 @@
   .ga-amadeus .ga-mem.pinned { border-left: 2px solid var(--am); }
   .ga-amadeus .ga-memo { color: var(--am); }
   .ga-amadeus .ga-error { color: #ff7a6b; }
-  .ga-amadeus .ga-chip {
-    font-family: inherit; letter-spacing: .14em; font-size: 11px; border-radius: 0;
-    background: var(--am-bg); color: var(--am-text); border: 1px solid var(--am-line-2); box-shadow: 0 4px 12px #0006;
+  /* ---------- 人物模式：说话气泡 + 脚下控制台 ---------- */
+  .ga-staged { position: fixed; left: 0; bottom: 0; width: 0; height: 0; max-width: none; }
+  .ga-say {
+    position: fixed;
+    width: 280px;
+    max-width: calc(100vw - 24px);
+    max-height: min(40vh, 320px, var(--say-max, 320px));
+    display: flex; flex-direction: column;
+    background: var(--bg-elev); color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 14px 14px 14px 4px;
+    box-shadow: 0 10px 28px #0005;
+    overflow: hidden;
+    animation: ga-pop .16s ease-out;
   }
-  .ga-amadeus .ga-chip:hover { color: #fff; border-color: #f0b42999; }
+  .ga-say-head { display: flex; align-items: center; gap: 6px; padding: 6px 10px 0 12px; flex: none; }
+  .ga-say .ga-title { font-size: 11.5px; color: var(--text-dim); font-weight: 600; }
+  .ga-say .ga-body { padding: 4px 12px 2px; }
+  .ga-say-foot { display: flex; align-items: center; gap: 2px; padding: 0 6px 5px 8px; font-size: 11px; color: var(--text-faint); flex: none; min-height: 22px; }
+  .ga-subline { font-size: 13.5px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; animation: ga-sub .22s ease-out; }
+  @keyframes ga-sub { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+
+  .ga-dock {
+    position: fixed;
+    max-width: calc(100vw - 16px);
+    display: flex; flex-direction: column;
+    background: color-mix(in srgb, var(--bg-elev) 94%, transparent);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 8px 24px #0005;
+    backdrop-filter: blur(6px);
+    overflow: hidden;
+    transition: opacity .2s;
+    animation: ga-pop .16s ease-out;
+  }
+  .ga-dock.faded:not(:hover):not(:focus-within) { opacity: .18; }
+  .ga-panel { display: flex; flex-direction: column; max-height: var(--panel-max); min-height: 0; border-bottom: 1px solid var(--border-soft); }
+  .ga-panel .ga-list { min-height: 80px; }
+  .ga-panel-head { display: flex; align-items: center; gap: 2px; padding: 5px 6px 3px 8px; flex: none; border-bottom: 1px solid var(--border-soft); }
+  .ga-tab { border: 0; background: transparent; color: var(--text-dim); font-size: 12px; padding: 2px 8px; border-radius: 6px; cursor: pointer; }
+  .ga-tab:hover, .ga-tab.on { color: var(--text); background: var(--accent-soft); }
+  .ga-bar { display: flex; align-items: center; gap: 4px; padding: 5px 6px 0 10px; flex: none; min-width: 0; }
+  .ga-status { font-size: 11.5px; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .ga-status.live { color: var(--accent); }
+  .ga-bar .ga-memo { padding: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .ga-dock .ga-compose { border-top: 0; padding-top: 4px; }
+  .ga-chip-dot.speak { box-shadow: 0 0 0 3px var(--accent-soft); }
+  .ga-chip-dot.busy { animation: ga-blink .9s steps(2) infinite; }
+
+  .ga-amadeus .ga-say, .ga-amadeus .ga-dock {
+    background:
+      repeating-linear-gradient(0deg, #ffffff04 0 1px, transparent 1px 3px),
+      var(--am-bg);
+    color: var(--am-text);
+    border: 1px solid var(--am-line-2);
+    border-radius: 2px;
+    box-shadow: 0 0 0 1px #0008, 0 12px 30px #0009;
+    backdrop-filter: blur(8px);
+  }
+  .ga-amadeus .ga-say { width: 330px; }
+  .ga-amadeus .ga-say-head { padding: 7px 18px 4px 12px; border-bottom: 1px solid var(--am-line); background: var(--am-bg-2); }
+  .ga-amadeus .ga-say .ga-title { color: var(--am-text); letter-spacing: .06em; font-weight: 600; }
+  .ga-amadeus .ga-say .ga-body { padding-top: 7px; }
+  .ga-amadeus .ga-say-foot, .ga-amadeus .ga-status { color: var(--am-dim); }
+  .ga-amadeus .ga-status.live { color: var(--am); }
+  .ga-amadeus .ga-subline { color: #ece7da; }
+  .ga-amadeus .ga-panel, .ga-amadeus .ga-panel-head { border-color: var(--am-line); }
+  .ga-amadeus .ga-tab { color: var(--am-dim); border-radius: 0; font-family: inherit; letter-spacing: .04em; }
+  .ga-amadeus .ga-tab:hover, .ga-amadeus .ga-tab.on { color: var(--am); background: #ffffff10; }
+  .ga-amadeus .ga-dock .ga-compose { border-top: 0; }
   @media (prefers-reduced-motion: reduce) {
-    .ga-card, .ga-page { animation: none; }
+    .ga-card, .ga-page, .ga-say, .ga-dock, .ga-subline { animation: none; }
   }
 </style>

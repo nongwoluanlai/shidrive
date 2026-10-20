@@ -5,6 +5,7 @@
 //
 // Everything a skin can tune lives in its skin.json `scene` block — the renderer has no
 // knowledge of specific characters, expressions or events beyond the generic bus events.
+import { inSeeThrough } from "./seethrough.svelte";
 import type { SkinEvent } from "./bus";
 import { emitSkinEvent, isSkinEvent } from "./bus";
 import type { MotionLevel } from "./motion.svelte";
@@ -198,7 +199,7 @@ function sample(keys: Keys, t: number) {
 }
 const rand = ([a, b]: Vec2) => a + Math.random() * (b - a);
 /** Clicks on real controls are never treated as "poking the character". */
-const INTERACTIVE = "button,a,input,textarea,select,label,[role=button],[role=menuitem],[contenteditable=true],.cm-editor,.ga-root";
+export const INTERACTIVE = "button,a,input,textarea,select,label,[role=button],[role=menuitem],[contenteditable=true],.cm-editor,.ga-root";
 
 export interface SceneImages { body: HTMLImageElement; mask: HTMLImageElement; layers: HTMLImageElement[] }
 
@@ -238,6 +239,7 @@ export class SceneRenderer {
   };
   private onDown = (e: PointerEvent) => {
     if (e.button !== 0 || (e.target instanceof Element && e.target.closest(INTERACTIVE))) return;
+    if (inSeeThrough(e.clientX, e.clientY)) return;
     if (this.hitTest(e.clientX, e.clientY)) emitSkinEvent("character.click");
   };
   private onLost = (e: Event) => { e.preventDefault(); this.fail("WebGL context lost"); };

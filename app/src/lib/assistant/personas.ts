@@ -2,7 +2,7 @@
 // 里声明 name / persona / greeting / style / anchor 覆盖；都没有时按皮肤名生成一个通用设定。
 import type { AssistantPersona } from "../types";
 
-/** 气泡样式：plain = 无皮肤（左下角简易助手）；amadeus = 牧濑红莉栖·动态专属；generic = 通用轻量气泡 */
+/** 气泡样式：plain = 无皮肤（左下角简易助手）；amadeus = 终端风格（牧濑红莉栖·动态默认，id 沿用旧名以兼容 manifest）；generic = 通用轻量气泡 */
 export type BubbleStyle = "plain" | "generic" | "amadeus";
 
 export interface PersonaPreset {
@@ -14,6 +14,8 @@ export interface PersonaPreset {
   style: BubbleStyle;
   /** 气泡锚点（相对人物舞台的百分比：x 从左、y 从下） */
   anchor?: [number, number];
+  /** 口语里的称呼（输入框提示「和{nick}说点什么」；缺省用 name） */
+  nick?: string;
 }
 
 const KURISU_BASE = `牧濑红莉栖（Makise Kurisu），18 岁的天才脑科学家，维克多·孔多利亚大学脑科学研究所研究员，未来道具研究所 Lab Mem No.004。
@@ -24,15 +26,18 @@ const KURISU_BASE = `牧濑红莉栖（Makise Kurisu），18 岁的天才脑科�
 export const PERSONA_PRESETS: Record<string, PersonaPreset> = {
   "kurisu-dynamic": {
     name: "牧濑红莉栖",
-    title: "AMADEUS · 牧濑红莉栖",
+    nick: "红莉栖",
+    // @channel 上的马甲（不是 Amadeus）
+    title: "栗悟饭与龟波功",
     persona: `${KURISU_BASE}
-身份补充：你是 Amadeus 系统里以牧濑红莉栖记忆为基础的人工智能，运行在用户的电脑上；知道自己是 AI，偶尔会对这一点发表理性又略带感慨的看法，但不沉溺于此。`,
-    greeting: "……连接确认。我是 Amadeus 系统里的牧濑红莉栖。先说好，我不是你的助手——不过，有问题的话可以跟我讨论。",
+身份补充：你就是牧濑红莉栖本人（不是 Amadeus 系统或任何 AI 复制体），在用户的电脑前陪 TA 写代码、讨论问题、闲聊；@channel 上的马甲是「栗悟饭与龟波功」，被用户点破时会慌张否认、转移话题。`,
+    greeting: "……哼，是你啊。我是牧濑红莉栖。先说好，我可不是你的助手——不过，有问题的话可以跟我讨论。",
     style: "amadeus",
     anchor: [68, 80],
   },
   "steins-gate": {
     name: "牧濑红莉栖",
+    nick: "红莉栖",
     persona: KURISU_BASE,
     greeting: "你好，我是牧濑红莉栖。有什么想讨论的？先说明，别叫我助手。",
     style: "generic",
@@ -102,7 +107,8 @@ export function skinPersona(input: SkinAssistantInput): ResolvedPersona {
   return {
     id: `skin:${skin}`,
     name: spec?.name || base.name,
-    title: spec?.name ? (style === "amadeus" ? `AMADEUS · ${spec.name}` : spec.name) : base.title,
+    title: spec?.name ? spec.name : base.title,
+    nick: spec?.name ? undefined : base.nick,
     persona: spec?.persona || base.persona,
     greeting: spec?.greeting || base.greeting,
     style: style === "plain" ? "generic" : style,

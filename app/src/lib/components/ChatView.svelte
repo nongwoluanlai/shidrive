@@ -1190,13 +1190,32 @@ import type { DisplayItem } from "../state.svelte";
       searchIdx = -1;
       return;
     }
+    // 下划线标识符（文件名、函数名、命令参数）多半出现在工具调用里，思考 / 工具卡片也纳入搜索
     searchHits = items
-      .map((it, index) => ({ id: it.id, text: it.text, index, kind: it.kind }))
-      .filter((it) => it.kind === "user" || it.kind === "assistant" || it.kind === "error")
-      .filter((it) => it.text.toLowerCase().includes(q))
-      .map(({ id, text, index }) => ({ id, text, index }));
+      .map((it, index) => ({ id: it.id, text: searchableText(it), index }))
+      .filter((it) => it.text.toLowerCase().includes(q));
     searchIdx = searchHits.length ? searchIdx >= 0 && searchIdx < searchHits.length ? searchIdx : 0 : -1;
     jumpToHit();
+  }
+
+  const toolSearchCache = new WeakMap<object, { sig: string; text: string }>();
+  function searchableText(it: DisplayItem): string {
+    if (it.kind !== "tools" || !it.tools?.length) return it.text ?? "";
+    // 工具卡片会原地合并更新：用「数量 + 状态 + 标题」做签名，变了就重建
+    const sig = it.tools.map((tc) => `${tc.status ?? ""}:${tc.title ?? ""}`).join("|");
+    const hit = toolSearchCache.get(it.tools);
+    if (hit && hit.sig === sig) return hit.text;
+    const parts: string[] = [];
+    for (const tc of it.tools) {
+      if (tc.title) parts.push(tc.title);
+      for (const l of tc.locations ?? []) parts.push(l.path);
+      if (tc.rawInput != null) {
+        try { parts.push((typeof tc.rawInput === "string" ? tc.rawInput : JSON.stringify(tc.rawInput)).slice(0, 4000)); } catch { /* ignore */ }
+      }
+    }
+    const text = parts.join("\n");
+    toolSearchCache.set(it.tools, { sig, text });
+    return text;
   }
 
   function stepSearch(dir: 1 | -1) {

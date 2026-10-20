@@ -14,6 +14,12 @@ export const vc = $state({
   level: 0,
   transcribing: false,
   speaking: false,
+  /** 这一回合在朗读（已选定语音）：气泡改为显示与音频同步的字幕 */
+  voiceTurn: false,
+  /** 正在朗读的那一句对应的字幕（界面语言） */
+  subtitle: "",
+  /** 字幕序号（每换一句 +1，用于动画） */
+  subRev: 0,
 });
 
 let inited = false;
@@ -158,18 +164,32 @@ export function cleanSpeech(seg: string): string {
 
 const SAYABLE = /[\p{L}\p{N}]/u;
 
-export function layerSegments(raw: string, lang: string): string[] {
+/** 一句朗读：say = 读出来的文本，show = 气泡里同步显示的字幕 */
+export type SpeechSeg = { say: string; show: string };
+
+/** 配音模式：每个 [[lang: …]] 是一句台词，字幕取它前面那段界面语言的原文 */
+export function layerSegments(raw: string, lang: string): SpeechSeg[] {
   const re = new RegExp(`\\[\\[\\s*${lang}\\s*[:：]\\s*([^\\[\\]]*?)\\s*\\]\\]`, "gi");
-  return [...raw.matchAll(re)].map((m) => m[1].trim()).filter((s) => SAYABLE.test(s));
+  const out: SpeechSeg[] = [];
+  let prev = 0;
+  for (const m of raw.matchAll(re)) {
+    const show = cleanSpeech(speakable(raw.slice(prev, m.index)));
+    prev = (m.index ?? 0) + m[0].length;
+    const say = m[1].trim();
+    if (SAYABLE.test(say)) out.push({ say, show: show || say });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- 朗读队列
 
-type Clip = { rate: number; pcm: string } | { text: string };
+type Clip = ({ rate: number; pcm: string } | { text: string }) & { show: string };
 
 let gen = 0;
-let queue: string[] = [];
+let queue: SpeechSeg[] = [];
 let running = false;
+/** 本回合的原文已全部喂入（队列读完即字幕结束） */
+let ended = false;
 let current: { stop: () => void } | null = null;
 let actx: AudioContext | null = null;
 let turnVoice: OutputVoice | null = null;
@@ -180,8 +200,10 @@ let warned = false;
 export function beginSpeech() {
   stopSpeaking();
   turnVoice = outputVoice();
+  vc.voiceTurn = !!turnVoice;
   consumed = 0;
   warned = false;
+  ended = false;
 }
 
 export function stopSpeaking() {
@@ -194,13 +216,15 @@ export function stopSpeaking() {
   c?.stop();
   if ("speechSynthesis" in window) speechSynthesis.cancel();
   vc.speaking = false;
+  vc.voiceTurn = false;
+  vc.subtitle = "";
 }
 
 /** 喂入流式原文；final = 回合结束（把剩下的半句也读掉） */
 export function feedSpeech(raw: string, final: boolean) {
   const v = turnVoice;
   if (!v) return;
-  let segs: string[];
+  let segs: SpeechSeg[];
   if (v.layer) {
     const all = layerSegments(raw, v.lang);
     segs = all.slice(consumed);
@@ -209,9 +233,13 @@ export function feedSpeech(raw: string, final: boolean) {
     const s = speakable(raw);
     const [parts, used] = cutSentences(s.slice(consumed), final);
     consumed += used;
-    segs = parts.map(cleanSpeech).filter((x) => SAYABLE.test(x));
+    segs = parts.map(cleanSpeech).filter((x) => SAYABLE.test(x)).map((x) => ({ say: x, show: x }));
   }
-  if (!segs.length) return;
+  if (final) ended = true;
+  if (!segs.length) {
+    if (final && !running) { vc.voiceTurn = false; vc.subtitle = ""; }
+    return;
+  }
   queue.push(...segs);
   void pump();
 }
@@ -222,18 +250,21 @@ export function previewVoice(voice: OutputVoice, text: string) {
   turnVoice = voice;
   consumed = 0;
   warned = false;
-  queue.push(text);
+  ended = true;
+  queue.push({ say: text, show: text });
   void pump();
 }
 
-async function synth(v: OutputVoice, text: string, my: number): Promise<Clip | null> {
-  if (v.kind === "system") return { text };
+async function synth(v: OutputVoice, seg: SpeechSeg, my: number): Promise<Clip | null> {
+  if (v.kind === "system") return { text: seg.say, show: seg.show };
   try {
-    const r = await api.voiceTts(text, v.id);
-    return r.pcm ? r : null;
+    const r = await api.voiceTts(seg.say, v.id);
+    return r.pcm ? { rate: r.rate, pcm: r.pcm, show: seg.show } : null;
   } catch (e) {
     if (my === gen && !warned) {
       warned = true;
+      // 合成失败：气泡退回显示全文，不再等字幕
+      vc.voiceTurn = false;
       toast("error", `${t("语音合成失败")}：${e}`);
     }
     return null;
@@ -255,12 +286,15 @@ async function pump() {
       if (my !== gen) break;
       if (!clip) continue;
       vc.speaking = true;
+      vc.subtitle = clip.show;
+      vc.subRev++;
       await ("text" in clip ? speakSystem(clip.text, v.lang) : playPcm(clip));
     }
   } finally {
     if (my === gen) {
       running = false;
       vc.speaking = false;
+      if (ended && !queue.length) { vc.voiceTurn = false; vc.subtitle = ""; }
     }
   }
 }

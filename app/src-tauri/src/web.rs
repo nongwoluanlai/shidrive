@@ -1335,7 +1335,7 @@ fn route(req: &Req, ctx: &Ctx) -> ApiResult {
             }
             let mode = if req.q("mode") == "content" { "content" } else { "files" };
             let opts: crate::search::SearchOpts = serde_json::from_value(json!({
-                "root": strip_verbatim(&root), "query": q, "mode": mode, "max_results": 200,
+                "root": strip_verbatim(&root), "query": q, "mode": mode, "maxResults": 200,
             }))
             .map_err(|e| e.to_string())?;
             let r = crate::search::search(opts)?;

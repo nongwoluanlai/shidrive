@@ -43,7 +43,7 @@ export function persona(): ResolvedPersona {
   const cfg = ga.view?.config;
   if (cfg?.persona_mode === "custom" && (cfg.custom_name.trim() || cfg.custom_persona.trim())) {
     const name = cfg.custom_name.trim() || base.name;
-    return { ...base, id: "custom", name, title: base.style === "amadeus" ? `AMADEUS · ${name}` : name, persona: cfg.custom_persona.trim() || base.persona, greeting: "" };
+    return { ...base, id: "custom", name, title: name, nick: undefined, persona: cfg.custom_persona.trim() || base.persona, greeting: "" };
   }
   return base;
 }

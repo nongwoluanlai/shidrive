@@ -2,8 +2,9 @@
   import { app } from "../state.svelte";
   import { dynamicSkin } from "../skins.svelte";
   import { effectiveMotion, skinMotion } from "../skin-fx/motion.svelte";
-  import { onSkinEvent } from "../skin-fx/bus";
-  import { SceneRenderer } from "../skin-fx/scene";
+  import { emitSkinEvent, onSkinEvent } from "../skin-fx/bus";
+  import { INTERACTIVE, SceneRenderer } from "../skin-fx/scene";
+  import { see, seeMask, inSeeThrough, watchSeeThrough } from "../skin-fx/seethrough.svelte";
 
   // 动态看板：皮肤声明了 scene 时用 WebGL 渲染分层人物（待机动画 + 事件表情）；
   // 动效关闭、WebGL 不可用或渲染失败时回退为静态图，界面其余部分不受影响。
@@ -47,10 +48,77 @@
 
   // 动效档位变化时补画一帧（按需渲染模式下画面否则会停在旧形变上）
   $effect(() => { void level; renderer?.invalidate(); });
+
+  // ---------- 聊天输入框聚焦时：与聊天区重叠的部分变透明 ----------
+  let stageEl = $state<HTMLDivElement | null>(null);
+  $effect(() => {
+    if (!app.skin) return;
+    return watchSeeThrough();
+  });
+  const maskStyle = $derived.by(() => {
+    const h = see.hole, el = stageEl;
+    if (!h || !el) return "";
+    return `${seeMask(h, el.clientWidth, el.clientHeight)};--see:${see.active ? 0.1 : 1}`;
+  });
+
+  // ---------- 静态人物的点击判定（动态看板由 SceneRenderer 自己判定） ----------
+  // 不透明像素才算「戳人物」：取一张缩小的 alpha 图，按 contain + 左下对齐换算坐标。
+  let alpha: { src: string; w: number; h: number; iw: number; ih: number; a: Uint8ClampedArray } | null = null;
+  let alphaLoading = "";
+  function staticTarget(): { el: Element; src: string } | null {
+    const img = stageEl?.querySelector(".skin-scene-static") as HTMLImageElement | null;
+    if (img?.src) return { el: img, src: img.currentSrc || img.src };
+    const div = stageEl?.querySelector(".skin-character");
+    if (!div) return null;
+    const m = /url\(["']?(.*?)["']?\)/.exec(getComputedStyle(div).backgroundImage);
+    return m ? { el: div, src: m[1] } : null;
+  }
+  function loadAlpha(src: string) {
+    if (alphaLoading === src) return;
+    alphaLoading = src;
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const k = Math.min(1, 256 / Math.max(img.naturalWidth, img.naturalHeight));
+        const w = Math.max(1, Math.round(img.naturalWidth * k)), h = Math.max(1, Math.round(img.naturalHeight * k));
+        const c = document.createElement("canvas");
+        c.width = w; c.height = h;
+        const ctx = c.getContext("2d", { willReadFrequently: true })!;
+        ctx.drawImage(img, 0, 0, w, h);
+        const d = ctx.getImageData(0, 0, w, h).data;
+        const a = new Uint8ClampedArray(w * h);
+        for (let i = 0; i < a.length; i++) a[i] = d[i * 4 + 3];
+        alpha = { src, w, h, iw: img.naturalWidth, ih: img.naturalHeight, a };
+      } catch { alpha = null; }
+    };
+    img.src = src;
+  }
+  function staticHit(x: number, y: number): boolean {
+    const t = staticTarget();
+    if (!t) return false;
+    if (alpha?.src !== t.src) { loadAlpha(t.src); return false; }
+    const r = t.el.getBoundingClientRect();
+    const k = Math.min(r.width / alpha.iw, r.height / alpha.ih);
+    const w = alpha.iw * k, h = alpha.ih * k;
+    const px = (x - r.left) / w, py = (y - (r.bottom - h)) / h;
+    if (px < 0 || py < 0 || px >= 1 || py >= 1) return false;
+    return alpha.a[Math.floor(py * alpha.h) * alpha.w + Math.floor(px * alpha.w)] > 96;
+  }
+  $effect(() => {
+    if (!app.skin || live) return;
+    const t = setTimeout(() => { const st = staticTarget(); if (st) loadAlpha(st.src); }, 300);
+    const onDown = (e: PointerEvent) => {
+      if (e.button !== 0 || (e.target instanceof Element && e.target.closest(INTERACTIVE))) return;
+      if (inSeeThrough(e.clientX, e.clientY)) return;
+      if (staticHit(e.clientX, e.clientY)) emitSkinEvent("character.click");
+    };
+    addEventListener("pointerdown", onDown, { passive: true, capture: true });
+    return () => { clearTimeout(t); removeEventListener("pointerdown", onDown, { capture: true }); };
+  });
 </script>
 
 {#if app.skin}
-  <div class="skin-character-stage" aria-hidden="true">
+  <div class="skin-character-stage" class:see-through={see.active && !!see.hole} aria-hidden="true" bind:this={stageEl} style={maskStyle}>
     {#if live}
       <canvas class="skin-scene" bind:this={canvas}></canvas>
     {:else if dynamicSkin.scene && dynamicSkin.urls}

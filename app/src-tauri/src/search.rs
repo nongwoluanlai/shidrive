@@ -559,7 +559,7 @@ fn search_files(root: &Path, opts: &SearchOpts, abort: &(dyn Fn() -> bool + Sync
     res.truncated = truncated;
     res.searched_files = files.len();
     let limit = opts.max_results.unwrap_or(200).clamp(1, 2000);
-    let query = opts.query.trim().replace('\\', "/");
+    let query = opts.query.trim().replace('\\', "/").replace('＿', "_");
     let include = PathFilter::new(&opts.include).ok().flatten();
     let exclude = PathFilter::new(&opts.exclude).ok().flatten();
     let mut hits: Vec<FileHit> = Vec::new();
@@ -599,11 +599,32 @@ fn search_files(root: &Path, opts: &SearchOpts, abort: &(dyn Fn() -> bool + Sync
 
 // ---------------------------------------------------------------- content mode
 
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// 字面量查询转正则：中文输入法下容易打出全角下划线「＿」，半角 / 全角互相匹配。
+fn literal_pattern(q: &str) -> String {
+    q.chars()
+        .map(|c| match c {
+            '_' | '＿' => "[_＿]".to_string(),
+            c => regex::escape(c.encode_utf8(&mut [0; 4])),
+        })
+        .collect()
+}
+
 fn build_matcher(opts: &SearchOpts) -> Result<BytesRegex, String> {
     let q = &opts.query;
-    let mut pat = if opts.regex { q.clone() } else { regex::escape(q) };
+    let mut pat = if opts.regex { q.clone() } else { literal_pattern(q) };
     if opts.whole_word {
-        pat = format!(r"\b(?:{pat})\b");
+        if opts.regex {
+            pat = format!(r"\b(?:{pat})\b");
+        } else {
+            // 只在首 / 尾是单词字符的一侧加 \b：否则 `foo(`、`.bar` 这类查询在全字匹配下永远搜不到
+            let lead = if q.chars().next().is_some_and(is_word_char) { r"\b" } else { "" };
+            let tail = if q.chars().last().is_some_and(is_word_char) { r"\b" } else { "" };
+            pat = format!("{lead}(?:{pat}){tail}");
+        }
     }
     BytesRegexBuilder::new(&pat)
         .case_insensitive(!opts.case_sensitive)
@@ -875,5 +896,40 @@ mod tests {
         let d = PathFilter::new("dist").unwrap().unwrap();
         assert!(d.matches("app/dist/a.js", "a.js"));
         assert!(PathFilter::new(" , ").unwrap().is_none());
+    }
+
+    #[test]
+    fn underscore_queries() {
+        let base = std::env::temp_dir().join(format!("shidrive-search-underscore-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join(".gitignore"), "[._]*.s[a-v][a-z]\n*.swp\n").unwrap();
+        std::fs::write(base.join("src/voice_server.py"), "def run_voice_server():\n    return include_str\n").unwrap();
+        std::fs::write(base.join("src/a.rs"), "call(foo_bar); x.__init__\n").unwrap();
+        std::fs::write(base.join("src/_server.swp"), "voice_server\n").unwrap();
+        let mk = |q: &str, mode: &str, ww: bool| SearchOpts {
+            root: base.to_string_lossy().to_string(),
+            query: q.into(),
+            mode: mode.into(),
+            case_sensitive: false,
+            whole_word: ww,
+            regex: false,
+            include: String::new(),
+            exclude: String::new(),
+            use_ignore: true,
+            max_results: None,
+        };
+        let content = |q: &str, ww: bool| search(mk(q, "content", ww)).unwrap().total_matches;
+        assert_eq!(content("voice_server", false), 1, "ignored .swp must be skipped");
+        assert_eq!(content("_server", false), 1);
+        assert_eq!(content("voice＿server", false), 1, "full-width underscore");
+        assert_eq!(content("run_voice_server", true), 1);
+        assert_eq!(content("voice_server", true), 0, "part of run_voice_server");
+        assert_eq!(content("__init__", true), 1);
+        assert_eq!(content("call(", true), 1, "edge non-word char");
+        let files = |q: &str| search(mk(q, "files", false)).unwrap().files.into_iter().map(|h| h.rel.replace('\\', "/")).collect::<Vec<_>>();
+        assert_eq!(files("voice_server"), vec!["src/voice_server.py"]);
+        assert_eq!(files("_server"), vec!["src/voice_server.py"]);
+        assert_eq!(files("voice＿"), vec!["src/voice_server.py"]);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
