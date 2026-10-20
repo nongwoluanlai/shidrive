@@ -6,6 +6,7 @@
   import logo from "../../assets/logo.png";
 
   let maximized = $state(false);
+  const pendingTodos = $derived(app.todos.filter((x) => !x.done).length);
 
   async function w(fn: string) {
     try {
@@ -33,6 +34,10 @@
         🔐 {t("待授权")} <span class="consent-count">{app.oauthPending.length}</span>
       </button>
     {/if}
+    <button class="qbtn" class:active={app.overlay === "todos"} title={t("待办：随手记下要做的事，可快速编辑、复制")} onclick={() => (app.overlay = app.overlay === "todos" ? null : "todos")}>
+      <Icon name="todos" size={15} /> {t("待办")}
+      {#if pendingTodos > 0}<span class="todo-count">{pendingTodos > 99 ? "99+" : pendingTodos}</span>{/if}
+    </button>
     <button class="qbtn" class:active={app.overlay === "sessions"} title={t("会话管理")} onclick={() => (app.overlay = app.overlay === "sessions" ? null : "sessions")}>
       <Icon name="sessions" size={15} /> {t("会话管理")}
     </button>
@@ -146,6 +151,7 @@
     background: var(--text-faint);
   }
   .log-badge.alert { background: var(--warn); }
+  .todo-count { min-width: 16px; padding: 0 5px; border-radius: 8px; font-size: 0.75em; line-height: 16px; text-align: center; color: var(--accent-contrast, #fff); background: var(--accent); }
   .consent-count { border-radius: 10px; padding: 0 6px; color: #fff; background: var(--warn); }
   .divider {
     width: 1px;

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { app, loadProjects, currentProject, currentContext, loadPrompts, isNoProject, loadCfgPrefs, capabilityLists, isFakeDeepseekCaps } from "./lib/state.svelte";
+  import { app, loadProjects, currentProject, currentContext, loadPrompts, loadTodos, isNoProject, loadCfgPrefs, capabilityLists, isFakeDeepseekCaps } from "./lib/state.svelte";
   import { api } from "./lib/ipc";
   import { applyTheme, watchThemeVars } from "./lib/theme";
   import { activateSkin, loadSkinOpacity } from "./lib/skins.svelte";
@@ -22,6 +22,7 @@
   import SessionManagerModal from "./lib/components/SessionManagerModal.svelte";
   import TasksPanel from "./lib/components/TasksPanel.svelte";
   import PromptsPanel from "./lib/components/PromptsPanel.svelte";
+  import TodosPanel from "./lib/components/TodosPanel.svelte";
   import HistoryBindModal from "./lib/components/HistoryBindModal.svelte";
   import DialogHost from "./lib/components/DialogHost.svelte";
   import SearchPanel from "./lib/components/SearchPanel.svelte";
@@ -175,6 +176,7 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
     }
     await loadProjects(true);
     await loadPrompts();
+    await loadTodos();
     loadCfgPrefs();
     app.ready = true;
     startScheduledSends();
@@ -271,6 +273,7 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
 <SessionManagerModal />
 <TasksPanel />
 <PromptsPanel />
+<TodosPanel />
 <HistoryBindModal />
 <PermissionDialog />
 <ElicitationDialog />

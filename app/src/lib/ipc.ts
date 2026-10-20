@@ -238,6 +238,8 @@ export const api = {
     invoke<AssistantTurnResult>("assistant_send", { text, persona, appState, turnId, speech }),
   assistantGreet: (persona: AssistantPersona, appState: string | null, turnId: string, reason: "new" | "resume", speech: SpeechHint | null = null) =>
     invoke<AssistantTurnResult>("assistant_greet", { persona, appState, turnId, reason, speech }),
+  assistantCare: (persona: AssistantPersona, appState: string | null, turnId: string, context: string, speech: SpeechHint | null = null) =>
+    invoke<AssistantTurnResult>("assistant_care", { persona, appState, turnId, context, speech }),
   voiceConfigGet: () => invoke<VoiceView>("voice_config_get"),
   voiceConfigSet: (config: VoiceConfig, baiduSecret?: string | null) => invoke<VoiceView>("voice_config_set", { config, baiduSecret: baiduSecret ?? null }),
   voiceStatus: () => invoke<VoiceStatus>("voice_status"),

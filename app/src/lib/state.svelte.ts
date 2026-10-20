@@ -8,6 +8,7 @@ import type {
   OAuthPending,
   Project,
   Prompt,
+  Todo,
   SessionReadyInfo,
   ThemeConfig,
   ToolCallUpdate,
@@ -22,7 +23,7 @@ export type Tab = "chat" | "context" | "workflows";
 /** 内置「无项目」的固定 ID（后端 models.rs NO_PROJECT_ID 同值） */
 export const NO_PROJECT_ID = "00000000-0000-0000-0000-000000000000";
 export const isNoProject = (id: string | null) => id === NO_PROJECT_ID;
-export type Overlay = null | "sessions" | "tasks" | "prompts" | "logs";
+export type Overlay = null | "todos" | "sessions" | "tasks" | "prompts" | "logs";
 
 export interface FileEditorState {
   path: string;
@@ -135,6 +136,8 @@ export const app = $state({
   wfLiveLogs: {} as Record<string, string>,
   /** 常用提示词 */
   prompts: [] as Prompt[],
+  /** 待办（全局，轻量便签） */
+  todos: [] as Todo[],
   /** set by prompts panel, consumed by chat composer */
   insertPrompt: null as { text: string; at: number } | null,
   mcpPort: 8345,
@@ -651,6 +654,20 @@ export async function loadPrompts() {
   } catch {
     app.prompts = [];
   }
+}
+
+export async function loadTodos() {
+  try {
+    const raw = await api.settingsGet("ui.todos");
+    const list = raw ? JSON.parse(raw) : [];
+    app.todos = Array.isArray(list) ? list.filter((x: any) => x && typeof x.text === "string").map((x: any) => ({ id: String(x.id ?? nextId()), text: x.text, done: !!x.done, at: Number(x.at) || Date.now() })) : [];
+  } catch {
+    app.todos = [];
+  }
+}
+
+export async function saveTodos() {
+  await api.settingsSet("ui.todos", JSON.stringify(app.todos)).catch((e) => toast("error", String(e)));
 }
 
 export async function savePrompts() {

@@ -352,6 +352,7 @@ fn main() {
             assistant::assistant_config_set,
             assistant::assistant_send,
             assistant::assistant_greet,
+            assistant::assistant_care,
             assistant::assistant_cancel,
             assistant::assistant_session_reset,
             assistant::assistant_messages,

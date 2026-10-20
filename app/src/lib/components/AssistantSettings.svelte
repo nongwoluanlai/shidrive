@@ -8,6 +8,8 @@
   import { ga, persona, afterConfigSaved, resetSession, clearMessages } from "../assistant/store.svelte";
   import type { AssistantConfig, AssistantConfigView } from "../types";
   import VoiceSettings from "./VoiceSettings.svelte";
+  import { tryCare } from "../assistant/care.svelte";
+  import { inputEnabled } from "../assistant/voice.svelte";
 
   let view = $state<AssistantConfigView | null>(null);
   let draft = $state<AssistantConfig | null>(null);
@@ -131,6 +133,22 @@
     try { await clearMessages(); toast("ok", t("对话记录已清空")); } catch (e) { toast("error", String(e)); }
   }
 
+  let caring = $state(false);
+  async function testCare() {
+    if (dirty) { toast("warn", t("请先保存设置")); return; }
+    if (!view?.config.enabled) { toast("warn", t("请先启用全局助手")); return; }
+    caring = true;
+    try {
+      const r = await tryCare();
+      if (r === "busy") toast("warn", t("助手正在忙，请稍后"));
+      else if (r === "skipped") toast("info", t("她觉得现在不适合打扰你，这次没说话"));
+      else if (r === "failed") toast("warn", t("这次没有生成关怀内容"));
+      else toast("ok", t("她开口了：关掉设置就能看到气泡"));
+    } finally {
+      caring = false;
+    }
+  }
+
   const styleLabel = (s: string) => (s === "amadeus" ? t("终端风格气泡") : s === "generic" ? t("人物旁通用气泡") : t("左下角简易助手"));
 </script>
 
@@ -245,6 +263,33 @@
       </div>
     </div>
 
+    <div class="sec">
+      <div class="sec-head">
+        <h3 class="grow">{t("主动关怀")}</h3>
+        <label class="switch" title={t("你不忙的时候，她偶尔会主动找你说句话")}>
+          <input type="checkbox" bind:checked={draft.care_enabled} />
+          <span class="slider"></span>
+        </label>
+      </div>
+      <p class="note">{t("你不忙的时候，她偶尔会主动搭句话：深夜提醒早点休息、连续忙太久劝你歇会儿、饭点、还没做完的待办、晚上问问今天过得怎么样…… 只在窗口在前台、你在电脑前但没在打字时出现，每天最多 6 次；她觉得会打扰时会选择不说。")}</p>
+      {#if draft.care_enabled}
+        <div class="row">
+          <span class="lbl w2">{t("最短间隔")}</span>
+          <input class="num" type="number" min="30" max="600" step="10" bind:value={draft.care_interval_minutes} /><span class="pend">{t("分钟（30~600）")}</span>
+        </div>
+        <div class="row">
+          <span class="lbl w2">{t("深夜从")}</span>
+          <input class="num" type="number" min="0" max="23" bind:value={draft.care_late_hour} /><span class="pend">{t("点开始算深夜（到凌晨 5 点）")}</span>
+        </div>
+        <label class="check"><input type="checkbox" bind:checked={draft.care_voice} /> {t("说完后进入连续语音对话（可以直接开口回她，不说话就自动结束）")}</label>
+        {#if draft.care_voice && !inputEnabled()}<p class="note">{t("「语音输入」未开启：只会显示气泡，不会开麦。")}</p>{/if}
+      {/if}
+      <div class="rowbtns">
+        <button class="btn sm" disabled={caring || !!ga.busy || !view.config.enabled} onclick={testCare}>{caring ? t("她在想…") : t("现在试一下")}</button>
+        <span class="pend">{t("「待办」栏（标题栏）里没完成的事项也会被她惦记着。")}</span>
+      </div>
+    </div>
+
     <VoiceSettings />
 
     <div class="sec">
@@ -265,9 +310,8 @@
       <p class="note">{t("对话记录与长期记忆保存在本机数据库，与客户端会话分开：切换客户端或新建会话后，助手仍记得你。")}</p>
     </div>
 
-    <div class="save-bar">
-      <span class="pend">{dirty ? t("有未保存的修改") : ""}</span>
-      <span class="grow"></span>
+    <div class="save-bar" class:dirty>
+      {#if dirty}<span class="pend">{t("有未保存的修改")}</span>{/if}
       <button class="btn sm" disabled={!dirty || saving} onclick={load}>{t("撤销")}</button>
       <button class="btn sm primary" disabled={!dirty || saving} onclick={save}>{saving ? t("保存中…") : t("保存")}</button>
     </div>
@@ -310,5 +354,14 @@
   .switch input:checked + .slider { background: #34c77b; }
   .switch input:checked + .slider::before { transform: translateX(16px); }
   .switch input:disabled + .slider { opacity: .5; cursor: default; }
-  .save-bar { position: sticky; bottom: -1px; display: flex; align-items: center; gap: 8px; padding: 8px 0 2px; background: var(--bg-elev); border-top: 1px solid var(--border-soft); }
+  .sec-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .sec-head h3 { margin: 0; }
+  /* 保存条：右下角的紧凑浮条，只包住按钮本身 */
+  .save-bar {
+    position: sticky; bottom: 6px; align-self: flex-end; width: fit-content; max-width: 100%;
+    display: flex; align-items: center; gap: 8px; padding: 5px 6px 5px 10px; margin-top: -4px;
+    background: var(--bg-elev); border: 1px solid var(--border-soft); border-radius: 10px; box-shadow: var(--shadow);
+  }
+  .save-bar:not(.dirty) { padding-left: 6px; box-shadow: none; }
+  .save-bar.dirty { border-color: var(--accent); }
 </style>

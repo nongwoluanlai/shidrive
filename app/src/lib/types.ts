@@ -94,6 +94,14 @@ export interface SessionInfo {
   cwd?: string | null;
 }
 
+export interface Todo {
+  id: string;
+  text: string;
+  done: boolean;
+  /** 创建时间（ms） */
+  at: number;
+}
+
 export interface Prompt {
   id: string;
   title: string;
@@ -435,6 +443,10 @@ export interface AssistantConfig {
   history_turns: number;
   share_app_state: boolean;
   bubble_seconds: number;
+  care_enabled: boolean;
+  care_interval_minutes: number;
+  care_late_hour: number;
+  care_voice: boolean;
 }
 export interface AssistantConfigView {
   config: AssistantConfig;
@@ -459,7 +471,7 @@ export interface AssistantMessage {
   greeting: boolean;
 }
 export interface AssistantMemory { id: string; content: string; source: "auto" | "manual" | "summary"; pinned: boolean; created_at: string; updated_at: string }
-export interface AssistantTurnResult { message: AssistantMessage | null; memories_added: number; memories_forgotten: number }
+export interface AssistantTurnResult { message: AssistantMessage | null; memories_added: number; memories_forgotten: number; end_conversation?: boolean; skipped?: boolean }
 
 // ---------------- 全局助手 · 语音 ----------------
 export interface VoiceConfig {
@@ -488,6 +500,7 @@ export interface VoiceConfig {
   wake_action: "listen" | "open";
   wake_background: boolean;
   wake_chime: boolean;
+  wake_multiturn: boolean;
 }
 export interface VoiceTask { id: string; stage: string; received: number; total: number; message: string; running: boolean }
 export interface VoicePack { id: string; name: string; lang: string; engine: string; skins: string[]; characters: string[]; license: string; source: string; credits: string }
@@ -503,4 +516,4 @@ export interface VoiceStatus {
   kws_running: boolean;
 }
 export interface VoiceView { config: VoiceConfig; baidu_secret_set: boolean; status: VoiceStatus }
-export interface SpeechHint { enabled: boolean; lang: string; layer: boolean }
+export interface SpeechHint { enabled: boolean; lang: string; layer: boolean; conversation?: boolean }

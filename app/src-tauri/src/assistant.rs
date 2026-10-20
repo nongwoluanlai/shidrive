@@ -81,6 +81,14 @@ pub struct AssistantConfig {
     pub share_app_state: bool,
     /// 气泡自动收起秒数，0 = 不自动收起
     pub bubble_seconds: u32,
+    /// 主动关怀：不忙时低频地主动搭话（深夜提醒、待办、今天过得怎样…）
+    pub care_enabled: bool,
+    /// 两次主动关怀的最短间隔（分钟）
+    pub care_interval_minutes: u32,
+    /// 几点以后算深夜（0~23）
+    pub care_late_hour: u32,
+    /// 关怀说完后进入连续语音对话（需开启语音输入）
+    pub care_voice: bool,
 }
 
 impl Default for AssistantConfig {
@@ -100,6 +108,10 @@ impl Default for AssistantConfig {
             history_turns: 12,
             share_app_state: true,
             bubble_seconds: 30,
+            care_enabled: false,
+            care_interval_minutes: 120,
+            care_late_hour: 23,
+            care_voice: true,
         }
     }
 }
@@ -111,6 +123,8 @@ impl AssistantConfig {
         self.memory_limit = self.memory_limit.clamp(0, 200);
         self.history_turns = self.history_turns.clamp(0, 60);
         self.bubble_seconds = self.bubble_seconds.min(600);
+        self.care_interval_minutes = self.care_interval_minutes.clamp(30, 600);
+        self.care_late_hour = self.care_late_hour.min(23);
         self.api.base_url = self.api.base_url.trim().to_string();
         self.api.model = self.api.model.trim().to_string();
         self.api.temperature = self.api.temperature.map(|t| t.clamp(0.0, 2.0));
@@ -371,6 +385,23 @@ pub fn extract_directives(text: &str) -> (String, Vec<String>, Vec<String>) {
     (out.trim().to_string(), remember, forget)
 }
 
+/// 剥出回合控制标记：`[[结束对话]]`（连续语音对话由助手判断收尾）、`[[跳过]]`（主动关怀时选择不打扰）。
+/// 返回 (文本, 结束对话, 跳过)
+pub fn extract_flags(text: &str) -> (String, bool, bool) {
+    let re = regex::Regex::new(r"(?i)[ \t]*\[\[\s*(结束对话|结束|end[ _-]?(conversation|chat)?|跳过|skip)\s*\]\][ \t]*").unwrap();
+    let mut end = false;
+    let mut skip = false;
+    for cap in re.captures_iter(text) {
+        let k = cap[1].to_lowercase();
+        if k == "跳过" || k == "skip" { skip = true } else { end = true }
+    }
+    if !end && !skip { return (text.to_string(), false, false); }
+    let out = re.replace_all(text, "").to_string();
+    let mut lines: Vec<&str> = out.lines().map(|l| l.trim_end()).collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) { lines.pop(); }
+    (lines.join("\n").trim().to_string(), end, skip)
+}
+
 /// 解析「- 条目」列表（整理 / 提炼记忆的输出）
 pub fn parse_bullets(text: &str) -> Vec<String> {
     let (text, _, _) = extract_directives(text);
@@ -458,6 +489,8 @@ pub struct SpeechHint {
     pub enabled: bool,
     pub lang: String,
     pub layer: bool,
+    /// 连续语音对话中：说完会自动继续听，由助手判断何时收尾
+    pub conversation: bool,
 }
 
 fn speech_lang_name(lang: &str) -> &'static str {
@@ -474,8 +507,22 @@ fn valid_speech_lang(lang: &str) -> bool {
     matches!(lang, "ja" | "en" | "ko" | "yue" | "zh")
 }
 
+const CONVERSATION_RULE: &str = "[连续语音对话中] 用户正用语音和你连续聊天：你说完后会自动接着听用户说话。像面对面聊天那样自然接话，别长篇大论。\
+请根据对话氛围判断要不要结束：用户道别、说「好了 / 没事了 / 先这样 / 谢谢」、明显要去忙，或话题已经自然收尾、再追问会显得啰嗦时，\
+用一句简短的话收尾，并在回复最后单独一行写 [[结束对话]]（之后就不再听）；还想继续聊就不写，结尾可以自然留个话头。这个标记不会展示给用户，也不要提起它。";
+
 pub fn speech_rule(h: Option<&SpeechHint>) -> Option<String> {
-    let h = h.filter(|h| h.enabled)?;
+    let h = h?;
+    let voice = voice_rule(h);
+    if !h.conversation { return voice; }
+    Some(match voice {
+        Some(v) => format!("{v}\n{CONVERSATION_RULE}"),
+        None => CONVERSATION_RULE.to_string(),
+    })
+}
+
+fn voice_rule(h: &SpeechHint) -> Option<String> {
+    if !h.enabled { return None; }
     if h.layer && valid_speech_lang(&h.lang) {
         let ln = speech_lang_name(&h.lang);
         let tag = &h.lang;
@@ -761,15 +808,29 @@ pub struct TurnResult {
     pub message: Option<AssistantMessage>,
     pub memories_added: usize,
     pub memories_forgotten: usize,
+    /// 助手判断连续语音对话可以结束了
+    pub end_conversation: bool,
+    /// 主动关怀：助手选择这次不打扰（没有消息）
+    pub skipped: bool,
 }
 
 /// 处理回复：剥指令、落记忆、存消息
 fn finish_reply(db: &Db, cfg: &AssistantConfig, raw: Result<String, String>, greeting: bool) -> Result<TurnResult, String> {
+    finish_reply_ext(db, cfg, raw, greeting, false)
+}
+
+/// `care` = 主动关怀回合：回复 `[[跳过]]` 时不存消息、不落记忆
+fn finish_reply_ext(db: &Db, cfg: &AssistantConfig, raw: Result<String, String>, greeting: bool, care: bool) -> Result<TurnResult, String> {
     let (raw, interrupted) = match raw {
         Ok(t) => (t, false),
         Err(e) if e.starts_with(ASSISTANT_CANCELLED) => (e[ASSISTANT_CANCELLED.len()..].to_string(), true),
         Err(e) => return Err(e),
     };
+    let (raw, end_conversation, skip) = extract_flags(&raw);
+    let skipped = care && skip;
+    if skipped {
+        return Ok(TurnResult { message: None, memories_added: 0, memories_forgotten: 0, end_conversation: false, skipped: true });
+    }
     let (clean, remember, forget) = extract_directives(&raw);
     let clean = strip_speech_tags(&clean);
     let mut added = 0;
@@ -791,7 +852,7 @@ fn finish_reply(db: &Db, cfg: &AssistantConfig, raw: Result<String, String>, gre
         if greeting { flags.push("greeting"); }
         Some(insert_message(db, "assistant", &clean, &cfg.provider, &flags)?)
     };
-    Ok(TurnResult { message, memories_added: added, memories_forgotten: forgotten })
+    Ok(TurnResult { message, memories_added: added, memories_forgotten: forgotten, end_conversation, skipped: false })
 }
 
 /// 回合已送达（成功或被停止）：当前会话视为已问候，之后不再自动打招呼
@@ -895,6 +956,33 @@ pub async fn assistant_greet(
     let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(ev), &turn_id, cancel, speech.as_ref()).await;
     mark_greeted(&db, &raw);
     finish_reply(&db, &cfg, raw, true)
+}
+
+/// 主动关怀的系统事件：前端给出此刻的情况（时间、连续使用时长、待办、这次的由头…）
+pub fn care_event(context: &str) -> String {
+    let ctx = cap_chars(context.trim(), 1200);
+    format!(
+        "[系统事件 · 主动关怀] 这次不是用户在找你：用户此刻没在忙，你想主动搭句话。下面是你注意到的情况（挑最值得说的一点就好，不要逐条复述）：\n{ctx}\n\n\
+怎么说：\n\
+- 像身边熟悉的朋友 / 搭档随口一句，保持你的人设口吻；1~2 句，总共不超过 50 字。\n\
+- 只围绕一个具体的点（很晚了、连续忙了很久、还有没做完的待办、到饭点了、今天过得怎么样…），说得具体、有温度，可以带点你自己的小情绪或小玩笑。\n\
+- 不说教、不催促、不列清单；不要提「系统」「提醒」「检测到」「主动关怀」这类字眼；别总用同一种开场。\n\
+- 结尾可以留一个轻松、好回答的小问题，方便用户接话。\n\
+- 如果结合最近的对话和记忆，现在搭话会显得打扰或重复（比如刚聊过同样的事），就只输出 [[跳过]]。"
+    )
+}
+
+#[tauri::command]
+pub async fn assistant_care(
+    app: AppHandle, db: DbState<'_>, agents: AgentsState<'_>, rt: RtState<'_>,
+    persona: Persona, app_state: Option<String>, turn_id: String, context: String, speech: Option<SpeechHint>,
+) -> Result<TurnResult, String> {
+    let cfg = load_config(&db);
+    check_enabled(&cfg)?;
+    let (_g, cancel) = acquire(&rt, &turn_id)?;
+    let db = db.inner().clone();
+    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(care_event(&context)), &turn_id, cancel, speech.as_ref()).await;
+    finish_reply_ext(&db, &cfg, raw, false, true)
 }
 
 #[tauri::command]
@@ -1073,10 +1161,30 @@ mod tests {
         assert_eq!(strip_speech_tags(&clean), "嗯，构建通过了。\n接下来跑测试吧。");
         assert!(speech_rule(None).is_none());
         assert!(speech_rule(Some(&SpeechHint { enabled: false, ..Default::default() })).is_none());
-        let ja = speech_rule(Some(&SpeechHint { enabled: true, lang: "ja".into(), layer: true })).unwrap();
+        let ja = speech_rule(Some(&SpeechHint { enabled: true, lang: "ja".into(), layer: true, ..Default::default() })).unwrap();
         assert!(ja.contains("[[ja: …]]") && ja.contains("日语"));
-        let plain = speech_rule(Some(&SpeechHint { enabled: true, lang: "zh".into(), layer: false })).unwrap();
+        let plain = speech_rule(Some(&SpeechHint { enabled: true, lang: "zh".into(), layer: false, ..Default::default() })).unwrap();
         assert!(plain.contains("短句") && !plain.contains("[["));
+    }
+
+    #[test]
+    fn conversation_and_care_flags() {
+        let conv = speech_rule(Some(&SpeechHint { conversation: true, ..Default::default() })).unwrap();
+        assert!(conv.contains("[[结束对话]]") && !conv.contains("语音输出已开启"));
+        let both = speech_rule(Some(&SpeechHint { enabled: true, lang: "zh".into(), conversation: true, ..Default::default() })).unwrap();
+        assert!(both.contains("语音输出已开启") && both.contains("[[结束对话]]"));
+        assert_eq!(extract_flags("好，那先这样。\n[[结束对话]]"), ("好，那先这样。".to_string(), true, false));
+        assert_eq!(extract_flags("[[跳过]]"), (String::new(), false, true));
+        assert_eq!(extract_flags("普通回复 [[记忆: x]]"), ("普通回复 [[记忆: x]]".to_string(), false, false));
+        let db = db();
+        let cfg = AssistantConfig { auto_memory: true, ..Default::default() };
+        let r = finish_reply_ext(&db, &cfg, Ok("[[跳过]]".into()), false, true).unwrap();
+        assert!(r.skipped && r.message.is_none());
+        let r = finish_reply_ext(&db, &cfg, Ok("嗯，回头见~ [[END]]".into()), false, false).unwrap();
+        assert!(r.end_conversation && !r.skipped && r.message.unwrap().content == "嗯，回头见~");
+        assert!(care_event("- 现在 23:40").contains("23:40"));
+        let c = AssistantConfig { care_interval_minutes: 5, care_late_hour: 30, ..Default::default() }.normalized();
+        assert_eq!((c.care_interval_minutes, c.care_late_hour, c.care_enabled, c.care_voice), (30, 23, false, true));
     }
 
     #[test]

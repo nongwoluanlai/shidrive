@@ -109,4 +109,6 @@ export const voiceEn: Record<string, string> = {
   "正在监听": "Listening",
   "点一下窗口任意位置后开始监听": "Click anywhere in the window to start listening",
   "窗口在后台，已暂停": "Paused while the window is in the background",
+  "唤醒后进入连续语音对话：她说完会自动接着听，觉得聊完了会自己停下；你不说话、开始打字、按 Esc 或点「结束」也会退出": "After waking, enter a continuous voice chat: she keeps listening after each reply and stops when she feels the talk is over; staying silent, typing, pressing Esc or clicking End also exits",
+  "唤醒后多轮对话（她说完自动继续听，由她判断何时结束）": "Multi-turn after wake (keeps listening after she replies; she decides when to stop)",
 };

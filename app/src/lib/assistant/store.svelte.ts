@@ -7,9 +7,9 @@ import { emitSkinEvent } from "../skin-fx/bus";
 import { skinPersona, toWire, type ResolvedPersona } from "./personas";
 import { t } from "../i18n";
 import { beginSpeech, feedSpeech, initVoice, speechHint, stopSpeaking } from "./voice.svelte";
-import type { AssistantConfigView, AssistantMemory, AssistantMessage, AssistantTurnResult } from "../types";
+import type { AssistantConfigView, AssistantMemory, AssistantMessage, AssistantTurnResult, SpeechHint } from "../types";
 
-type Busy = "" | "send" | "greet" | "summarize" | "reset";
+type Busy = "" | "send" | "greet" | "care" | "summarize" | "reset";
 
 export const ga = $state({
   loaded: false,
@@ -31,6 +31,21 @@ export const ga = $state({
 });
 
 export const enabled = () => !!ga.view?.config.enabled;
+
+/** 连续语音对话（唤醒 / 主动关怀后）：说完自动接着听，助手判断何时结束 */
+export const conv = $state({
+  active: false,
+  source: "" as "" | "wake" | "care",
+  /** 已完成的轮数 */
+  rounds: 0,
+});
+
+/** 发给后端的语音提示：连续对话中额外告诉模型「说完会继续听，由你判断何时收尾」 */
+function hint(): SpeechHint | null {
+  const h = speechHint();
+  if (!conv.active) return h;
+  return { ...(h ?? { enabled: false, lang: "", layer: false }), conversation: true };
+}
 
 /** 当前人设（皮肤角色或自定义） */
 export function persona(): ResolvedPersona {
@@ -70,6 +85,7 @@ export function visibleText(raw: string): string {
     .replace(/^[ \t]*\[\[\s*(记忆|忘记|memory|forget)\s*[:：][^\]]*\]\][ \t]*$/gim, "")
     .replace(/\[\[\s*(记忆|忘记|memory|forget)\s*[:：][^\]]*\]\]/gi, "")
     .replace(/[ \t]*\[\[\s*(ja|en|ko|yue|zh)\s*[:：][^\[\]]*\]\]/gi, "")
+    .replace(/[ \t]*\[\[\s*(结束对话|结束|end[ _-]?(conversation|chat)?|跳过|skip)\s*\]\][ \t]*/gi, "")
     .replace(/\[\[[^\]]*$/, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
@@ -126,6 +142,9 @@ export function hideBubble() {
 }
 
 let unlisten: (() => void) | null = null;
+/** 当前回合是否安静开始（主动关怀：有正文了才弹气泡），以及气泡是否已为流式打开 */
+let quietTurn = false;
+let opened = false;
 
 export async function initAssistant() {
   if (!unlisten) {
@@ -134,10 +153,10 @@ export async function initAssistant() {
       if (!p || !ga.turnId || p.turnId !== ga.turnId || ga.busy === "summarize") return;
       const u = p.update;
       if (u?.sessionUpdate !== "agent_message_chunk" || u.content?.type !== "text" || typeof u.content.text !== "string") return;
-      const first = !ga.streaming;
       ga.streaming += u.content.text;
       feedSpeech(ga.streaming, false);
-      if (first) {
+      if (!opened && (!quietTurn || visibleText(ga.streaming))) {
+        opened = true;
         emitSkinEvent("agent.streaming");
         if (!ga.bubble.visible || ga.bubble.pages.length) ga.bubble = { visible: true, pages: [], index: 0, error: "", rev: ga.bubble.rev + 1 };
       }
@@ -199,17 +218,24 @@ export function afterConfigSaved(view: AssistantConfigView) {
   if (fresh && !ga.busy) void greet("new");
 }
 
-async function runTurn(kind: Busy, call: (turnId: string) => Promise<AssistantTurnResult>) {
-  if (ga.busy) { toast("warn", t("助手正在回复中，请稍后")); return; }
+async function runTurn(kind: Busy, call: (turnId: string) => Promise<AssistantTurnResult>, quiet = false): Promise<AssistantTurnResult | null> {
+  if (ga.busy) { if (!quiet) toast("warn", t("助手正在回复中，请稍后")); return null; }
   const turnId = newTurn();
   ga.turnId = turnId;
   ga.busy = kind;
   ga.streaming = "";
-  ga.bubble = { visible: true, pages: [], index: 0, error: "", rev: ga.bubble.rev + 1 };
+  quietTurn = quiet;
+  opened = false;
+  if (!quiet) ga.bubble = { visible: true, pages: [], index: 0, error: "", rev: ga.bubble.rev + 1 };
   beginSpeech();
   try {
     const r = await call(turnId);
-    if (ga.turnId !== turnId) return;
+    if (ga.turnId !== turnId) return null;
+    if (r.skipped) {
+      stopSpeaking();
+      if (opened) hideBubble();
+      return r;
+    }
     feedSpeech(ga.streaming || r.message?.content || "", true);
     if (r.message) {
       ga.messages = [...ga.messages, r.message].slice(-400);
@@ -226,17 +252,27 @@ async function runTurn(kind: Busy, call: (turnId: string) => Promise<AssistantTu
       memoNote.rev++;
     }
     emitSkinEvent("agent.done");
+    return r;
   } catch (e) {
-    if (ga.turnId !== turnId) return;
+    if (ga.turnId !== turnId) return null;
+    if (quiet) {
+      // 主动关怀失败不打扰用户
+      stopSpeaking();
+      if (opened) hideBubble();
+      console.warn("[assistant care]", e);
+      return null;
+    }
     if (String(e).includes("已停止") || String(e).toLowerCase().includes("cancel")) stopSpeaking();
     else feedSpeech(ga.streaming, true);
     const partial = visibleText(ga.streaming);
     showBubble(partial, String(e));
     emitSkinEvent("agent.error");
+    return null;
   } finally {
     if (ga.turnId === turnId) {
       ga.busy = "";
       ga.streaming = "";
+      quietTurn = false;
       void refreshView();
     }
   }
@@ -249,22 +285,29 @@ async function refreshView() {
   ga.view = await api.assistantConfigGet().catch(() => ga.view);
 }
 
-export async function send(text: string) {
+export async function send(text: string): Promise<AssistantTurnResult | null> {
   const body = text.trim();
-  if (!body || !enabled()) return;
+  if (!body || !enabled()) return null;
   const pending: AssistantMessage = { id: `local-${Date.now()}`, role: "user", content: body, provider: ga.view!.config.provider, created_at: new Date().toISOString(), interrupted: false, greeting: false };
   emitSkinEvent("message.send");
-  await runTurn("send", async (turnId) => {
+  const r = await runTurn("send", async (turnId) => {
     ga.messages = [...ga.messages, pending];
-    return api.assistantSend(body, toWire(persona(), app.locale), appState(), turnId, speechHint());
+    return api.assistantSend(body, toWire(persona(), app.locale), appState(), turnId, hint());
   });
   // 用库里的记录替换本地占位（拿到真实 id）
   if (!ga.busy) ga.messages = await api.assistantMessages(200).catch(() => ga.messages);
+  return r;
+}
+
+/** 主动关怀：安静地发起一轮（有正文才弹气泡；助手可以回 [[跳过]] 选择不打扰） */
+export async function care(context: string): Promise<AssistantTurnResult | null> {
+  if (!enabled() || ga.busy) return null;
+  return runTurn("care", (turnId) => api.assistantCare(toWire(persona(), app.locale), appState(), turnId, context, hint()), true);
 }
 
 export async function greet(reason: "new" | "resume") {
   if (!enabled()) return;
-  await runTurn("greet", (turnId) => api.assistantGreet(toWire(persona(), app.locale), appState(), turnId, reason, speechHint()));
+  await runTurn("greet", (turnId) => api.assistantGreet(toWire(persona(), app.locale), appState(), turnId, reason, hint()));
 }
 
 export async function cancel() {
@@ -313,7 +356,7 @@ export async function summarize(mode: "consolidate" | "extract"): Promise<number
 
 /** 已发出、还没收到任何文字 */
 export function isThinking() {
-  return (ga.busy === "send" || ga.busy === "greet" || ga.busy === "reset") && !ga.streaming;
+  return (ga.busy === "send" || ga.busy === "greet" || ga.busy === "care" || ga.busy === "reset") && !ga.streaming;
 }
 
 /** 点击人物 / 语音唤起：打开输入框 */

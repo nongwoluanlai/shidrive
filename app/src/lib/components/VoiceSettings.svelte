@@ -413,6 +413,9 @@
         <label class="check"><input type="radio" value="open" bind:group={draft.wake_action} onchange={() => commit(0)} /> {t("只打开输入框")}</label>
       </div>
       {#if draft.wake_action === "listen" && !draft.input_enabled}<p class="warn">{t("「语音输入」未开启：唤醒后只会打开输入框。")}</p>{/if}
+      <label class="check" title={t("唤醒后进入连续语音对话：她说完会自动接着听，觉得聊完了会自己停下；你不说话、开始打字、按 Esc 或点「结束」也会退出")}>
+        <input type="checkbox" bind:checked={draft.wake_multiturn} disabled={draft.wake_action !== "listen"} onchange={() => commit(0)} /> {t("唤醒后多轮对话（她说完自动继续听，由她判断何时结束）")}
+      </label>
       <label class="check"><input type="checkbox" bind:checked={draft.wake_chime} onchange={() => commit(0)} /> {t("唤醒时播放提示音")}</label>
       <label class="check"><input type="checkbox" bind:checked={draft.wake_background} onchange={() => commit(0)} /> {t("窗口最小化 / 在后台时也监听（唤醒时切到前台）")}</label>
       {#if wakeStatus}

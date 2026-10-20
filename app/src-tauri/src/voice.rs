@@ -83,6 +83,8 @@ pub struct VoiceConfig {
     pub wake_background: bool,
     /// 唤醒时播放提示音
     pub wake_chime: bool,
+    /// 唤醒后进入连续语音对话（助手说完自动继续听，由她判断何时结束）
+    pub wake_multiturn: bool,
 }
 
 impl Default for VoiceConfig {
@@ -112,6 +114,7 @@ impl Default for VoiceConfig {
             wake_action: "listen".into(),
             wake_background: false,
             wake_chime: true,
+            wake_multiturn: true,
         }
     }
 }
@@ -1198,7 +1201,7 @@ mod tests {
         assert_eq!((e.wake_keywords.as_str(), e.wake_threshold, e.wake_action.as_str()), ("Christina", 0.25, "open"));
         // 旧配置（没有唤醒词字段）按默认值读入
         let old: VoiceConfig = serde_json::from_str(r#"{"input_enabled":true}"#).unwrap();
-        assert!(!old.wake_enabled && old.wake_chime && old.wake_keywords == "Christina");
+        assert!(!old.wake_enabled && old.wake_chime && old.wake_keywords == "Christina" && old.wake_multiturn);
     }
 
     #[test]

@@ -472,10 +472,10 @@ function to16k(chunks: Float32Array[], total: number, inRate: number): Int16Arra
 }
 
 /**
- * 录一段话：检测到说话后静音约 1.4 秒自动结束；8 秒内没说话则放弃；最长 maxSeconds 秒。
+ * 录一段话：检测到说话后静音约 1.4 秒自动结束；idleSeconds 秒（默认 8）内没说话则放弃；最长 maxSeconds 秒。
  * 返回 base64 PCM16（16k 单声道），没录到有效语音返回 null。
  */
-export async function captureSpeech(maxSeconds: number): Promise<string | null> {
+export async function captureSpeech(maxSeconds: number, idleSeconds = 8): Promise<string | null> {
   if (vc.recording) { stopCapture(true); return null; }
   stopSpeaking();
   let stream: MediaStream;
@@ -535,15 +535,15 @@ export async function captureSpeech(maxSeconds: number): Promise<string | null> 
       const elapsed = performance.now() - started;
       if (speech && silentMs > 1400) finish(true);
       else if (elapsed > maxSeconds * 1000) finish(true);
-      else if (!speech && elapsed > 8000) finish(false);
+      else if (!speech && elapsed > idleSeconds * 1000) finish(false);
     };
   });
 }
 
 /** 录音 + 识别；返回文字（没听清返回 ""） */
-export async function listenOnce(): Promise<string> {
+export async function listenOnce(idleSeconds = 8): Promise<string> {
   const cfg = vc.view?.config;
-  const pcm = await captureSpeech(cfg?.input_max_seconds ?? 30);
+  const pcm = await captureSpeech(cfg?.input_max_seconds ?? 30, idleSeconds);
   if (!pcm) return "";
   vc.transcribing = true;
   try {

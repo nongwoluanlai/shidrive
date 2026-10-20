@@ -4,7 +4,7 @@
   //   · 控制台：在人物脚下（舞台底部），平时只有输入框 + 语音 / 状态反馈，对话记录和记忆是可展开的面板。
   // 牧濑红莉栖·动态 用终端风格（style id 仍叫 amadeus），其它皮肤用通用轻量样式。关闭后不留浮标，点人物唤起；
   // 双击 Ctrl = 语音输入；开启唤醒词后喊「Christina」也能唤起。
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { app, toast } from "../state.svelte";
   import { api } from "../ipc";
   import { md } from "../markdown";
@@ -14,7 +14,9 @@
   import { see } from "../skin-fx/seethrough.svelte";
   import { vc, inputEnabled, listenOnce, stopCapture, stopSpeaking } from "../assistant/voice.svelte";
   import { wk, wakeReady, setWake, chime, wakeQuip } from "../assistant/wake.svelte";
-  import { ga, enabled, persona, initAssistant, send, cancel, resetSession, hideBubble, showBubble, loadMemories, summarize, visibleText, isThinking, openComposer, memoNote, clearMessages, settingsRequest } from "../assistant/store.svelte";
+  import { ga, enabled, persona, initAssistant, send, cancel, resetSession, hideBubble, showBubble, loadMemories, summarize, visibleText, isThinking, openComposer, memoNote, clearMessages, settingsRequest, conv } from "../assistant/store.svelte";
+  import { startConversation, endConversation } from "../assistant/conv.svelte";
+  import { initCare } from "../assistant/care.svelte";
 
   const p = $derived(persona());
   const style = $derived(p.style);
@@ -67,7 +69,7 @@
   const streamingText = $derived(visibleText(ga.streaming));
   const page = $derived(ga.bubble.pages[ga.bubble.index] ?? "");
   const pageCount = $derived(ga.bubble.pages.length);
-  const busy = $derived(ga.busy === "send" || ga.busy === "greet" || ga.busy === "reset");
+  const busy = $derived(ga.busy === "send" || ga.busy === "greet" || ga.busy === "care" || ga.busy === "reset");
   /** 朗读刚读完：气泡继续显示最后一句字幕，片刻后收起 */
   let holdSub = $state(false);
   /** 人物气泡在朗读：显示与音频同步的字幕 */
@@ -75,9 +77,10 @@
   const status = $derived(
     vc.recording ? t("正在听…") : vc.transcribing ? t("识别中…") : ga.busy === "reset" ? t("正在新建会话…") : busy ? t("回复中…") : vc.speaking ? t("朗读中…") : ga.busy === "summarize" ? t("处理中…") : "",
   );
-  const keysHint = $derived(app.enterSend ? t("Enter 发送，Shift+Enter 换行") : t("Enter 换行，Ctrl+Enter 发送"));
+  /** 输入框下方的按键提示 */
+  const keys = $derived(app.enterSend ? [["Enter", t("发送")], ["Shift+Enter", t("换行")]] : [["Ctrl+Enter", t("发送")], ["Enter", t("换行")]]);
   const placeholder = $derived(
-    vc.recording ? t("正在听…") : vc.transcribing ? t("识别中…") : busy ? t("回复中…") : t("和{name}说点什么（{keys}）", { name: nick, keys: keysHint }),
+    vc.recording ? t("正在听…") : vc.transcribing ? t("识别中…") : busy ? t("回复中…") : t("和{name}说点什么…", { name: nick }),
   );
   const divergence = $derived.by(() => {
     // Amadeus 头部的世界线变动率：随消息数轻微跳动，只是装饰
@@ -90,9 +93,10 @@
   let bodyEl = $state<HTMLDivElement | null>(null);
   let hovered = $state(false);
 
+  // 只响应聚焦请求：连续对话 / 主动关怀打开控制台时不抢焦点
   $effect(() => {
     void ga.focusRev;
-    if (ga.composer) void tick().then(() => inputEl?.focus());
+    if (untrack(() => ga.composer)) void tick().then(() => inputEl?.focus());
   });
 
   // 流式时贴底
@@ -162,6 +166,7 @@
   function next() { if (ga.bubble.index < pageCount - 1) ga.bubble.index++; }
 
   function close() {
+    endConversation();
     ga.composer = false;
     ga.panel = null;
     hideBubble();
@@ -179,6 +184,7 @@
     if (e.isComposing) return;
     if (e.key === "Escape") {
       e.preventDefault();
+      if (conv.active) { endConversation(); return; }
       if (mode !== "plain") { ga.composer = false; ga.panel = null; return; }
       ga.composer = false;
       if (!ga.panel && !ga.bubble.visible) close();
@@ -219,8 +225,19 @@
     }
     if (vc.recording) { stopCapture(true); return; }
     if (vc.transcribing) return;
+    if (fromWake && vc.view?.config.wake_multiturn) { void startConversation("wake"); return; }
     openComposer();
     void onMic();
+  }
+
+  /** 连续对话中用户开始打字：改为手动输入 */
+  function onInput() {
+    if (conv.active && input.trim()) endConversation();
+  }
+
+  function stopAll() {
+    endConversation();
+    void cancel();
   }
 
   async function onMic() {
@@ -271,6 +288,7 @@
 
   function onWake(word: string) {
     if (wk.testing) { if (vc.view?.config.wake_chime) chime(vc.view.config.volume); return; }
+    if (conv.active) return;
     const cfg = vc.view?.config;
     if (!cfg || !enabled()) return;
     if (cfg.wake_chime) chime(cfg.volume);
@@ -364,6 +382,7 @@
 
   onMount(() => {
     void initAssistant();
+    const offCare = initCare();
     const off = onSkinEvent((ev) => { if (ev === "character.click" && enabled()) { onChip(); focusAfterClick(); } });
     const onResize = () => measure();
     addEventListener("resize", onResize);
@@ -391,6 +410,8 @@
     void api.settingsGet("chat.enter_send").then((v) => (app.enterSend = v === "1")).catch(() => {});
     return () => {
       off();
+      offCare();
+      endConversation();
       removeEventListener("resize", onResize);
       removeEventListener("keydown", onKeyDown, true);
       removeEventListener("keyup", onKeyUp, true);
@@ -413,6 +434,13 @@
     <button class="ga-icon ga-speaking" title={t("停止朗读")} aria-label={t("停止朗读")} onclick={stopTalking}>
       <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M4 9v6h4l5 4V5L8 9H4Zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4Z"/></svg>
     </button>
+  {/if}
+{/snippet}
+
+{#snippet convChip()}
+  {#if conv.active}
+    <span class="ga-conv" title={t("连续语音对话：她说完会接着听，聊完会自己结束")}><i></i>{t("连续对话")}</span>
+    <button class="ga-btn sm" title={t("结束连续对话")} onclick={endConversation}>{t("结束")}</button>
   {/if}
 {/snippet}
 
@@ -508,13 +536,14 @@
 {#snippet composeRow()}
   <div class="ga-compose">
     {#if mode === "amadeus"}<span class="ga-prompt">&gt;</span>{/if}
-    <textarea class="ga-input grow" rows="1" bind:this={inputEl} bind:value={input} {placeholder} onkeydown={onKey}></textarea>
+    <textarea class="ga-input grow" rows="1" bind:this={inputEl} bind:value={input} {placeholder} onkeydown={onKey} oninput={onInput}></textarea>
     {@render micBtn()}
     {#if busy}
-      <button class="ga-btn" onclick={cancel}>{mode === "amadeus" ? "[ STOP ]" : t("停止")}</button>
+      <button class="ga-btn" onclick={stopAll}>{mode === "amadeus" ? "[ STOP ]" : t("停止")}</button>
     {:else}
       <button class="ga-btn primary" disabled={!input.trim()} onclick={submit}>{mode === "amadeus" ? "[ SEND ]" : t("发送")}</button>
     {/if}
+    <div class="ga-keys" aria-hidden="true">{#each keys as [k, what], i (k)}{#if i}<span class="ga-keys-sep">·</span>{/if}<kbd>{k}</kbd>{what}{/each}</div>
   </div>
 {/snippet}
 
@@ -538,6 +567,7 @@
           <header class="ga-head">
             <span class="ga-title">{title}</span>
             <span class="ga-grow"></span>
+            {@render convChip()}
             {@render stopSpeakBtn()}
             <button class="ga-icon" class:on={ga.panel === "chat"} title={t("对话记录")} onclick={() => openPanel("chat")}>☰</button>
             <button class="ga-icon" class:on={ga.panel === "memory"} title={t("长期记忆")} onclick={() => openPanel("memory")}>✦</button>
@@ -559,7 +589,7 @@
             {@render composeRow()}
           {:else}
             <div class="ga-foot">
-              {#if busy}<button class="ga-btn" onclick={cancel}>{t("停止")}</button>{/if}
+              {#if busy}<button class="ga-btn" onclick={stopAll}>{t("停止")}</button>{/if}
               <span class="ga-grow"></span>
               {@render micBtn()}
               <button class="ga-btn" onclick={openComposer}>{t("回复")}</button>
@@ -630,6 +660,7 @@
             <span class="ga-status" class:live={!!status}>{status || title}</span>
             {#if memoShown}<span class="ga-memo">✦ {memoShown}</span>{/if}
             <span class="ga-grow"></span>
+            {@render convChip()}
             {@render stopSpeakBtn()}
             <button class="ga-icon sm" class:on={ga.panel === "chat"} title={t("对话记录")} aria-label={t("对话记录")} onclick={() => openPanel("chat")}>☰</button>
             <button class="ga-icon sm" class:on={ga.panel === "memory"} title={t("长期记忆")} aria-label={t("长期记忆")} onclick={() => openPanel("memory")}>✦</button>
@@ -720,6 +751,14 @@
     padding: 4px 8px; font: inherit; font-size: 12.5px; resize: none; min-width: 0; max-height: 96px; field-sizing: content;
   }
   .ga-input:focus { outline: none; border-color: var(--accent); }
+  .ga-compose { flex-wrap: wrap; row-gap: 4px; }
+  .ga-keys { flex: 1 0 100%; display: flex; align-items: center; gap: 3px; font-size: 10.5px; line-height: 1; color: var(--text-faint); padding-left: 2px; white-space: nowrap; overflow: hidden; opacity: .8; }
+  .ga-keys kbd { font: inherit; font-size: 10px; padding: 1px 4px; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; background: var(--bg-elev2, transparent); color: var(--text-dim); margin-right: 2px; }
+  .ga-keys-sep { margin: 0 3px; opacity: .6; }
+  .ga-conv { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--accent); white-space: nowrap; }
+  .ga-conv i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: ga-conv-pulse 1.4s ease-in-out infinite; }
+  @keyframes ga-conv-pulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+  .ga-root .ga-btn.sm { padding: 1px 7px; font-size: 11px; }
   .grow { flex: 1; }
   .ga-memo { font-size: 11px; color: var(--accent); padding: 0 12px 4px; flex: none; }
 
@@ -811,6 +850,9 @@
   .ga-amadeus .ga-input { background: #0005; color: var(--am-text); border: 1px solid var(--am-line-2); border-radius: 0; font-family: inherit; caret-color: var(--am); }
   .ga-amadeus .ga-input:focus { border-color: #f0b429aa; box-shadow: 0 0 0 1px #f0b42933; }
   .ga-amadeus .ga-input::placeholder { color: #8b8d9488; }
+  .ga-amadeus .ga-keys { color: var(--am-dim); padding-left: 16px; }
+  .ga-amadeus .ga-keys kbd { border-color: var(--am-line-2); border-radius: 0; background: #0004; color: var(--am-text); }
+  .ga-amadeus .ga-conv { color: var(--am); text-shadow: 0 0 4px #ff9d0066; }
   .ga-amadeus .ga-tools { border-top-color: var(--am-line); }
   .ga-amadeus .ga-msg .ga-md { background: #ffffff08; border: 1px solid var(--am-line); border-radius: 0; }
   .ga-amadeus .ga-msg.user .ga-md { background: #ffffff10; border-color: var(--am-line-2); border-left: 2px solid #f0b429aa; }
