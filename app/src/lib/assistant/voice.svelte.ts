@@ -28,6 +28,10 @@ let inited = false;
 export async function initVoice() {
   if (!inited) {
     inited = true;
+    // 第一次点击 / 按键时就把播放用的 AudioContext 准备好（WebView 的自动播放限制），后面语音唤醒等无手势的场景也能直接出声
+    const unlock = () => { void unlockAudio(); if (actx?.state === "running") for (const e of ["pointerdown", "keydown"]) removeEventListener(e, unlock, true); };
+    for (const e of ["pointerdown", "keydown"]) addEventListener(e, unlock, true);
+    void unlockAudio();
     await listen<VoiceTask>("voice://progress", (e) => {
       const task = e.payload;
       vc.tasks = { ...vc.tasks, [task.id]: task };
@@ -391,10 +395,39 @@ function bytesToB64(bytes: Uint8Array): string {
   return btoa(s);
 }
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** 创建 / 恢复播放用的 AudioContext。没有用户手势时 resume() 可能一直挂起：最多等 timeout 毫秒，不卡住朗读队列 */
+export async function unlockAudio(timeout = 600): Promise<boolean> {
+  try {
+    const a = (actx ??= new AudioContext());
+    if (a.state === "suspended") await Promise.race([a.resume().catch(() => {}), sleep(timeout)]);
+    return a.state === "running";
+  } catch {
+    return false;
+  }
+}
+
+/** 预热：提前启动语音服务并加载当前语音的模型（第一句话不用等加载，也不会没声） */
+const warmed = new Set<string>();
+export async function warmVoice(v: OutputVoice | null = outputVoice()) {
+  void unlockAudio();
+  if (!v) return;
+  if (v.kind === "system") { systemVoices(); return; }
+  if (warmed.has(v.id)) return;
+  warmed.add(v.id);
+  try {
+    await api.voiceTts(v.lang === "ja" ? "はい。" : v.lang === "en" ? "OK." : "好。", v.id);
+  } catch (e) {
+    warmed.delete(v.id);
+    console.warn("[voice] warm-up", e);
+  }
+}
+
 async function playPcm(c: { rate: number; pcm: string }): Promise<void> {
-  const a = (actx ??= new AudioContext());
-  if (a.state === "suspended") await a.resume().catch(() => {});
-  if (a.state !== "running") {
+  await unlockAudio();
+  const a = actx!;
+  if (!a || a.state !== "running") {
     if (!warned) { warned = true; toast("warn", t("浏览器暂不允许自动播放声音：点一下窗口任意位置后再试")); }
     return;
   }

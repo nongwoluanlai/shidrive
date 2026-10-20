@@ -166,6 +166,10 @@ fn mcp_stdio_bridge(url: &str) -> i32 {
     0
 }
 
+/// WebView2 启动参数（主窗口在 tauri.conf.json 里配置同一串；同一数据目录下所有窗口必须一致）。
+/// 保留 Tauri 默认的 disable-features，再允许无手势自动播放：语音唤醒 / 主动关怀时助手能直接出声。
+pub const WEBVIEW_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required";
+
 fn main() {
     // 独立模式：shidrive.exe --coding-mcp [--port N] [--root DIR] [--token T] [--bind ADDR]
     let argv: Vec<String> = std::env::args().collect();

@@ -191,6 +191,7 @@ export const workbenchEn: Record<string, string> = {
   "隧道地址获取失败，请查看运行日志": "Failed to acquire tunnel address; check the logs",
   "保存路径（含文件名，可改）": "Save path (with file name; editable)",
   "皮肤商店 ↗": "Skin store ↗",
+  "获取语音包 ↗": "Get voice packs ↗",
   "把皮肤 zip 拖到这里，或": "Drop a skin .zip here, or",
   "选择 zip 文件": "Choose a .zip file",
   "松开即可导入皮肤包": "Release to import the skin pack",

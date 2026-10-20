@@ -12,7 +12,7 @@
   import { confirmDialog } from "../dialog.svelte";
   import { onSkinEvent } from "../skin-fx/bus";
   import { see } from "../skin-fx/seethrough.svelte";
-  import { vc, inputEnabled, listenOnce, stopCapture, stopSpeaking } from "../assistant/voice.svelte";
+  import { vc, inputEnabled, listenOnce, stopCapture, stopSpeaking, outputVoice, warmVoice } from "../assistant/voice.svelte";
   import { wk, wakeReady, setWake, chime, wakeQuip } from "../assistant/wake.svelte";
   import { ga, enabled, persona, initAssistant, send, cancel, resetSession, hideBubble, showBubble, loadMemories, summarize, visibleText, isThinking, openComposer, memoNote, clearMessages, settingsRequest, conv } from "../assistant/store.svelte";
   import { startConversation, endConversation } from "../assistant/conv.svelte";
@@ -277,6 +277,16 @@
     if (ga.bubble.pages.length || ga.bubble.error || busy) ga.bubble.visible = true;
     openComposer();
   }
+
+  // ---------------- 语音预热 ----------------
+  // 启用朗读后在后台提前启动语音服务、加载当前角色语音（换皮肤 / 换语音会重新预热），第一次说话就有声音
+  $effect(() => {
+    if (!enabled() || !app.ready) return;
+    const v = outputVoice();
+    if (!v) return;
+    const id = setTimeout(() => void warmVoice(v), 2500);
+    return () => clearTimeout(id);
+  });
 
   // ---------------- 唤醒词 ----------------
   $effect(() => {

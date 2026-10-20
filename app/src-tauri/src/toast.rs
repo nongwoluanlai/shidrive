@@ -183,6 +183,7 @@ pub fn show(app: &AppHandle, t: Toast) -> Result<(), String> {
         .focusable(false)
         .shadow(true)
         .background_color(tauri::window::Color(bg.0, bg.1, bg.2, 255))
+        .additional_browser_args(crate::WEBVIEW_ARGS)
         .build();
     if let Err(e) = built {
         state.items.lock().unwrap_or_else(|p| p.into_inner()).remove(&label);
@@ -265,6 +266,14 @@ pub async fn toast_action(app: AppHandle, window: tauri::WebviewWindow, action: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn webview_args_match_main_window() {
+        // 主窗口（tauri.conf.json）与通知窗口的 WebView2 参数必须一致，否则通知窗口创建失败
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(conf["app"]["windows"][0]["additionalBrowserArgs"].as_str(), Some(crate::WEBVIEW_ARGS));
+        assert!(crate::WEBVIEW_ARGS.contains("--autoplay-policy=no-user-gesture-required"));
+    }
+
     use super::*;
 
     #[test]

@@ -370,6 +370,7 @@
         {/each}
         <div class="rowbtns">
           <button class="btn sm" onclick={importPack}>{t("导入语音包（.zip）…")}</button>
+          <button class="linklike" onclick={() => void api.fsOpenDefault("https://shidrive.nwll.top/resources#voice").catch((e) => toast("error", String(e)))}>{t("获取语音包 ↗")}</button>
         </div>
         <p class="note">{t("角色语音包含模型、音素表与 voice.json（声明语言与适用皮肤）。语言与界面不同时（如日语配音），助手会在每句后附上该语言的台词用于朗读，气泡里仍显示中文。")}</p>
       {/if}
@@ -467,6 +468,8 @@
   .link { background: none; border: 0; padding: 0 0 0 8px; color: var(--accent); cursor: pointer; font-size: inherit; }
   .preview { border: 1px solid var(--border-soft); border-radius: 8px; padding: 6px 10px; font-size: .86em; background: var(--bg-elev2); }
   .rowbtns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .linklike { color: var(--accent); font-size: .85em; background: none; border: none; padding: 0; cursor: pointer; align-self: center; }
+  .linklike:hover { text-decoration: underline; }
   .wake h3 { margin: 0; }
   .wake .preview { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; transition: border-color .2s, background .2s; }
   .wake .preview.heard { border-color: #34c77b; background: color-mix(in srgb, #34c77b 14%, var(--bg-elev2)); }
