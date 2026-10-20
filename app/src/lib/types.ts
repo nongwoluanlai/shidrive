@@ -481,10 +481,17 @@ export interface VoiceConfig {
   github_prefix: string;
   pypi_index: string;
   proxy: string;
+  wake_enabled: boolean;
+  /** 英文唤醒词，逗号分隔 */
+  wake_keywords: string;
+  wake_threshold: number;
+  wake_action: "listen" | "open";
+  wake_background: boolean;
+  wake_chime: boolean;
 }
 export interface VoiceTask { id: string; stage: string; received: number; total: number; message: string; running: boolean }
 export interface VoicePack { id: string; name: string; lang: string; engine: string; skins: string[]; characters: string[]; license: string; source: string; credits: string }
-export interface VoiceModelStatus { id: string; kind: "asr" | "tts"; name: string; size_mb: number; installed: boolean }
+export interface VoiceModelStatus { id: string; kind: "asr" | "tts" | "kws"; name: string; size_mb: number; installed: boolean }
 export interface VoiceStatus {
   root: string;
   runtime_installed: boolean;
@@ -493,6 +500,7 @@ export interface VoiceStatus {
   packs: VoicePack[];
   tasks: VoiceTask[];
   server_running: boolean;
+  kws_running: boolean;
 }
 export interface VoiceView { config: VoiceConfig; baidu_secret_set: boolean; status: VoiceStatus }
 export interface SpeechHint { enabled: boolean; lang: string; layer: boolean }

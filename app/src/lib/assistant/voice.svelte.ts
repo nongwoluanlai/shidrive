@@ -20,6 +20,8 @@ export const vc = $state({
   subtitle: "",
   /** 字幕序号（每换一句 +1，用于动画） */
   subRev: 0,
+  /** 一个朗读回合正常读完（+1）：人物气泡随之收起 */
+  spokenRev: 0,
 });
 
 let inited = false;
@@ -149,6 +151,63 @@ export function cutSentences(text: string, final: boolean): [string[], number] {
   return [out, start];
 }
 
+// 单句长度上限（按「字」计：汉字 / 假名 = 1，拉丁字母等 ≈ 1/3）：字幕一屏读得完，语音包也不会因句子太长出错
+const SEG_MAX = 26;
+const isWide = (ch: string) => /[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef\u3000-\u303f]/.test(ch);
+const unitOf = (ch: string) => (isWide(ch) ? 1 : 0.34);
+export const segUnits = (s: string) => { let n = 0; for (const ch of s) n += unitOf(ch); return n; };
+const SOFT = "，,、：:；;—";
+
+/** 把过长的一句在逗号 / 顿号 / 空格处拆成几段，实在没有停顿处就硬切 */
+export function splitLong(seg: string, max = SEG_MAX): string[] {
+  const out: string[] = [];
+  let rest = seg.trim();
+  while (rest && segUnits(rest) > max) {
+    const chars = Array.from(rest);
+    let u = 0, limit = chars.length, soft = -1, space = -1;
+    for (let i = 0; i < chars.length; i++) {
+      u += unitOf(chars[i]);
+      if (u > max) { limit = i; break; }
+      if (u >= max * 0.35) {
+        if (SOFT.includes(chars[i])) soft = i + 1;
+        else if (chars[i] === " ") space = i;
+      }
+    }
+    const cut = soft > 0 ? soft : space > 0 ? space : Math.max(1, limit);
+    const head = chars.slice(0, cut).join("").trim();
+    rest = chars.slice(cut).join("").trim();
+    if (head) out.push(head);
+  }
+  if (rest) out.push(rest);
+  return out;
+}
+
+/** 按比例把字幕切成 n 段（尽量落在标点处），与拆开的配音逐段对应 */
+export function splitShow(show: string, weights: number[]): string[] {
+  const n = weights.length;
+  if (n <= 1) return [show];
+  const chars = Array.from(show);
+  const total = weights.reduce((a, b) => a + b, 0) || 1;
+  const out: string[] = [];
+  let start = 0, acc = 0;
+  for (let k = 0; k < n - 1; k++) {
+    acc += weights[k];
+    let cut = Math.round((chars.length * acc) / total);
+    // 附近 ±6 字内有停顿就挪到停顿后
+    let best = -1;
+    for (let d = 0; d <= 6 && best < 0; d++) {
+      for (const c of [cut + d, cut - d]) {
+        if (c > start && c < chars.length && (SOFT + "。！？!?…").includes(chars[c - 1])) { best = c; break; }
+      }
+    }
+    cut = Math.min(chars.length, Math.max(start + 1, best > 0 ? best : cut));
+    out.push(chars.slice(start, cut).join("").trim());
+    start = cut;
+  }
+  out.push(chars.slice(start).join("").trim());
+  return out.map((x, i) => x || (i ? out[i - 1] : show));
+}
+
 /** 去掉 Markdown 记号、链接地址等不适合读出来的内容 */
 export function cleanSpeech(seg: string): string {
   return seg
@@ -176,7 +235,10 @@ export function layerSegments(raw: string, lang: string): SpeechSeg[] {
     const show = cleanSpeech(speakable(raw.slice(prev, m.index)));
     prev = (m.index ?? 0) + m[0].length;
     const say = m[1].trim();
-    if (SAYABLE.test(say)) out.push({ say, show: show || say });
+    if (!SAYABLE.test(say)) continue;
+    const says = splitLong(say);
+    const shows = splitShow(show || say, says.map(segUnits));
+    says.forEach((x, i) => out.push({ say: x, show: shows[i] }));
   }
   return out;
 }
@@ -195,6 +257,10 @@ let actx: AudioContext | null = null;
 let turnVoice: OutputVoice | null = null;
 let consumed = 0;
 let warned = false;
+/** 这一回合确实读出过声音（读完时才通知气泡收起） */
+let played = false;
+/** 试听不通知气泡 */
+let notify = false;
 
 /** 新回合开始：停掉上一段朗读，按当前设置选定这一轮的语音 */
 export function beginSpeech() {
@@ -204,6 +270,8 @@ export function beginSpeech() {
   consumed = 0;
   warned = false;
   ended = false;
+  played = false;
+  notify = true;
 }
 
 export function stopSpeaking() {
@@ -233,7 +301,7 @@ export function feedSpeech(raw: string, final: boolean) {
     const s = speakable(raw);
     const [parts, used] = cutSentences(s.slice(consumed), final);
     consumed += used;
-    segs = parts.map(cleanSpeech).filter((x) => SAYABLE.test(x)).map((x) => ({ say: x, show: x }));
+    segs = parts.map(cleanSpeech).flatMap((x) => splitLong(x)).filter((x) => SAYABLE.test(x)).map((x) => ({ say: x, show: x }));
   }
   if (final) ended = true;
   if (!segs.length) {
@@ -251,6 +319,7 @@ export function previewVoice(voice: OutputVoice, text: string) {
   consumed = 0;
   warned = false;
   ended = true;
+  notify = false;
   queue.push({ say: text, show: text });
   void pump();
 }
@@ -286,6 +355,7 @@ async function pump() {
       if (my !== gen) break;
       if (!clip) continue;
       vc.speaking = true;
+      played = true;
       vc.subtitle = clip.show;
       vc.subRev++;
       await ("text" in clip ? speakSystem(clip.text, v.lang) : playPcm(clip));
@@ -294,7 +364,13 @@ async function pump() {
     if (my === gen) {
       running = false;
       vc.speaking = false;
-      if (ended && !queue.length) { vc.voiceTurn = false; vc.subtitle = ""; }
+      if (ended && !queue.length) {
+        vc.voiceTurn = false;
+        // 字幕留着（气泡收起前继续显示最后一句），下一回合 / stopSpeaking 时清空
+        if (played && notify) vc.spokenRev++;
+        else vc.subtitle = "";
+        played = false;
+      }
     }
   }
 }

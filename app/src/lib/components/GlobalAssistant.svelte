@@ -1,8 +1,9 @@
 <script lang="ts">
   // 全局助手：无皮肤 → 左下角简易助手（一张卡片）；有皮肤人物 → 拆成两块：
-  //   · 说话气泡：贴在人物头部旁，显示回复（朗读时显示与音频同步的字幕）；
+  //   · 说话气泡：贴在人物头部旁的临时提示（不可点击、没有按钮），显示回复；朗读时显示与音频同步的字幕，读完即收起；
   //   · 控制台：在人物脚下（舞台底部），平时只有输入框 + 语音 / 状态反馈，对话记录和记忆是可展开的面板。
-  // 牧濑红莉栖·动态 用终端风格（style id 仍叫 amadeus），其它皮肤用通用轻量样式。关闭后不留浮标，点人物或 Alt+A 唤起。
+  // 牧濑红莉栖·动态 用终端风格（style id 仍叫 amadeus），其它皮肤用通用轻量样式。关闭后不留浮标，点人物唤起；
+  // 双击 Ctrl = 语音输入；开启唤醒词后喊「Christina」也能唤起。
   import { onMount, tick } from "svelte";
   import { app, toast } from "../state.svelte";
   import { api } from "../ipc";
@@ -12,7 +13,8 @@
   import { onSkinEvent } from "../skin-fx/bus";
   import { see } from "../skin-fx/seethrough.svelte";
   import { vc, inputEnabled, listenOnce, stopCapture, stopSpeaking } from "../assistant/voice.svelte";
-  import { ga, enabled, persona, initAssistant, send, cancel, resetSession, hideBubble, loadMemories, summarize, visibleText, isThinking, openComposer, memoNote, clearMessages, settingsRequest } from "../assistant/store.svelte";
+  import { wk, wakeReady, setWake, chime, wakeQuip } from "../assistant/wake.svelte";
+  import { ga, enabled, persona, initAssistant, send, cancel, resetSession, hideBubble, showBubble, loadMemories, summarize, visibleText, isThinking, openComposer, memoNote, clearMessages, settingsRequest } from "../assistant/store.svelte";
 
   const p = $derived(persona());
   const style = $derived(p.style);
@@ -42,7 +44,7 @@
   const mode = $derived(style === "plain" || !stage ? "plain" : style);
   const pos = $derived.by(() => {
     if (mode === "plain" || !stage) return { left: 14, bottom: 62 };
-    const [ax, ay] = p.anchor ?? [62, 78];
+    const [ax, ay] = p.anchor ?? [54, 78];
     const left = Math.round(stage.left + (stage.width * ax) / 100);
     const bottom = Math.round(winH - (stage.top + stage.height) + (stage.height * ay) / 100);
     return { left: Math.max(8, left), bottom: Math.min(Math.max(8, bottom), winH - 160) };
@@ -66,8 +68,10 @@
   const page = $derived(ga.bubble.pages[ga.bubble.index] ?? "");
   const pageCount = $derived(ga.bubble.pages.length);
   const busy = $derived(ga.busy === "send" || ga.busy === "greet" || ga.busy === "reset");
+  /** 朗读刚读完：气泡继续显示最后一句字幕，片刻后收起 */
+  let holdSub = $state(false);
   /** 人物气泡在朗读：显示与音频同步的字幕 */
-  const subtitleOn = $derived(mode !== "plain" && vc.voiceTurn);
+  const subtitleOn = $derived(mode !== "plain" && (vc.voiceTurn || holdSub));
   const status = $derived(
     vc.recording ? t("正在听…") : vc.transcribing ? t("识别中…") : ga.busy === "reset" ? t("正在新建会话…") : busy ? t("回复中…") : vc.speaking ? t("朗读中…") : ga.busy === "summarize" ? t("处理中…") : "",
   );
@@ -97,22 +101,49 @@
     if (bodyEl && ga.streaming) bodyEl.scrollTop = bodyEl.scrollHeight;
   });
 
-  // 自动翻页（悬停暂停）与自动收起
+  // 自动翻页与自动收起
   $effect(() => {
     void ga.bubble.rev;
     const idx = ga.bubble.index, n = pageCount, text = page;
-    // 简易卡片：输入框 / 面板开着时不自动收起；人物气泡与控制台分开，只在悬停或朗读字幕时暂停
-    if (!ga.bubble.visible || busy || hovered || vc.voiceTurn || (mode === "plain" && (ga.composer || ga.panel))) return;
+    const staged = mode !== "plain";
+    // 简易卡片：悬停暂停，输入框 / 面板开着时不自动收起；人物气泡是临时提示（不可悬停），只在朗读字幕时暂停
+    if (!ga.bubble.visible || busy || vc.voiceTurn || holdSub || (!staged && (hovered || ga.composer || ga.panel))) return;
     if (idx < n - 1) {
       const ms = Math.min(12000, Math.max(3500, 1200 + text.length * 70));
       const id = setTimeout(() => { if (ga.bubble.index === idx) ga.bubble.index = idx + 1; }, ms);
       return () => clearTimeout(id);
     }
     const secs = ga.view?.config.bubble_seconds ?? 30;
-    if (!secs || ga.bubble.error) return;
+    // 人物气泡没有关闭按钮：出错提示也会自动收起
+    if (ga.bubble.error) {
+      if (!staged) return;
+      const id = setTimeout(() => hideBubble(), 15000);
+      return () => clearTimeout(id);
+    }
+    if (!secs) return;
     const id = setTimeout(() => hideBubble(), secs * 1000 + Math.min(8000, text.length * 40));
     return () => clearTimeout(id);
   });
+
+  // 朗读读完：人物气泡（字幕）随语音一起消失；完整回复可在控制台的对话记录里看
+  let spokenSeen = vc.spokenRev;
+  $effect(() => {
+    const rev = vc.spokenRev;
+    if (rev === spokenSeen) return;
+    spokenSeen = rev;
+    if (mode === "plain") return;
+    holdSub = true;
+    const id = setTimeout(() => {
+      holdSub = false;
+      if (!busy && !vc.voiceTurn) hideBubble();
+    }, 1200);
+    return () => { clearTimeout(id); holdSub = false; };
+  });
+
+  function stopTalking() {
+    stopSpeaking();
+    if (mode !== "plain") hideBubble();
+  }
 
   // 气泡被关掉时 mouseleave 不会触发：复位悬停，免得下一条回复不再自动收起
   $effect(() => { if (!ga.bubble.visible) hovered = false; });
@@ -164,6 +195,34 @@
   }
 
   // ---------------- 语音 ----------------
+  /** 点人物唤起时：pointerdown 里聚焦的输入框会被随后 mousedown 的默认行为抢走焦点，松开后再聚焦一次 */
+  function focusAfterClick() {
+    let done = false;
+    const go = () => {
+      if (done) return;
+      done = true;
+      removeEventListener("pointerup", up, true);
+      void tick().then(() => requestAnimationFrame(() => inputEl?.focus()));
+    };
+    const up = () => setTimeout(go, 30);
+    addEventListener("pointerup", up, true);
+    setTimeout(go, 500);
+  }
+
+  /** 双击 Ctrl / 唤醒词：语音输入（未开启语音输入时只打开输入框） */
+  function voiceHotkey(fromWake = false) {
+    if (!enabled()) return;
+    if (!inputEnabled()) {
+      openComposer();
+      if (!fromWake) toast("info", t("语音输入未开启：设置 → 全局助手 → 语音"));
+      return;
+    }
+    if (vc.recording) { stopCapture(true); return; }
+    if (vc.transcribing) return;
+    openComposer();
+    void onMic();
+  }
+
   async function onMic() {
     if (vc.recording) { stopCapture(true); return; }
     if (vc.transcribing) return;
@@ -200,6 +259,27 @@
   function onChip() {
     if (ga.bubble.pages.length || ga.bubble.error || busy) ga.bubble.visible = true;
     openComposer();
+  }
+
+  // ---------------- 唤醒词 ----------------
+  $effect(() => {
+    void wk.retry;
+    const want = enabled() && wakeReady() && (wk.visible || !!vc.view?.config.wake_background);
+    setWake(want, onWake);
+  });
+  $effect(() => () => setWake(false, onWake));
+
+  function onWake(word: string) {
+    if (wk.testing) { if (vc.view?.config.wake_chime) chime(vc.view.config.volume); return; }
+    const cfg = vc.view?.config;
+    if (!cfg || !enabled()) return;
+    if (cfg.wake_chime) chime(cfg.volume);
+    if (document.visibilityState !== "visible" || !document.hasFocus()) void api.voiceWakeRaise().catch(() => {});
+    const quip = wakeQuip(p.name, word, app.locale);
+    if (quip && !busy) showBubble(quip);
+    if (cfg.wake_action === "open" || !inputEnabled()) { openComposer(); return; }
+    // 等提示音放完再开始录，免得把提示音录进去
+    setTimeout(() => voiceHotkey(true), cfg.wake_chime ? 260 : 0);
   }
 
   async function newSession() {
@@ -284,12 +364,39 @@
 
   onMount(() => {
     void initAssistant();
-    const off = onSkinEvent((ev) => { if (ev === "character.click" && enabled()) onChip(); });
+    const off = onSkinEvent((ev) => { if (ev === "character.click" && enabled()) { onChip(); focusAfterClick(); } });
     const onResize = () => measure();
     addEventListener("resize", onResize);
+    // 双击 Ctrl（两次单独按下松开 Ctrl，中间不按别的键）：语音输入
+    let downAt = 0, clean = false, lastTap = 0;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Control") { if (!e.repeat) { downAt = performance.now(); clean = true; } }
+      else { clean = false; lastTap = 0; }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key !== "Control") return;
+      const now = performance.now();
+      const tap = clean && now - downAt < 350;
+      clean = false;
+      if (!tap) { lastTap = 0; return; }
+      if (now - lastTap < 450) { lastTap = 0; voiceHotkey(); } else lastTap = now;
+    };
+    const onPointer = () => { clean = false; lastTap = 0; };
+    const onBlur = () => { clean = false; lastTap = 0; };
+    addEventListener("keydown", onKeyDown, true);
+    addEventListener("keyup", onKeyUp, true);
+    addEventListener("pointerdown", onPointer, true);
+    addEventListener("blur", onBlur);
     // 输入框的 Enter 行为跟随聊天设置（聊天页没打开过时这里自己读一次）
     void api.settingsGet("chat.enter_send").then((v) => (app.enterSend = v === "1")).catch(() => {});
-    return () => { off(); removeEventListener("resize", onResize); };
+    return () => {
+      off();
+      removeEventListener("resize", onResize);
+      removeEventListener("keydown", onKeyDown, true);
+      removeEventListener("keyup", onKeyUp, true);
+      removeEventListener("pointerdown", onPointer, true);
+      removeEventListener("blur", onBlur);
+    };
   });
 </script>
 
@@ -303,7 +410,7 @@
 
 {#snippet stopSpeakBtn()}
   {#if vc.speaking}
-    <button class="ga-icon ga-speaking" title={t("停止朗读")} aria-label={t("停止朗读")} onclick={stopSpeaking}>
+    <button class="ga-icon ga-speaking" title={t("停止朗读")} aria-label={t("停止朗读")} onclick={stopTalking}>
       <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M4 9v6h4l5 4V5L8 9H4Zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4Z"/></svg>
     </button>
   {/if}
@@ -414,7 +521,7 @@
 {#if enabled()}
   {#if mode === "plain"}
     <div class="ga-root ga-plain" role="complementary" aria-label={t("全局助手")}>
-      <button class="ga-launcher" class:on={cardOpen} class:busy title={t("全局助手（Alt+A）")} onclick={onLauncher}>
+      <button class="ga-launcher" class:on={cardOpen} class:busy title={t("全局助手")} onclick={onLauncher}>
         <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M12 3C6.9 3 3 6.4 3 10.6c0 2.3 1.2 4.4 3.1 5.8L5.4 20l4-2.1c.8.2 1.7.3 2.6.3 5.1 0 9-3.4 9-7.6S17.1 3 12 3Zm-4 8.8a1.2 1.2 0 1 1 0-2.4 1.2 1.2 0 0 1 0 2.4Zm4 0a1.2 1.2 0 1 1 0-2.4 1.2 1.2 0 0 1 0 2.4Zm4 0a1.2 1.2 0 1 1 0-2.4 1.2 1.2 0 0 1 0 2.4Z"/></svg>
       </button>
 
@@ -464,15 +571,13 @@
   {:else}
     <div class="ga-root ga-{mode} ga-staged" role="complementary" aria-label={t("全局助手")}>
       {#if ga.bubble.visible}
-        <!-- 说话气泡：人物头部旁 -->
+        <!-- 说话气泡：人物头部旁的临时提示（鼠标穿透，没有按钮） -->
         <div
           class="ga-say"
           class:subtitle={subtitleOn}
           style="left:{pos.left}px; bottom:{pos.bottom}px; --say-max:{Math.max(140, winH - pos.bottom - 12)}px"
           role="status"
           aria-live="polite"
-          onmouseenter={() => (hovered = true)}
-          onmouseleave={() => (hovered = false)}
         >
           {@render corners()}
           <header class="ga-say-head">
@@ -492,16 +597,9 @@
               {@render replyView()}
             {/if}
           </div>
-          <footer class="ga-say-foot">
-            {#if !subtitleOn && pageCount > 1 && !busy}{@render pager()}{/if}
-            <span class="ga-grow"></span>
-            {@render stopSpeakBtn()}
-            {#if !ga.composer}
-              <button class="ga-icon sm" title={t("回复")} aria-label={t("回复")} onclick={openComposer}>✎</button>
-            {/if}
-            <button class="ga-icon sm" class:on={ga.panel === "chat"} title={t("对话记录")} aria-label={t("对话记录")} onclick={() => openPanel("chat", true)}>☰</button>
-            <button class="ga-icon sm" title={t("收起气泡")} aria-label={t("收起气泡")} onclick={hideBubble}>✕</button>
-          </footer>
+          {#if !subtitleOn && pageCount > 1 && !busy}
+            <div class="ga-say-dots" aria-hidden="true">{#each ga.bubble.pages as _, i (i)}<i class:on={i === ga.bubble.index}></i>{/each}</div>
+          {/if}
         </div>
       {/if}
 
@@ -535,7 +633,7 @@
             {@render stopSpeakBtn()}
             <button class="ga-icon sm" class:on={ga.panel === "chat"} title={t("对话记录")} aria-label={t("对话记录")} onclick={() => openPanel("chat")}>☰</button>
             <button class="ga-icon sm" class:on={ga.panel === "memory"} title={t("长期记忆")} aria-label={t("长期记忆")} onclick={() => openPanel("memory")}>✦</button>
-            <button class="ga-icon sm" title={t("关闭（点击人物或 Alt+A 重新打开）")} aria-label={t("关闭")} onclick={close}>✕</button>
+            <button class="ga-icon sm" title={t("关闭（点击人物重新打开）")} aria-label={t("关闭")} onclick={close}>✕</button>
           </div>
           {@render composeRow()}
         </div>
@@ -737,8 +835,12 @@
   }
   .ga-say-head { display: flex; align-items: center; gap: 6px; padding: 6px 10px 0 12px; flex: none; }
   .ga-say .ga-title { font-size: 11.5px; color: var(--text-dim); font-weight: 600; }
-  .ga-say .ga-body { padding: 4px 12px 2px; }
-  .ga-say-foot { display: flex; align-items: center; gap: 2px; padding: 0 6px 5px 8px; font-size: 11px; color: var(--text-faint); flex: none; min-height: 22px; }
+  .ga-say .ga-body { padding: 4px 12px 9px; }
+  .ga-root .ga-say { pointer-events: none; user-select: none; }
+  .ga-say .ga-body { overflow: hidden; }
+  .ga-say-dots { display: flex; justify-content: center; gap: 4px; padding: 2px 0 7px; flex: none; }
+  .ga-say-dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--text-faint); opacity: .45; }
+  .ga-say-dots i.on { background: var(--accent); opacity: 1; }
   .ga-subline { font-size: 13.5px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; animation: ga-sub .22s ease-out; }
   @keyframes ga-sub { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 
@@ -784,7 +886,9 @@
   .ga-amadeus .ga-say-head { padding: 7px 18px 4px 12px; border-bottom: 1px solid var(--am-line); background: var(--am-bg-2); }
   .ga-amadeus .ga-say .ga-title { color: var(--am-text); letter-spacing: .06em; font-weight: 600; }
   .ga-amadeus .ga-say .ga-body { padding-top: 7px; }
-  .ga-amadeus .ga-say-foot, .ga-amadeus .ga-status { color: var(--am-dim); }
+  .ga-amadeus .ga-status { color: var(--am-dim); }
+  .ga-amadeus .ga-say-dots i { border-radius: 0; background: var(--am-dim); }
+  .ga-amadeus .ga-say-dots i.on { background: var(--am); }
   .ga-amadeus .ga-status.live { color: var(--am); }
   .ga-amadeus .ga-subline { color: #ece7da; }
   .ga-amadeus .ga-panel, .ga-amadeus .ga-panel-head { border-color: var(--am-line); }

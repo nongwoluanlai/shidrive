@@ -1,6 +1,7 @@
 # ShiDrive 语音服务：由使驾以「语音运行环境」里的 Python 启动，常驻内存（模型只加载一次）。
 # 协议：stdin / stdout 每行一个 JSON。请求 {"id", "op", ...}；响应 {"id", "ok", ...} 或 {"id", "ok": false, "error"}。
-# 父进程退出（stdin 关闭）后自动结束。不联网、不写文件；日志写 stderr。
+# 父进程退出（stdin 关闭）后自动结束。不联网；只在工作目录写唤醒词列表（kws_keywords.txt）；日志写 stderr。
+# 唤醒词检测（kws_*）由使驾另起一个单线程实例运行，不与识别 / 合成抢同一把锁。
 import base64
 import json
 import os
@@ -198,6 +199,176 @@ def op_tts(req):
     return pcm16_b64(audio.samples, audio.sample_rate)
 
 
+# ---------------------------------------------------------------- 唤醒词（sherpa-onnx KeywordSpotter，GigaSpeech 英文 zipformer）
+
+def _varint(b, i):
+    r = s = 0
+    while True:
+        c = b[i]
+        i += 1
+        r |= (c & 0x7F) << s
+        s += 7
+        if c < 0x80:
+            return r, i
+
+
+def spm_vocab(path):
+    """读 sentencepiece 的 bpe.model（protobuf）：pieces = 字段 1（piece = 1，score = 2，type = 3）。不依赖 sentencepiece 包。"""
+    key = ("spm", path)
+    if key in _cache:
+        return _cache[key]
+    import struct
+
+    b = open(path, "rb").read()
+    i = 0
+    vocab = {}
+    while i < len(b):
+        k, i = _varint(b, i)
+        f, t = k >> 3, k & 7
+        if t == 0:
+            _, i = _varint(b, i)
+            continue
+        if t == 1:
+            i += 8
+            continue
+        if t == 5:
+            i += 4
+            continue
+        n, i = _varint(b, i)
+        chunk = b[i:i + n]
+        i += n
+        if f != 1:
+            continue
+        j = 0
+        piece, score, typ = None, 0.0, 1
+        while j < len(chunk):
+            kk, j = _varint(chunk, j)
+            ff, tt = kk >> 3, kk & 7
+            if tt == 2:
+                m, j = _varint(chunk, j)
+                if ff == 1:
+                    piece = chunk[j:j + m].decode("utf-8", "replace")
+                j += m
+            elif tt == 5:
+                if ff == 2:
+                    score = struct.unpack("<f", chunk[j:j + 4])[0]
+                j += 4
+            elif tt == 0:
+                v, j = _varint(chunk, j)
+                if ff == 3:
+                    typ = v
+            elif tt == 1:
+                j += 8
+        if piece is not None and typ in (1, 4):
+            vocab[piece] = score
+    _cache[key] = vocab
+    return vocab
+
+
+def spm_encode(text, vocab):
+    """unigram 分词（Viterbi，取得分最高的切分）；词首带 ▁，与 icefall 训练时一致（全大写）。"""
+    out = []
+    maxlen = max((len(x) for x in vocab), default=1)
+    for w in text.upper().split():
+        word = "\u2581" + w
+        n = len(word)
+        best = [(-1e18, -1)] * (n + 1)
+        best[0] = (0.0, -1)
+        for e in range(1, n + 1):
+            for s in range(max(0, e - maxlen), e):
+                sc = vocab.get(word[s:e])
+                if sc is None:
+                    if e - s != 1:
+                        continue
+                    sc = -100.0
+                if best[s][0] + sc > best[e][0]:
+                    best[e] = (best[s][0] + sc, s)
+        seg = []
+        e = n
+        while e > 0:
+            s = best[e][1]
+            seg.append(word[s:e])
+            e = s
+        out += seg[::-1]
+    return out
+
+
+def find_onnx(d, part):
+    names = sorted(x for x in os.listdir(d) if x.startswith(part) and x.endswith(".onnx"))
+    int8 = [x for x in names if x.endswith(".int8.onnx")]
+    if not names:
+        raise RuntimeError("唤醒词模型缺少 %s*.onnx" % part)
+    return p(d, (int8 or names)[0])
+
+
+_kws = {"key": None, "spotter": None, "stream": None, "names": {}}
+
+
+def kws_setup(req):
+    d = req["dir"]
+    words = [w.strip() for w in req.get("keywords") or [] if w and w.strip()]
+    if not words:
+        raise RuntimeError("没有设置唤醒词")
+    th = float(req.get("threshold") or 0.25)
+    boost = float(req.get("boost") or 1.5)
+    key = json.dumps([d, words, th, boost])
+    if _kws["key"] == key:
+        return []
+    import sherpa_onnx
+
+    vocab = spm_vocab(p(d, "bpe.model"))
+    known = set(l.split(" ")[0] for l in open(p(d, "tokens.txt"), encoding="utf-8") if l.strip())
+    lines, names, shown = [], {}, []
+    for w in words:
+        toks = spm_encode(w, vocab)
+        bad = [t for t in toks if t not in known]
+        if not toks or bad:
+            raise RuntimeError("唤醒词无法识别（只支持英文字母）：%s" % w)
+        tag = re.sub(r"[^A-Z0-9]+", "_", w.upper()).strip("_") or "WAKE"
+        names[tag] = w
+        lines.append("%s :%s #%s @%s" % (" ".join(toks), boost, th, tag))
+        shown.append(" ".join(toks))
+    kf = os.path.abspath("kws_keywords.txt")
+    with open(kf, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    spotter = sherpa_onnx.KeywordSpotter(
+        tokens=p(d, "tokens.txt"), encoder=find_onnx(d, "encoder"), decoder=find_onnx(d, "decoder"), joiner=find_onnx(d, "joiner"),
+        keywords_file=kf, num_threads=threads(), max_active_paths=4, num_trailing_blanks=1,
+        keywords_score=boost, keywords_threshold=th, provider="cpu",
+    )
+    _kws.update(key=key, spotter=spotter, stream=spotter.create_stream(), names=names)
+    log("kws ready", words, shown)
+    return shown
+
+
+def op_kws_feed(req):
+    import numpy as np
+
+    shown = kws_setup(req)
+    k, st = _kws["spotter"], _kws["stream"]
+    raw = base64.b64decode(req.get("pcm") or "")
+    a = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    hits = []
+    if a.size:
+        st.accept_waveform(int(req.get("rate", 16000)), a)
+        while k.is_ready(st):
+            k.decode_stream(st)
+            r = k.get_result(st)
+            if r:
+                hits.append(_kws["names"].get(r, r))
+                k.reset_stream(st)
+    out = {"hits": hits}
+    if shown:
+        out["tokens"] = shown
+    return out
+
+
+def op_kws_reset(_req):
+    if _kws["spotter"] is not None:
+        _kws["stream"] = _kws["spotter"].create_stream()
+    return {}
+
+
 def op_ping(_req):
     out = {"python": sys.version.split()[0]}
     for mod in ("numpy", "onnxruntime", "sherpa_onnx", "pyopenjtalk"):
@@ -211,10 +382,11 @@ def op_ping(_req):
 
 def op_unload(_req):
     _cache.clear()
+    _kws.update(key=None, spotter=None, stream=None, names={})
     return {}
 
 
-OPS = {"ping": op_ping, "asr": op_asr, "tts": op_tts, "unload": op_unload}
+OPS = {"ping": op_ping, "asr": op_asr, "tts": op_tts, "unload": op_unload, "kws_feed": op_kws_feed, "kws_reset": op_kws_reset}
 
 
 def reply(obj):

@@ -1,12 +1,13 @@
 <script lang="ts">
-  // 设置 → 全局助手 → 语音：语音输入（本地 SenseVoice / 百度极速版）、语音输出（系统 / 本地 TTS / 角色语音包）与组件管理。
-  // 修改即时保存（与上方助手设置的「保存」分开）。
+  // 设置 → 全局助手 → 语音：语音输入（本地 SenseVoice / 百度极速版）、语音输出（系统 / 本地 TTS / 角色语音包）与组件管理；
+  // 以及独立的「唤醒词」一节（离线关键词检测，默认 Christina）。修改即时保存（与上方助手设置的「保存」分开）。
   import { onMount } from "svelte";
   import { app, toast } from "../state.svelte";
   import { api } from "../ipc";
   import { t } from "../i18n";
   import { confirmDialog } from "../dialog.svelte";
   import { vc, initVoice, refreshVoice, saveVoice, packForSkin, outputVoice, previewVoice, systemVoices, listenOnce, stopCapture, stopSpeaking, displayLang, localModelReady, type OutputVoice } from "../assistant/voice.svelte";
+  import { wk } from "../assistant/wake.svelte";
   import type { VoiceConfig, VoicePack, VoiceTask } from "../types";
 
   let draft = $state<VoiceConfig | null>(null);
@@ -19,11 +20,13 @@
 
   onMount(() => {
     void initVoice().then(sync);
+    // 设置页开着时，听到唤醒词只提示，不去唤起助手
+    wk.testing = true;
     const upd = () => (sysVoices = systemVoices());
     upd();
     const ss = "speechSynthesis" in window ? speechSynthesis : null;
     ss?.addEventListener("voiceschanged", upd);
-    return () => { ss?.removeEventListener("voiceschanged", upd); clearTimeout(timer); };
+    return () => { ss?.removeEventListener("voiceschanged", upd); clearTimeout(timer); wk.testing = false; };
   });
 
   function sync() {
@@ -144,6 +147,27 @@
       micBusy = false;
     }
   }
+
+  const wakeModel = $derived(model("kws-gigaspeech"));
+  const wakeStatus = $derived.by(() => {
+    if (!draft?.wake_enabled) return "";
+    if (!st?.runtime_installed) return t("需要先安装上面的语音运行环境");
+    if (!wakeModel?.installed) return t("需要先下载唤醒词模型");
+    if (wk.error) return `${t("出错")}：${wk.error}`;
+    if (wk.listening && wk.suspended) return t("点一下窗口任意位置后开始监听");
+    if (wk.listening) return t("正在监听");
+    if (!wk.visible && !draft.wake_background) return t("窗口在后台，已暂停");
+    return t("准备中…");
+  });
+  /** 刚刚听到唤醒词（设置页里 3 秒内高亮） */
+  let heardFlash = $state(false);
+  $effect(() => {
+    if (!wk.hits) return;
+    heardFlash = true;
+    const id = setTimeout(() => (heardFlash = false), 3000);
+    return () => clearTimeout(id);
+  });
+  const sensitivity = $derived(draft ? Math.round(((0.6 - draft.wake_threshold) / 0.55) * 100) : 0);
 
   const langName = (l: string) => ({ ja: t("日语"), zh: t("中文"), en: t("英语"), ko: t("韩语"), yue: t("粤语") })[l] ?? l;
   const sysList = $derived(sysVoices.filter((v) => /^(zh|en|ja)/i.test(v.lang)));
@@ -354,7 +378,52 @@
           <b>{t("当前朗读")}：</b>{effective.name}{effective.layer ? ` · ${t("{lang}配音，字幕为界面语言", { lang: langName(effective.lang) })}` : ""}
         </div>
       {/if}
-      <p class="note">{t("开启后会要求模型用短句、尽快给出第一句，边生成边朗读；代码块和链接不会被读出。点击气泡标题栏的喇叭可停止朗读。")}</p>
+      <p class="note">{t("开启后会要求模型用短句、尽快给出第一句，边生成边朗读；代码块和链接不会被读出。人物气泡只在朗读时显示字幕，读完即收起；点控制台里的喇叭可停止朗读。")}</p>
+    {/if}
+  </div>
+
+  <!-- ---------------- 唤醒词（独立一节） ---------------- -->
+  <div class="sec voice wake">
+    <div class="row">
+      <h3 class="grow">{t("唤醒词")}</h3>
+      <label class="switch" title={t("常开麦克风，听到唤醒词后唤起助手")}>
+        <input type="checkbox" bind:checked={draft.wake_enabled} onchange={() => commit(0)} />
+        <span class="slider"></span>
+      </label>
+    </div>
+    <p class="note">{t("喊一声唤醒词（默认「Christina」）即可唤起助手，免去点击或按键。完全离线：麦克风音频只在本机检测，不会上传。")}</p>
+    {#if draft.wake_enabled}
+      {@render modelRow("kws-gigaspeech", t("唤醒词模型（英文关键词检测）"))}
+      {#if !st.runtime_installed}<p class="warn">{t("需要先安装上面的语音运行环境。")}</p>{/if}
+      <div class="row">
+        <span class="lbl w">{t("唤醒词")}</span>
+        <input class="grow" placeholder="Christina" bind:value={draft.wake_keywords} onchange={() => commit(0)} />
+      </div>
+      <p class="note">{t("英文单词或短语，多个用逗号分隔（最多 4 个），如「Christina, Hey Kurisu」。模型只认英文发音。")}</p>
+      <div class="row">
+        <span class="lbl w">{t("灵敏度")}</span>
+        <span class="pend">{t("严格")}</span>
+        <input type="range" min="0" max="100" step="1" value={sensitivity} oninput={(e) => { if (!draft) return; const v = Number((e.target as HTMLInputElement).value); draft.wake_threshold = Math.round((0.6 - (v / 100) * 0.55) * 100) / 100; commit(); }} />
+        <span class="pend">{t("灵敏")}</span>
+        <span class="pend">（{t("阈值")} {draft.wake_threshold.toFixed(2)}）</span>
+      </div>
+      <div class="row">
+        <span class="lbl w">{t("唤醒后")}</span>
+        <label class="check"><input type="radio" value="listen" bind:group={draft.wake_action} onchange={() => commit(0)} /> {t("直接开始语音输入")}</label>
+        <label class="check"><input type="radio" value="open" bind:group={draft.wake_action} onchange={() => commit(0)} /> {t("只打开输入框")}</label>
+      </div>
+      {#if draft.wake_action === "listen" && !draft.input_enabled}<p class="warn">{t("「语音输入」未开启：唤醒后只会打开输入框。")}</p>{/if}
+      <label class="check"><input type="checkbox" bind:checked={draft.wake_chime} onchange={() => commit(0)} /> {t("唤醒时播放提示音")}</label>
+      <label class="check"><input type="checkbox" bind:checked={draft.wake_background} onchange={() => commit(0)} /> {t("窗口最小化 / 在后台时也监听（唤醒时切到前台）")}</label>
+      {#if wakeStatus}
+        <div class="preview" class:heard={heardFlash}>
+          <span class="dot {wk.listening ? 'on' : 'off'}"></span>
+          <b>{t("状态")}：</b>{wakeStatus}
+          {#if wk.listening}<span class="lv wlv"><i style="width:{Math.round(wk.level * 100)}%"></i></span>{/if}
+          {#if wk.lastHit}<span class="pend">· {heardFlash ? t("听到了：{word}", { word: wk.lastHit }) : t("上次听到：{word}", { word: wk.lastHit })}</span>{/if}
+        </div>
+      {/if}
+      <p class="note">{t("设置页开着时只做测试：听到唤醒词会提示并响一声，不会唤起助手。录音、识别和朗读期间暂停检测。")}</p>
     {/if}
   </div>
 {/if}
@@ -395,6 +464,11 @@
   .link { background: none; border: 0; padding: 0 0 0 8px; color: var(--accent); cursor: pointer; font-size: inherit; }
   .preview { border: 1px solid var(--border-soft); border-radius: 8px; padding: 6px 10px; font-size: .86em; background: var(--bg-elev2); }
   .rowbtns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .wake h3 { margin: 0; }
+  .wake .preview { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; transition: border-color .2s, background .2s; }
+  .wake .preview.heard { border-color: #34c77b; background: color-mix(in srgb, #34c77b 14%, var(--bg-elev2)); }
+  .wlv { width: 80px; }
+  .wlv i { background: #34c77b; }
   .switch { position: relative; display: inline-block; width: 38px; height: 22px; flex: none; }
   .switch input { opacity: 0; width: 0; height: 0; }
   .slider { position: absolute; inset: 0; cursor: pointer; border-radius: 22px; background: var(--border); transition: background .2s; }

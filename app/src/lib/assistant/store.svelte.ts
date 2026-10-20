@@ -316,16 +316,11 @@ export function isThinking() {
   return (ga.busy === "send" || ga.busy === "greet" || ga.busy === "reset") && !ga.streaming;
 }
 
-/** Alt+A / 点击人物：打开输入框 */
+/** 点击人物 / 语音唤起：打开输入框 */
 export function openComposer() {
   if (!enabled()) return;
   ga.composer = true;
   ga.focusRev++;
-}
-export function toggleComposer() {
-  if (!enabled()) return;
-  if (ga.composer) ga.composer = false;
-  else openComposer();
 }
 
 /** 请求设置窗口打开到某个页签（助手卡片里的「设置」按钮用） */

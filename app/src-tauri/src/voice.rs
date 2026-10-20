@@ -5,6 +5,8 @@
 //! - 常驻语音服务（voice_server.py）经 stdin/stdout JSON 行通信，模型只加载一次；父进程退出即结束。
 //! - 模型：SenseVoice（识别）、Melo / Kokoro（通用中英 TTS）从 sherpa-onnx 官方发布下载；
 //!   角色语音包（如 牧濑红莉栖 · Amadeus 日语）以 zip 导入（model.onnx + tokens + voice.json）。
+//! - 唤醒词（如 Christina）：sherpa-onnx KeywordSpotter（GigaSpeech 英文小模型），前端持续送 16k 音频片段，
+//!   由单独一个单线程语音服务实例检测，不和识别 / 合成排队。
 //! - 系统语音（Web Speech）由前端直接调用，不经过这里。
 
 use std::collections::{BTreeMap, HashMap};
@@ -69,6 +71,18 @@ pub struct VoiceConfig {
     pub pypi_index: String,
     /// 仅用于下载的 HTTP 代理（如 http://127.0.0.1:7890）
     pub proxy: String,
+    /// 唤醒词：常开麦克风，听到唤醒词后唤起助手
+    pub wake_enabled: bool,
+    /// 唤醒词（英文，逗号分隔，最多 4 个）
+    pub wake_keywords: String,
+    /// 触发阈值 0.05~0.6：越小越灵敏（也越容易误触发）
+    pub wake_threshold: f32,
+    /// 唤醒后："listen" = 直接开始语音输入；"open" = 只打开输入框
+    pub wake_action: String,
+    /// 窗口最小化 / 在后台时也监听（唤醒时把窗口拉到前台）
+    pub wake_background: bool,
+    /// 唤醒时播放提示音
+    pub wake_chime: bool,
 }
 
 impl Default for VoiceConfig {
@@ -92,6 +106,12 @@ impl Default for VoiceConfig {
             github_prefix: String::new(),
             pypi_index: String::new(),
             proxy: String::new(),
+            wake_enabled: false,
+            wake_keywords: DEFAULT_WAKE.into(),
+            wake_threshold: 0.25,
+            wake_action: "listen".into(),
+            wake_background: false,
+            wake_chime: true,
         }
     }
 }
@@ -112,8 +132,29 @@ impl VoiceConfig {
         self.proxy = self.proxy.trim().to_string();
         self.system_voice = self.system_voice.trim().chars().take(200).collect();
         self.bindings.retain(|k, v| !k.trim().is_empty() && k.len() <= 80 && v.len() <= 80);
+        self.wake_keywords = wake_words(&self.wake_keywords).join(", ");
+        if self.wake_keywords.is_empty() { self.wake_keywords = DEFAULT_WAKE.into(); }
+        self.wake_threshold = if self.wake_threshold.is_finite() { self.wake_threshold.clamp(0.05, 0.6) } else { 0.25 };
+        if self.wake_action != "open" { self.wake_action = "listen".into(); }
         self
     }
+}
+
+const DEFAULT_WAKE: &str = "Christina";
+/// 唤醒词的加权（keywords_score）：越大越容易命中
+const WAKE_BOOST: f32 = 1.5;
+
+/// 唤醒词列表：按逗号 / 分号 / 换行切开，只保留英文字母、空格、撇号（模型是英文 BPE），去重，最多 4 个
+fn wake_words(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in s.split([',', '，', ';', '；', '、', '\n', '/']) {
+        let w: String = part.chars().filter(|c| c.is_ascii_alphabetic() || *c == ' ' || *c == '\'').collect();
+        let w = w.split_whitespace().collect::<Vec<_>>().join(" ");
+        if w.is_empty() || w.len() > 40 || out.iter().any(|x| x.eq_ignore_ascii_case(&w)) { continue; }
+        out.push(w);
+        if out.len() >= 4 { break; }
+    }
+    out
 }
 
 fn load_config(db: &Db) -> VoiceConfig {
@@ -150,6 +191,11 @@ const MODELS: &[ModelSpec] = &[
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_1.tar.bz2",
         size_mb: 141, check: "voices.bin",
     },
+    ModelSpec {
+        id: "kws-gigaspeech", kind: "kws", name: "唤醒词模型（英文 GigaSpeech zipformer 3.3M）",
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2",
+        size_mb: 18, check: "bpe.model",
+    },
 ];
 
 fn model_spec(id: &str) -> Option<&'static ModelSpec> { MODELS.iter().find(|m| m.id == id) }
@@ -177,6 +223,8 @@ struct Server {
 pub struct VoiceRuntime {
     root: PathBuf,
     server: Mutex<Option<Server>>,
+    /// 唤醒词检测专用实例（单线程，常驻时与识别 / 合成互不阻塞）
+    kws: Mutex<Option<Server>>,
     tasks: Mutex<HashMap<String, TaskInfo>>,
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     baidu_token: Mutex<Option<(String, String, Instant)>>,
@@ -184,10 +232,20 @@ pub struct VoiceRuntime {
 
 impl Drop for VoiceRuntime {
     fn drop(&mut self) {
-        if let Ok(mut s) = self.server.lock() {
-            if let Some(mut srv) = s.take() { let _ = srv.child.kill(); }
+        for slot in [&self.server, &self.kws] {
+            if let Ok(mut s) = slot.lock() {
+                if let Some(mut srv) = s.take() { let _ = srv.child.kill(); }
+            }
         }
     }
+}
+
+/// 语音服务实例：主实例（识别 / 合成）与唤醒词实例
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Slot { Main, Kws }
+
+impl Slot {
+    fn log(self) -> &'static str { match self { Slot::Main => "voice_server.log", Slot::Kws => "voice_kws.log" } }
 }
 
 impl VoiceRuntime {
@@ -195,6 +253,7 @@ impl VoiceRuntime {
         Self {
             root: data_dir.join("tools").join("voice"),
             server: Mutex::new(None),
+            kws: Mutex::new(None),
             tasks: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
             baidu_token: Mutex::new(None),
@@ -209,8 +268,16 @@ impl VoiceRuntime {
     fn runtime_ready(&self) -> bool { self.ready_file().is_file() && self.python().is_file() }
     fn model_installed(&self, m: &ModelSpec) -> bool { self.model_dir(m.id).join(m.check).is_file() }
 
+    fn slot(&self, slot: Slot) -> &Mutex<Option<Server>> { match slot { Slot::Main => &self.server, Slot::Kws => &self.kws } }
+
+    /// 停掉全部语音服务实例（安装 / 删除组件前释放文件占用）
     fn stop_server(&self) {
-        if let Ok(mut s) = self.server.lock() {
+        self.stop_slot(Slot::Main);
+        self.stop_slot(Slot::Kws);
+    }
+
+    fn stop_slot(&self, slot: Slot) {
+        if let Ok(mut s) = self.slot(slot).lock() {
             if let Some(mut srv) = s.take() {
                 let _ = srv.child.kill();
                 let _ = srv.child.wait();
@@ -218,14 +285,15 @@ impl VoiceRuntime {
         }
     }
 
-    fn spawn_server(&self) -> Result<Server, String> {
+    fn spawn_server(&self, slot: Slot) -> Result<Server, String> {
         if !self.runtime_ready() { return Err("语音运行环境未安装：请在 设置 → 全局助手 → 语音 中安装".into()); }
         let script = self.root.join("runtime").join("voice_server.py");
         if std::fs::read_to_string(&script).ok().as_deref() != Some(SERVER_PY) {
             std::fs::write(&script, SERVER_PY).map_err(|e| format!("写入语音服务脚本失败：{e}"))?;
         }
-        let log = std::fs::File::create(self.root.join("voice_server.log")).map_err(|e| format!("创建日志失败：{e}"))?;
+        let log = std::fs::File::create(self.root.join(slot.log())).map_err(|e| format!("创建日志失败：{e}"))?;
         let mut cmd = Command::new(self.python());
+        if slot == Slot::Kws { cmd.env("SHIDRIVE_VOICE_THREADS", "1"); }
         cmd.arg("-u").arg("-X").arg("utf8").arg(&script)
             .current_dir(self.root.join("runtime"))
             .env("PYTHONIOENCODING", "utf-8")
@@ -250,19 +318,23 @@ impl VoiceRuntime {
     }
 
     /// 向常驻语音服务发一个请求（串行）；超时或进程退出时重置，下次自动重启。
-    fn request(&self, mut req: Value, timeout: Duration) -> Result<Value, String> {
-        let mut guard = self.server.lock().map_err(|_| "语音服务状态异常")?;
+    fn request(&self, req: Value, timeout: Duration) -> Result<Value, String> {
+        self.request_on(Slot::Main, req, timeout)
+    }
+
+    fn request_on(&self, slot: Slot, mut req: Value, timeout: Duration) -> Result<Value, String> {
+        let mut guard = self.slot(slot).lock().map_err(|_| "语音服务状态异常")?;
         if let Some(srv) = guard.as_mut() {
             if !matches!(srv.child.try_wait(), Ok(None)) { *guard = None; }
         }
-        if guard.is_none() { *guard = Some(self.spawn_server()?); }
+        if guard.is_none() { *guard = Some(self.spawn_server(slot)?); }
         let srv = guard.as_mut().unwrap();
         let id = srv.next_id;
         srv.next_id += 1;
         req["id"] = json!(id);
         let line = serde_json::to_string(&req).map_err(|e| e.to_string())? + "\n";
         if let Err(e) = srv.stdin.write_all(line.as_bytes()).and_then(|_| srv.stdin.flush()) {
-            let tail = self.log_tail();
+            let tail = self.log_tail(slot);
             *guard = None;
             return Err(format!("语音服务已退出：{e}{tail}"));
         }
@@ -277,15 +349,15 @@ impl VoiceRuntime {
                     return Err(format!("语音服务出错：{}", v.get("error").and_then(Value::as_str).unwrap_or("未知错误")));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => break "语音服务响应超时（已重启）".to_string(),
-                Err(mpsc::RecvTimeoutError::Disconnected) => break format!("语音服务意外退出{}", self.log_tail()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break format!("语音服务意外退出{}", self.log_tail(slot)),
             }
         };
         if let Some(mut s) = guard.take() { let _ = s.child.kill(); let _ = s.child.wait(); }
         Err(failure)
     }
 
-    fn log_tail(&self) -> String {
-        let s = std::fs::read_to_string(self.root.join("voice_server.log")).unwrap_or_default();
+    fn log_tail(&self, slot: Slot) -> String {
+        let s = std::fs::read_to_string(self.root.join(slot.log())).unwrap_or_default();
         let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
         let tail = lines[lines.len().saturating_sub(3)..].join(" | ");
         if tail.is_empty() { String::new() } else { format!("：{}", tail.chars().take(400).collect::<String>()) }
@@ -331,6 +403,7 @@ pub struct VoiceStatus {
     pub packs: Vec<VoicePack>,
     pub tasks: Vec<TaskInfo>,
     pub server_running: bool,
+    pub kws_running: bool,
 }
 
 #[derive(Serialize)]
@@ -363,9 +436,10 @@ fn status(rt: &VoiceRuntime) -> VoiceStatus {
     }).collect();
     let tasks = rt.tasks.lock().map(|m| m.values().cloned().collect()).unwrap_or_default();
     let server_running = rt.server.lock().map(|s| s.is_some()).unwrap_or(false);
+    let kws_running = rt.kws.lock().map(|s| s.is_some()).unwrap_or(false);
     VoiceStatus {
         root: rt.root.to_string_lossy().to_string(),
-        runtime_installed, runtime_info, models, packs: list_packs(rt), tasks, server_running,
+        runtime_installed, runtime_info, models, packs: list_packs(rt), tasks, server_running, kws_running,
     }
 }
 
@@ -1049,6 +1123,56 @@ pub async fn voice_stop_server(rt: VState<'_>) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Serialize)]
+pub struct KwsResult {
+    /// 这一段里命中的唤醒词（原样，如 "Christina"）
+    pub hits: Vec<String>,
+    /// 唤醒词列表刚生效时返回模型分词结果（调试用）
+    pub tokens: Vec<String>,
+}
+
+fn kws_request(cfg: &VoiceConfig, rt: &VoiceRuntime, pcm: &str, rate: u32) -> Result<Value, String> {
+    let m = model_spec("kws-gigaspeech").unwrap();
+    if !rt.runtime_ready() { return Err("语音运行环境未安装".into()); }
+    if !rt.model_installed(m) { return Err("唤醒词模型未安装".into()); }
+    let words = wake_words(&cfg.wake_keywords);
+    Ok(json!({
+        "op": "kws_feed", "dir": rt.model_dir(m.id), "keywords": if words.is_empty() { vec![DEFAULT_WAKE.to_string()] } else { words },
+        "threshold": cfg.wake_threshold, "boost": WAKE_BOOST, "pcm": pcm, "rate": rate,
+    }))
+}
+
+/// 唤醒词检测：pcm = 一小段（约 0.3 秒）16k 单声道 PCM16LE base64；检测状态在服务里跨调用保持
+#[tauri::command]
+pub async fn voice_kws_feed(db: DbState<'_>, rt: VState<'_>, pcm: String, rate: Option<u32>) -> Result<KwsResult, String> {
+    if pcm.len() > 400_000 { return Err("音频片段太长".into()); }
+    let cfg = load_config(&db);
+    if !cfg.wake_enabled { return Err("唤醒词未开启".into()); }
+    let req = kws_request(&cfg, &rt, &pcm, rate.unwrap_or(16000))?;
+    let rt = rt.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let v = rt.request_on(Slot::Kws, req, Duration::from_secs(30))?;
+        let strs = |k: &str| v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+        Ok(KwsResult { hits: strs("hits"), tokens: strs("tokens") })
+    })
+    .await
+    .map_err(|e| format!("唤醒词检测异常：{e}"))?
+}
+
+/// 停止唤醒词检测实例（关闭唤醒词 / 窗口隐藏时释放内存）
+#[tauri::command]
+pub async fn voice_kws_stop(rt: VState<'_>) -> Result<(), String> {
+    let rt = rt.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || rt.stop_slot(Slot::Kws)).await.map_err(|e| e.to_string())
+}
+
+/// 后台唤醒：把主窗口拉到前台
+#[tauri::command]
+pub async fn voice_wake_raise(app: AppHandle) -> Result<(), String> {
+    crate::raise_main_window(&app);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,6 +1189,16 @@ mod tests {
         assert_eq!(c.pypi_index, "https://m/simple");
         assert_eq!(pypi_index(&VoiceConfig { source: "cn".into(), ..Default::default() }).as_deref(), Some(CN_PYPI));
         assert_eq!(github_urls(&c, "https://github.com/a").len(), 2);
+        assert_eq!(c.wake_keywords, "Christina");
+        assert_eq!(c.wake_action, "listen");
+        let w = VoiceConfig { wake_keywords: "  hey   Kurisu，christina; Christina,你好,Amadeus!,a,b,c".into(), wake_threshold: 9.0, wake_action: "x".into(), ..Default::default() }.normalized();
+        assert_eq!(w.wake_keywords, "hey Kurisu, christina, Amadeus, a");
+        assert_eq!(w.wake_threshold, 0.6);
+        let e = VoiceConfig { wake_keywords: "你好".into(), wake_threshold: f32::NAN, wake_action: "open".into(), ..Default::default() }.normalized();
+        assert_eq!((e.wake_keywords.as_str(), e.wake_threshold, e.wake_action.as_str()), ("Christina", 0.25, "open"));
+        // 旧配置（没有唤醒词字段）按默认值读入
+        let old: VoiceConfig = serde_json::from_str(r#"{"input_enabled":true}"#).unwrap();
+        assert!(!old.wake_enabled && old.wake_chime && old.wake_keywords == "Christina");
     }
 
     #[test]
@@ -1074,7 +1208,9 @@ mod tests {
         assert_eq!(b64_len("AA=="), 1);
         assert_eq!(url_enc("a b+/"), "a%20b%2B%2F");
         assert!(valid_id("amadeus-kurisu") && !valid_id("../x") && !valid_id("Ab") && !valid_id(".x"));
-        assert!(SERVER_PY.contains("def op_tts"));
+        assert!(SERVER_PY.contains("def op_tts") && SERVER_PY.contains("\"kws_feed\": op_kws_feed"));
+        assert_eq!(Slot::Kws.log(), "voice_kws.log");
+        assert!(model_spec("kws-gigaspeech").is_some_and(|m| m.kind == "kws"));
     }
 
     #[test]

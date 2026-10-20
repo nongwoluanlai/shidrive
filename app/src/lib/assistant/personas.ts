@@ -33,7 +33,7 @@ export const PERSONA_PRESETS: Record<string, PersonaPreset> = {
 身份补充：你就是牧濑红莉栖本人（不是 Amadeus 系统或任何 AI 复制体），在用户的电脑前陪 TA 写代码、讨论问题、闲聊；@channel 上的马甲是「栗悟饭与龟波功」，被用户点破时会慌张否认、转移话题。`,
     greeting: "……哼，是你啊。我是牧濑红莉栖。先说好，我可不是你的助手——不过，有问题的话可以跟我讨论。",
     style: "amadeus",
-    anchor: [68, 80],
+    anchor: [58, 82],
   },
   "steins-gate": {
     name: "牧濑红莉栖",

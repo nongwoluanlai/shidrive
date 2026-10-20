@@ -31,7 +31,6 @@
   import Icon from "./lib/components/Icon.svelte";
 import SkinCharacter from "./lib/components/SkinCharacter.svelte";
   import GlobalAssistant from "./lib/components/GlobalAssistant.svelte";
-  import { toggleComposer } from "./lib/assistant/store.svelte";
   import logo from "./assets/logo.png";
   import { t } from "./lib/i18n";
 
@@ -65,14 +64,9 @@ import SkinCharacter from "./lib/components/SkinCharacter.svelte";
     }
   }
 
-  // Alt+F：全局搜索（已打开时切换「文件 / 内容」模式）；Alt+A：全局助手输入框
+  // Alt+F：全局搜索（已打开时切换「文件 / 内容」模式）。全局助手：点人物打开，双击 Ctrl 语音输入（见 GlobalAssistant）
   function onGlobalKey(e: KeyboardEvent) {
     if (e.isComposing || !e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
-    if (e.code === "KeyA" || e.key.toLowerCase() === "a") {
-      e.preventDefault();
-      toggleComposer();
-      return;
-    }
     if (e.code !== "KeyF" && e.key.toLowerCase() !== "f") return;
     if (!app.projectId || isNoProject(app.projectId)) return;
     e.preventDefault();

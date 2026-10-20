@@ -141,12 +141,12 @@
       <span>{t("全局助手")}：{view.config.enabled ? t("已启用") : t("未启用")}</span>
       {#if ga.busy}<span class="sep">·</span><span>{t("回复中")}</span>{/if}
       <span class="grow"></span>
-      <label class="switch" title={t("启用后在左下角（或皮肤人物旁）出现助手，可随时聊天（Alt+A）")}>
+      <label class="switch" title={t("启用后在左下角（或皮肤人物旁）出现助手，可随时聊天")}>
         <input type="checkbox" bind:checked={draft.enabled} />
         <span class="slider"></span>
       </label>
     </div>
-    <p class="note">{t("一个独立于项目会话的长期助手：可闲聊、提问，会记住你的偏好。人设与说话风格跟随左下角的皮肤角色。Alt+A 打开输入框。")}</p>
+    <p class="note">{t("一个独立于项目会话的长期助手：可闲聊、提问，会记住你的偏好。人设与说话风格跟随左下角的皮肤角色。点击人物打开输入框，双击 Ctrl 语音输入。")}</p>
 
     <div class="sec">
       <h3>{t("大脑")}</h3>
@@ -224,7 +224,7 @@
         <div><b>{t("当前角色")}：</b>{draft.persona_mode === "custom" && draft.custom_name.trim() ? draft.custom_name.trim() : current.name}<span class="sep"> · </span>{styleLabel(current.style)}</div>
         {#if draft.persona_mode !== "custom"}<div class="dim clamp">{current.persona}</div>{/if}
       </div>
-      <p class="note">{t("无皮肤时是左下角的简易助手；带人物的皮肤会在人物头部旁显示说话气泡（朗读时显示同步字幕），脚下是输入控制台，点击人物或按 Alt+A 打开（牧濑红莉栖·动态 为终端风格）。皮肤作者可在 manifest 里用 assistant 字段自定义角色设定。")}</p>
+      <p class="note">{t("无皮肤时是左下角的简易助手；带人物的皮肤会在人物头部旁显示说话气泡（朗读时显示同步字幕），脚下是输入控制台，点击人物打开（牧濑红莉栖·动态 为终端风格）。皮肤作者可在 manifest 里用 assistant 字段自定义角色设定。")}</p>
     </div>
 
     <div class="sec">
