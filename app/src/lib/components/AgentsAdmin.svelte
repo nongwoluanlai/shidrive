@@ -5,7 +5,7 @@
   // Svelte 的 state_unsafe_mutation，导致展开/上移下移整块渲染中断失效。
   import { app, toast } from "../state.svelte";
   import { api } from "../ipc";
-  import type { AgentEnvStatusItem } from "../types";
+  import type { AgentEnvStatusItem, ShidriveAgentConfig, ShidriveAgentConfigView } from "../types";
 
   let {
     registry = $bindable([] as AgentEnvStatusItem[]),
@@ -95,7 +95,10 @@
     }
     await api.agentsEnabledSet(next);
     await refreshEnabled();
-    if (on && r.npm) {
+    if (on && r.id === "shidrive" && !r.adapter_ready) {
+      toast("info", t("已启用 ShiDrive：请填写接口地址、模型与 API Key 后保存"));
+      if (expanded !== r.id) toggleExpand(r);
+    } else if (on && r.npm) {
       const row = registry.find((x) => x.id === r.id);
       if (row && !row.adapter_ready) {
         toast("info", t("已启用 {p0}：适配器未安装，请展开该行点「安装适配器」（需联网，仅此一次）", { p0: r.name }));
@@ -188,6 +191,65 @@
       toast("error", String(e));
     } finally {
       busy = null;
+    }
+  }
+
+  // ---- 内置 ShiDrive Agent：OpenAI 兼容接口配置 ----
+  let sdView = $state<ShidriveAgentConfigView | null>(null);
+  let sdDraft = $state<{ base_url: string; model: string; models: string; max_steps: string }>({ base_url: "", model: "", models: "", max_steps: "" });
+  let sdKey = $state("");
+  let sdShowKey = $state(false);
+  let sdModels = $state<string[]>([]);
+  let sdBusy = $state<"" | "models" | "save">("");
+
+  $effect(() => {
+    if (expanded !== "shidrive" || sdView) return;
+    void api
+      .shidriveAgentConfigGet()
+      .then((v) => {
+        sdView = v;
+        sdDraft = { base_url: v.base_url, model: v.model, models: v.models, max_steps: v.max_steps ? String(v.max_steps) : "" };
+      })
+      .catch((e) => toast("error", String(e)));
+  });
+
+  async function sdFetchModels() {
+    if (!sdDraft.base_url.trim()) return toast("info", t("请先填写接口地址"));
+    sdBusy = "models";
+    try {
+      const list = await api.shidriveAgentModels(sdDraft.base_url.trim(), sdKey.trim() || undefined);
+      sdModels = list;
+      toast("ok", list.length ? t("连接成功：{n} 个模型", { n: list.length }) : t("连接成功，但接口未返回模型列表，请手动填写模型名"));
+      if (!sdDraft.model && list.length) sdDraft.model = list[0];
+    } catch (e) {
+      toast("error", String(e));
+    } finally {
+      sdBusy = "";
+    }
+  }
+
+  async function sdSave(clearKey = false) {
+    const steps = sdDraft.max_steps.trim() ? Number(sdDraft.max_steps.trim()) : null;
+    if (steps !== null && (!Number.isInteger(steps) || steps < 1 || steps > 500)) return toast("error", t("最大步数需为 1 ~ 500 的整数"));
+    sdBusy = "save";
+    try {
+      const config: ShidriveAgentConfig = {
+        base_url: sdDraft.base_url.trim(),
+        model: sdDraft.model.trim(),
+        models: sdDraft.models,
+        max_steps: steps,
+        temperature: sdView?.temperature ?? null,
+      };
+      await api.shidriveAgentConfigSet(config, clearKey ? "" : sdKey.trim() || null);
+      sdKey = "";
+      sdView = await api.shidriveAgentConfigGet();
+      sdDraft = { base_url: sdView.base_url, model: sdView.model, models: sdView.models, max_steps: sdView.max_steps ? String(sdView.max_steps) : "" };
+      toast("ok", sdView.configured ? t("已保存，ShiDrive Agent 可以使用了") : t("已保存（还需填写接口地址与模型）"));
+      await loadRegistry();
+    } catch (e) {
+      toast("error", String(e));
+    } finally {
+      sdBusy = "";
     }
   }
 
@@ -400,7 +462,7 @@
 </script>
 
 <div class="agents-admin">
-  <p class="hint">{t("默认全部停用。启用后会话页顶部出现对应 Agent 标签；顺序即标签顺序（用 ↑↓ 调整）。npm 类工具：展开该行点「安装适配器」自动下载到用户数据目录（DeepSeek 会安装运行必需的原生依赖，可配代理）；二进制类（Cursor/OpenCode）手动填命令路径。")}</p>
+  <p class="hint">{t("内置 ShiDrive 无需安装，展开填写接口即可使用。启用后会话页顶部出现对应 Agent 标签；顺序即标签顺序（用 ↑↓ 调整）。npm 类工具：展开该行点「安装适配器」自动下载到用户数据目录（DeepSeek 会安装运行必需的原生依赖，可配代理）；二进制类（Cursor/OpenCode）手动填命令路径。")}</p>
   <div class="rows">
     {#each sortedRegistry as r (r.id)}
       <div class="agent-row" class:open={expanded === r.id} class:on={r.enabled}>
@@ -414,7 +476,9 @@
           />
           <span class="name">{r.name}</span>
           {#if r.enabled}
-            {#if !r.npm}
+            {#if r.id === "shidrive"}
+              <span class="badge {r.adapter_ready ? 'ok' : 'warn'}">{r.adapter_ready ? t("已配置") : t("待配置接口")}</span>
+            {:else if !r.npm}
               <span class="badge {r.manual_command ? 'ok' : 'warn'}">{r.manual_command ? t("已配置命令") : t("待配置命令")}</span>
             {:else if r.adapter_ready}
               <span class="badge ok">{t("适配器就绪")}</span>
@@ -432,6 +496,40 @@
         </div>
         {#if expanded === r.id}
           <div class="row-body">
+            {#if r.id === "shidrive"}
+              <p class="help-text">{t(r.help)}</p>
+              {#if !sdView}
+                <p class="pend">{t("加载中…")}</p>
+              {:else}
+                <div class="field"><label for="sd-base">{t("接口地址（OpenAI 兼容，如 https://api.openai.com/v1）")}</label>
+                  <input id="sd-base" class="mono" bind:value={sdDraft.base_url} placeholder="https://…/v1" />
+                </div>
+                <div class="field"><label for="sd-key">{t("API Key")}</label>
+                  <div class="cfg-line">
+                    <input id="sd-key" class="mono grow" type={sdShowKey ? "text" : "password"} autocomplete="new-password" placeholder={sdView.api_key_set ? t("已保存（留空不修改）") : "sk-…"} bind:value={sdKey} />
+                    <button class="btn sm" onclick={() => (sdShowKey = !sdShowKey)}>{sdShowKey ? t("隐藏") : t("显示")}</button>
+                    {#if sdView.api_key_set}<button class="btn sm" disabled={!!sdBusy} onclick={() => sdSave(true)}>{t("清除")}</button>{/if}
+                  </div>
+                </div>
+                <div class="field"><label for="sd-model">{t("模型")}</label>
+                  <div class="cfg-line">
+                    <input id="sd-model" class="mono grow" list="sd-models" bind:value={sdDraft.model} placeholder="gpt-4.1 / deepseek-chat / qwen-…" />
+                    <datalist id="sd-models">{#each sdModels as m (m)}<option value={m}></option>{/each}</datalist>
+                    <button class="btn sm" disabled={!!sdBusy} onclick={sdFetchModels}>{sdBusy === "models" ? t("连接中…") : t("获取模型 / 测试连接")}</button>
+                  </div>
+                </div>
+                <div class="field"><label for="sd-models-extra">{t("可切换的其他模型（逗号分隔，可选；会话中可在模型下拉里切换）")}</label>
+                  <input id="sd-models-extra" class="mono" bind:value={sdDraft.models} />
+                </div>
+                <div class="field"><label for="sd-steps">{t("单轮最大工具步数（可选，默认 60）")}</label>
+                  <input id="sd-steps" class="mono" inputmode="numeric" bind:value={sdDraft.max_steps} placeholder="60" />
+                </div>
+                <div class="rowbtns">
+                  <button class="btn sm primary" disabled={!!sdBusy} onclick={() => sdSave()}>{sdBusy === "save" ? t("保存中…") : t("保存")}</button>
+                  <span class="pend">{t("保存后立即生效（会重置当前连接）。模式：询问（改文件 / 执行命令前确认）、自动、只读，可在会话页切换。")}</span>
+                </div>
+              {/if}
+            {:else}
 {#if r.id !== "deepseek"}<p class="help-text">{t(r.help)}</p>{/if}
             {#if r.id === "deepseek"}
               {@const ds = r.deepseek}
@@ -505,6 +603,7 @@
               <button class="btn sm primary" onclick={() => saveConfig(r)}>{t("保存配置")}</button>
               <button class="btn sm" onclick={() => clearConfig(r)}>{t("清除自定义")}</button>
             </div>
+            {/if}
           </div>
         {/if}
       </div>
@@ -674,6 +773,10 @@
     white-space: nowrap;
     min-width: 0;
     user-select: text;
+  }
+  .grow {
+    flex: 1;
+    min-width: 0;
   }
   .rowbtns {
     display: flex;

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Icon from "./Icon.svelte";
   import { tick, untrack } from "svelte";
   import { prepareImage, MAX_IMAGES } from "../images";
   import { app, chatKey, currentContext, finishTurn, setChatRows, pushLocal, toast, clearChat, sharedContextPrompt, switchAgent, loadChatLocal, saveCfgPref, fullAccessDefault, touchChat, nextId, adoptBinding, invalidateBindingRead, addDraftImage, clearDraftImages } from "../state.svelte";
@@ -1606,13 +1607,15 @@ import type { DisplayItem } from "../state.svelte";
       oncontextmenu={onInputContext}
     ></textarea>
     <input class="img-picker" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" multiple bind:this={imagePicker} onchange={onPickImages} />
-    <button class="btn ghost sched-btn" title={t("添加图片（可多选，最多 {n} 张）", { n: MAX_IMAGES })} disabled={!ctx} onclick={() => imagePicker?.click()}>🖼</button>
-    <button class="btn ghost sched-btn" class:on={schedOpen} title={t("定时发送：到点自动发送输入框里的文字（回答中会等本回合结束）")} disabled={!ctx} onclick={openSched}>⏰</button>
-    {#if streaming}
-      <button class="btn danger" onclick={stop}>■ {t("停止")}</button>
-    {:else}
-      <button class="btn primary" disabled={(!input.trim() && !pendingImages.length) || sending || loadingHere || sessionBusy || !ctx} onclick={send}>{t("发送")} ➤</button>
-    {/if}
+    <button class="btn ghost sched-btn img-btn" title={t("添加图片（可多选，最多 {n} 张）", { n: MAX_IMAGES })} aria-label={t("添加图片")} disabled={!ctx} onclick={() => imagePicker?.click()}><Icon name="plus" size={16} /></button>
+    <div class="send-col">
+      <button class="btn ghost sched-btn" class:on={schedOpen} title={t("定时发送：到点自动发送输入框里的文字（回答中会等本回合结束）")} disabled={!ctx} onclick={openSched}>⏰</button>
+      {#if streaming}
+        <button class="btn danger" onclick={stop}>■ {t("停止")}</button>
+      {:else}
+        <button class="btn primary" disabled={(!input.trim() && !pendingImages.length) || sending || loadingHere || sessionBusy || !ctx} onclick={send}>{t("发送")} ➤</button>
+      {/if}
+    </div>
     </div>
   </div>
 </div>
@@ -1941,6 +1944,20 @@ import type { DisplayItem } from "../state.svelte";
   }
   .sched-btn.on {
     color: var(--accent);
+  }
+  .send-col {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
+  .send-col .sched-btn {
+    align-self: flex-end;
+  }
+  .img-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
   }
   .input-row {
     display: flex;

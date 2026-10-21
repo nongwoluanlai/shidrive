@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod acp;
+mod acp_agent;
 mod assistant;
 mod voice;
 mod agents;
@@ -175,6 +176,10 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--coding-mcp") {
         std::process::exit(coding_mcp::run(&argv));
+    }
+    // 内置 ACP Agent：shidrive.exe --acp-agent（由 Agent 管理里的「ShiDrive」启动，stdio JSON-RPC）
+    if argv.iter().any(|a| a == "--acp-agent") {
+        std::process::exit(acp_agent::run());
     }
     // stdio MCP 桥：shidrive.exe --mcp-stdio <http://127.0.0.1:port/mcp?ctx=..>
     // 供只支持 stdio MCP 的 ACP 适配器使用，逐行转发到本机 HTTP MCP 端点。
@@ -431,6 +436,9 @@ fn main() {
             commands::agent_config_get,
             commands::agent_config_set,
             commands::agents_registry,
+            commands::shidrive_agent_config_get,
+            commands::shidrive_agent_config_set,
+            commands::shidrive_agent_models,
             commands::agents_enabled_get,
             commands::agents_enabled_set,
             commands::agents_bootstrap,

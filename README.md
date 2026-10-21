@@ -10,6 +10,7 @@
 - **项目与上下文**：项目分组、多工作上下文；上下文可绑定多个 Agent 会话，切换即恢复。
 <img width="2250" height="1303" alt="image" src="https://github.com/user-attachments/assets/686f9065-44f2-4aa2-af07-db07f9938223" />
 - **AI 会话（ACP）**：新建 / 绑定历史会话、流式回复、工具调用时间线、权限请求对话框、模型与模式切换、Ctrl+F 正文搜索、会话标题编辑；会话状态（对话中 / 已完成 / 已中断）集中管理。
+- **内置 ShiDrive Agent**：无需安装适配器，在「设置 → Agent 管理 → ShiDrive」填写 OpenAI 兼容接口（地址 / API Key / 模型）即可使用；可读写文件、执行命令、调用共享上下文工具，支持会话保存 / 恢复 / 列表，模式可选 询问（改文件 / 执行命令前确认）、自动、只读。
 - **多 Agent 注册表**：内置 Codex、ZCode、Claude、Cline、Codebuddy、Cursor、MiniMax、OpenCode、Qoder、Grok 十种 ACP 工具。启用顺序即会话页标签顺序；npm 类适配器在设置页一键安装（支持 HTTP 代理、npmmirror 镜像回退、`--omit=optional` 跳过大体积平台二进制）。
 <img width="892" height="793" alt="image" src="https://github.com/user-attachments/assets/b9bd3ffe-df63-4654-9694-c6974f1cf61b" />
 - **图形化工作流**：画布拖拽 / 自由连线 / 双击编辑；开始、注释、气泡提醒、环境变量、命令（cmd/powershell/python）、Agent 调度、延时等节点；并行分支、定时与手动触发、运行日志、复制粘贴、自动保存。

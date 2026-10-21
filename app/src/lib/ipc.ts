@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentBinding,
   AgentEnvStatusItem,
+  ShidriveAgentConfig,
+  ShidriveAgentConfigView,
   AgentLaunch,
   AgentType,
   BindingInfo,
@@ -226,6 +228,12 @@ export const api = {
   agentConfigSet: (agent_type: string, launch: AgentLaunch | null) =>
     invoke<void>("agent_config_set", { agentType: agent_type, launch }),
   agentsRegistry: () => invoke<AgentEnvStatusItem[]>("agents_registry"),
+  shidriveAgentConfigGet: () => invoke<ShidriveAgentConfigView>("shidrive_agent_config_get"),
+  /** apiKey：null = 保留已保存的，"" = 清除 */
+  shidriveAgentConfigSet: (config: ShidriveAgentConfig, apiKey: string | null) =>
+    invoke<void>("shidrive_agent_config_set", { config, apiKey }),
+  shidriveAgentModels: (baseUrl: string, apiKey?: string) =>
+    invoke<string[]>("shidrive_agent_models", { baseUrl, apiKey: apiKey ?? null }),
   agentsEnabledGet: () => invoke<string[]>("agents_enabled_get"),
   agentsEnabledSet: (ids: string[]) => invoke<void>("agents_enabled_set", { ids }),
   agentsBootstrap: (id: string) => invoke<string>("agents_bootstrap", { id }),

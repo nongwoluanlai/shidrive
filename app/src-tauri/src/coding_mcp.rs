@@ -445,7 +445,7 @@ pub(crate) fn within_root(child: &Path, root: &Path) -> bool {
     c.strip_prefix(&r).is_some_and(|rest| rest.starts_with('\\'))
 }
 
-fn safe_path(cfg: &Cfg, raw: &str) -> Result<PathBuf, String> {
+pub(crate) fn safe_path(cfg: &Cfg, raw: &str) -> Result<PathBuf, String> {
     let p = Path::new(raw);
     let joined = if p.is_absolute() { p.to_path_buf() } else { cfg.root.join(p) };
     let canon = std::fs::canonicalize(&joined).map_err(|e| format!("路径不存在（{}）：{e}", joined.display()))?;

@@ -3,6 +3,19 @@
 export type AgentType = string;
 export type AgentId = string;
 
+/** 内置 ShiDrive Agent 接口配置（API Key 不回显） */
+export interface ShidriveAgentConfig {
+  base_url: string;
+  model: string;
+  models: string;
+  max_steps: number | null;
+  temperature: number | null;
+}
+export interface ShidriveAgentConfigView extends ShidriveAgentConfig {
+  api_key_set: boolean;
+  configured: boolean;
+}
+
 export interface AgentEnvStatusItem {
   id: string;
   name: string;

@@ -274,7 +274,9 @@
   }
 
   function onChip() {
-    if (ga.bubble.pages.length || ga.bubble.error || busy) ga.bubble.visible = true;
+    // 简易卡片里气泡就是卡片正文，打开时带上上次回复；人物模式的说话气泡只在助手回复 / 朗读时出现，
+    // 点人物只打开输入框，不把旧气泡重新翻出来（完整记录在控制台「对话记录」里）
+    if (mode === "plain" && (ga.bubble.pages.length || ga.bubble.error || busy)) ga.bubble.visible = true;
     openComposer();
   }
 

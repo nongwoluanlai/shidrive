@@ -376,6 +376,17 @@ impl AgentManager {
     }
 
     pub async fn launch_for(&self, agent_type: &str) -> Result<AgentLaunch, String> {
+        if agent_type == "shidrive" {
+            // 内置 Agent：以当前可执行文件 --acp-agent 启动，接口配置经环境变量注入
+            let c = crate::agents::shidrive_agent_config(&self.db);
+            if !c.configured() { return Err(crate::acp_agent::NOT_CONFIGURED.into()); }
+            let exe = std::env::current_exe().map_err(|e| format!("无法定位 ShiDrive 可执行文件：{e}"))?;
+            let mut env = c.env();
+            if let Ok(dir) = self.app.path().app_data_dir() {
+                env.insert("SHIDRIVE_AGENT_HOME".into(), dir.join("agent").to_string_lossy().to_string());
+            }
+            return Ok(AgentLaunch { command: exe.to_string_lossy().to_string(), args: vec!["--acp-agent".into()], env });
+        }
         let mut manual = self.override_for(agent_type).await;
         if !manual.command.trim().is_empty() {
             // Empty args + an executable override means "use the registered launch

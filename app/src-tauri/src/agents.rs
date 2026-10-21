@@ -24,6 +24,13 @@ pub fn agent_specs() -> &'static [AgentSpec] {
     static SPECS: std::sync::OnceLock<Vec<AgentSpec>> = std::sync::OnceLock::new();
     SPECS.get_or_init(|| vec![
     AgentSpec {
+        id: "shidrive".into(),
+        name: "ShiDrive".into(),
+        npm: None,
+        args: vec!["--acp-agent".into()],
+        help: "使驾内置 Agent：无需安装任何适配器，填写 OpenAI 兼容接口（接口地址、API Key、模型）并保存即可使用。支持读写文件、执行命令、共享上下文工具，会话可保存与恢复；模式可选 询问（改文件/执行命令前确认）、自动、只读。".into(),
+    },
+    AgentSpec {
         id: "codex".into(),
         name: "Codex".into(),
         npm: Some("@agentclientprotocol/codex-acp".into()),
@@ -114,14 +121,14 @@ pub fn spec(id: &str) -> Option<&'static AgentSpec> {
     agent_specs().iter().find(|s| s.id == id)
 }
 
-/// 启用的 agent（有序）。首次读取时种子：已有绑定的库保留 codex+zcode，否则全部停用。
+/// 启用的 agent（有序）。首次读取时种子：已有绑定的库保留 codex+zcode，否则只启用内置 ShiDrive。
 pub fn enabled_agents(db: &Arc<Db>) -> Vec<String> {
     if let Ok(Some(raw)) = db.get_setting("agents.enabled") {
         if let Ok(list) = serde_json::from_str::<Vec<String>>(&raw) {
             return list.into_iter().filter(|id| spec(id).is_some()).collect();
         }
     }
-    // seed：存量安装（已有绑定）保留 codex/zcode；全新安装全部停用
+    // seed：存量安装（已有绑定）保留 codex/zcode；全新安装只启用 shidrive
     let has_bindings = db
         .bindings_list_all()
         .map(|l| !l.is_empty())
@@ -129,8 +136,56 @@ pub fn enabled_agents(db: &Arc<Db>) -> Vec<String> {
     if has_bindings {
         vec!["codex".into(), "zcode".into()]
     } else {
-        Vec::new()
+        // 全新安装：默认只启用内置 ShiDrive（无需安装，配置接口即可用）
+        vec!["shidrive".into()]
     }
+}
+
+/// 内置 ShiDrive Agent 的接口配置（settings `shidrive_agent.config`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShidriveAgentConfig {
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub model: String,
+    /// 可切换的其他模型（逗号分隔）
+    #[serde(default)]
+    pub models: String,
+    #[serde(default)]
+    pub max_steps: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+}
+
+pub const SHIDRIVE_AGENT_KEY: &str = "shidrive_agent.config";
+
+impl ShidriveAgentConfig {
+    pub fn configured(&self) -> bool {
+        !self.base_url.trim().is_empty() && !self.model.trim().is_empty()
+    }
+    /// 启动 `--acp-agent` 子进程时注入的环境变量
+    pub fn env(&self) -> std::collections::BTreeMap<String, String> {
+        let mut e = std::collections::BTreeMap::new();
+        e.insert("SHIDRIVE_AGENT_BASE_URL".into(), self.base_url.trim().into());
+        e.insert("SHIDRIVE_AGENT_API_KEY".into(), self.api_key.trim().into());
+        e.insert("SHIDRIVE_AGENT_MODEL".into(), self.model.trim().into());
+        e.insert("SHIDRIVE_AGENT_MODELS".into(), crate::acp_agent::split_models(&self.models).join(","));
+        if let Some(n) = self.max_steps.filter(|n| *n > 0) { e.insert("SHIDRIVE_AGENT_MAX_STEPS".into(), n.to_string()); }
+        if let Some(t) = self.temperature { e.insert("SHIDRIVE_AGENT_TEMPERATURE".into(), t.to_string()); }
+        e
+    }
+}
+
+pub fn shidrive_agent_config(db: &Arc<Db>) -> ShidriveAgentConfig {
+    db.get_setting(SHIDRIVE_AGENT_KEY).ok().flatten()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+pub fn set_shidrive_agent_config(db: &Arc<Db>, c: &ShidriveAgentConfig) -> Result<(), String> {
+    db.set_setting(SHIDRIVE_AGENT_KEY, &serde_json::to_string(c).map_err(|e| e.to_string())?)
 }
 
 pub fn set_enabled_agents(db: &Arc<Db>, ids: &[String]) -> Result<(), String> {
@@ -817,7 +872,10 @@ pub fn registry_status(db: &Arc<Db>, tools: &Tools) -> Vec<AgentEnvStatus> {
                 let mode = deepseek_mode_setting(db);
                 deepseek_source(&manual_launch.as_ref().map(|l| l.env.clone()).unwrap_or_default(), mode.as_deref())
             });
-            let (adapter_ready, adapter_path) = if let Some(ds) = &deepseek {
+            let (adapter_ready, adapter_path) = if sp.id == "shidrive" {
+                // 内置：无需适配器，「就绪」= 已填写接口地址与模型
+                (shidrive_agent_config(db).configured(), String::new())
+            } else if let Some(ds) = &deepseek {
                 (matches!(ds.kind.as_str(), "acp" | "manual" | "desktop" | "npm"), ds.path.clone())
             } else if let Some(pkg) = &sp.npm {
                 match adapter_script(tools, pkg) {

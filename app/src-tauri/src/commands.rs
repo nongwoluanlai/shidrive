@@ -1214,3 +1214,61 @@ pub async fn web_revoke_all(web: WebState<'_>) -> Result<usize, String> {
 pub async fn web_generate_code() -> Result<String, String> {
     Ok(crate::web::generate_guest_code())
 }
+
+// ---------- 内置 ShiDrive Agent 接口配置 ----------
+
+/// 读取配置：不回显 API Key，只给出 api_key_set 标记。
+#[tauri::command]
+pub async fn shidrive_agent_config_get(db: DbState<'_>) -> Result<Value, String> {
+    let c = crate::agents::shidrive_agent_config(&db);
+    Ok(serde_json::json!({
+        "base_url": c.base_url, "model": c.model, "models": c.models,
+        "max_steps": c.max_steps, "temperature": c.temperature,
+        "api_key_set": !c.api_key.trim().is_empty(), "configured": c.configured(),
+    }))
+}
+
+/// 保存配置。api_key：None = 保留已保存的；"" = 清除。保存后断开现有连接，下次使用按新配置启动。
+#[tauri::command]
+pub async fn shidrive_agent_config_set(
+    agents: AgentsState<'_>, db: DbState<'_>,
+    config: crate::agents::ShidriveAgentConfig, api_key: Option<String>,
+) -> Result<(), String> {
+    let old = crate::agents::shidrive_agent_config(&db);
+    let mut c = config;
+    c.base_url = c.base_url.trim().trim_end_matches('/').to_string();
+    c.model = c.model.trim().to_string();
+    c.models = crate::acp_agent::split_models(&c.models).join(", ");
+    if !c.base_url.is_empty() { crate::acp_agent::chat_url(&c.base_url)?; }
+    if let Some(t) = c.temperature { if !(0.0..=2.0).contains(&t) { return Err("温度需在 0 ~ 2 之间".into()); } }
+    c.api_key = match api_key { Some(k) => k.trim().to_string(), None => old.api_key };
+    crate::agents::set_shidrive_agent_config(&db, &c)?;
+    agents.disconnect("shidrive").await;
+    Ok(())
+}
+
+/// 获取模型列表 / 测试连接：GET {base}/models；api_key 留空时用已保存的。
+#[tauri::command]
+pub async fn shidrive_agent_models(db: DbState<'_>, base_url: String, api_key: Option<String>) -> Result<Vec<String>, String> {
+    let saved = crate::agents::shidrive_agent_config(&db);
+    let key = api_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).unwrap_or(saved.api_key);
+    let url = crate::acp_agent::models_url(&base_url)?;
+    tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(15))
+            .timeout_read(std::time::Duration::from_secs(30))
+            .build();
+        let mut req = agent.get(&url);
+        if !key.is_empty() { req = req.set("Authorization", &format!("Bearer {key}")); }
+        let resp = req.call().map_err(|e| match e {
+            ureq::Error::Status(code, r) => format!("接口返回 HTTP {code}：{}", r.into_string().unwrap_or_default().chars().take(300).collect::<String>()),
+            other => format!("连接失败：{other}"),
+        })?;
+        let v: Value = serde_json::from_reader(resp.into_reader()).map_err(|e| format!("模型列表无法解析：{e}"))?;
+        let mut ids: Vec<String> = v.get("data").and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string)).collect())
+            .unwrap_or_default();
+        ids.sort();
+        Ok(ids)
+    }).await.map_err(|e| e.to_string())?
+}
