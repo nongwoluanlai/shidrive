@@ -145,6 +145,10 @@
   }
 </script>
 
+{#snippet dl()}
+  {#if project && selected}<a class="btn sm" href={api.downloadUrl(project.id, selected)} download={selected.split(/[\\/]/).pop()}><Icon name="download" size={15} />下载文件</a>{/if}
+{/snippet}
+
 <div class="files" class:has-preview={!!selected}>
   <div class="tree-pane">
     <div class="bar">
@@ -207,6 +211,7 @@
           {#if isMd}<button class="btn sm ghost" onclick={() => (mdMode = !mdMode)}>{mdMode ? "源码" : "渲染"}</button>{/if}
           <button class="btn sm ghost" onclick={() => (wrap = !wrap)}>{wrap ? "不换行" : "换行"}</button>
         {/if}
+        {#if project}<a class="icon-btn" title="下载文件" aria-label="下载文件" href={api.downloadUrl(project.id, selected)} download={selected.split(/[\\/]/).pop()}><Icon name="download" size={17} /></a>{/if}
         <button class="icon-btn" title="复制路径" onclick={() => void copy(selected!)}><Icon name="copy" size={16} /></button>
       </div>
       <div class="pbody scroll">
@@ -215,9 +220,9 @@
         {:else if preview?.kind === "image"}
           <div class="img-wrap"><img src={preview.content} alt={preview.path} /></div>
         {:else if preview?.kind === "binary"}
-          <div class="empty">二进制文件（{fmtSize(preview.size)}），不支持预览</div>
+          <div class="empty">二进制文件（{fmtSize(preview.size)}），不支持预览{@render dl()}</div>
         {:else if preview?.kind === "large"}
-          <div class="empty">文件较大（{fmtSize(preview.size)}），网页端只预览 2MB 以内的文件</div>
+          <div class="empty">文件较大（{fmtSize(preview.size)}），网页端只预览 2MB 以内的文件{@render dl()}</div>
         {:else if preview?.kind === "error"}
           <div class="empty">{preview.content}</div>
         {:else if preview?.kind === "text"}

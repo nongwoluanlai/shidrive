@@ -484,7 +484,9 @@ export interface AssistantMessage {
   greeting: boolean;
 }
 export interface AssistantMemory { id: string; content: string; source: "auto" | "manual" | "summary"; pinned: boolean; created_at: string; updated_at: string }
-export interface AssistantTurnResult { message: AssistantMessage | null; memories_added: number; memories_forgotten: number; end_conversation?: boolean; skipped?: boolean }
+/** 字幕层：气泡里显示 / 朗读的短句；speech = 配音语言版本；derived = 模型没给、从正文推导 */
+export interface AssistantSubtitle { text: string; speech: string; derived?: boolean }
+export interface AssistantTurnResult { message: AssistantMessage | null; memories_added: number; memories_forgotten: number; end_conversation?: boolean; skipped?: boolean; subtitles?: AssistantSubtitle[]; has_body?: boolean }
 
 // ---------------- 全局助手 · 语音 ----------------
 export interface VoiceConfig {

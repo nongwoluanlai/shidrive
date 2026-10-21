@@ -68,6 +68,7 @@ a { color: var(--accent); }
   color: var(--text-dim); flex: none;
 }
 .icon-btn:hover { background: var(--bg-elev); color: var(--text); }
+a.btn, a.icon-btn { text-decoration: none; }
 .input, .select, .textarea {
   width: 100%; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px;
   padding: 8px 12px; outline: none; min-height: 38px;

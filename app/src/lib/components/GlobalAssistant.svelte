@@ -14,7 +14,7 @@
   import { see } from "../skin-fx/seethrough.svelte";
   import { vc, inputEnabled, listenOnce, stopCapture, stopSpeaking, outputVoice, warmVoice } from "../assistant/voice.svelte";
   import { wk, wakeReady, setWake, chime, wakeQuip } from "../assistant/wake.svelte";
-  import { ga, enabled, persona, initAssistant, send, cancel, resetSession, hideBubble, showBubble, loadMemories, summarize, visibleText, isThinking, openComposer, memoNote, clearMessages, settingsRequest, conv } from "../assistant/store.svelte";
+  import { ga, enabled, persona, initAssistant, send, cancel, resetSession, hideBubble, showBubble, loadMemories, summarize, visibleText, isThinking, openComposer, memoNote, clearMessages, settingsRequest, conv, subText } from "../assistant/store.svelte";
   import { startConversation, endConversation } from "../assistant/conv.svelte";
   import { initCare } from "../assistant/care.svelte";
 
@@ -67,6 +67,8 @@
   // ---------------- 卡片内容 ----------------
   const cardOpen = $derived(ga.bubble.visible || ga.composer || ga.panel !== null);
   const streamingText = $derived(visibleText(ga.streaming));
+  /** 气泡里流式显示的：字幕层优先；还没有字幕时先显示正文 */
+  const liveText = $derived(ga.subs.length ? subText(ga.subs) : streamingText);
   const page = $derived(ga.bubble.pages[ga.bubble.index] ?? "");
   const pageCount = $derived(ga.bubble.pages.length);
   const busy = $derived(ga.busy === "send" || ga.busy === "greet" || ga.busy === "care" || ga.busy === "reset");
@@ -101,8 +103,8 @@
 
   // 流式时贴底
   $effect(() => {
-    void streamingText;
-    if (bodyEl && ga.streaming) bodyEl.scrollTop = bodyEl.scrollHeight;
+    void liveText;
+    if (bodyEl && liveText) bodyEl.scrollTop = bodyEl.scrollHeight;
   });
 
   // 自动翻页与自动收起
@@ -473,7 +475,7 @@
       <div class="ga-empty">{t("还没有对话。")}</div>
     {/each}
     {#if busy}
-      <div class="ga-msg assistant"><div class="ga-msg-meta">{p.name}</div><div class="ga-md">{#if streamingText}{@html md(streamingText)}{:else}<span class="ga-dots"><i></i><i></i><i></i></span>{/if}</div></div>
+      <div class="ga-msg assistant"><div class="ga-msg-meta">{p.name}</div><div class="ga-md">{#if streamingText || ga.subs.length}{@html md(streamingText || subText(ga.subs))}{:else}<span class="ga-dots"><i></i><i></i><i></i></span>{/if}</div></div>
     {/if}
   </div>
   <div class="ga-tools">
@@ -518,13 +520,13 @@
 {/snippet}
 
 {#snippet replyView()}
-  {#if busy && !streamingText}
+  {#if busy && !liveText}
     <span class="ga-dots" aria-label={t("思考中")}><i></i><i></i><i></i></span>
     {#if ga.busy === "reset"}<span class="ga-sub">{t("正在新建会话…")}</span>{/if}
   {:else if busy}
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="ga-md" onclick={onMdClick}>{@html md(streamingText)}<span class="ga-caret"></span></div>
+    <div class="ga-md" onclick={onMdClick}>{@html md(liveText)}<span class="ga-caret"></span></div>
   {:else}
     {#if page}
       {#key ga.bubble.index + ga.bubble.rev * 1000}
@@ -534,6 +536,13 @@
       {/key}
     {:else if !ga.bubble.error}
       <div class="ga-sub">{t("想聊点什么？")}</div>
+    {/if}
+    {#if ga.bubble.more && page && ga.bubble.index >= pageCount - 1}
+      {#if mode === "plain"}
+        <button class="ga-more" onclick={() => openPanel("chat", true)}>{t("查看完整回复")} ›</button>
+      {:else}
+        <div class="ga-sub ga-more-hint">{t("完整回复在对话记录里")}</div>
+      {/if}
     {/if}
     {#if ga.bubble.error}<div class="ga-error">{ga.bubble.error}</div>{/if}
   {/if}
@@ -737,6 +746,9 @@
   .ga-page { animation: ga-fade .2s ease-out; }
   @keyframes ga-fade { from { opacity: 0; } to { opacity: 1; } }
   .ga-sub { color: var(--text-faint); font-size: 12px; }
+  .ga-more { display: inline-block; margin-top: 6px; padding: 0; background: none; border: 0; color: var(--accent); font-size: 12px; cursor: pointer; }
+  .ga-more:hover { text-decoration: underline; }
+  .ga-more-hint { margin-top: 4px; }
   .ga-error { color: var(--danger); font-size: 12px; margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
   .ga-caret { display: inline-block; width: 6px; height: 1em; vertical-align: -2px; margin-left: 2px; background: currentColor; opacity: .6; animation: ga-blink 1s steps(2) infinite; }
   @keyframes ga-blink { 50% { opacity: 0; } }

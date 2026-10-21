@@ -7,7 +7,7 @@ import { emitSkinEvent } from "../skin-fx/bus";
 import { skinPersona, toWire, type ResolvedPersona } from "./personas";
 import { t } from "../i18n";
 import { beginSpeech, feedSpeech, initVoice, speechHint, stopSpeaking } from "./voice.svelte";
-import type { AssistantConfigView, AssistantMemory, AssistantMessage, AssistantTurnResult, SpeechHint } from "../types";
+import type { AssistantConfigView, AssistantMemory, AssistantMessage, AssistantSubtitle, AssistantTurnResult, SpeechHint } from "../types";
 
 type Busy = "" | "send" | "greet" | "care" | "summarize" | "reset";
 
@@ -19,10 +19,12 @@ export const ga = $state({
   /** 当前对话回合（只接收这个回合的流式增量） */
   turnId: "",
   busy: "" as Busy,
-  /** 流式中的原始文本（含尚未剥离的指令） */
+  /** 流式中的原始文本（含尚未剥离的指令）——正文层，进对话记录 */
   streaming: "",
-  /** 气泡：分页后的内容；visible=false 时只显示小图标 */
-  bubble: { visible: false, pages: [] as string[], index: 0, error: "", rev: 0 },
+  /** 本回合的字幕层（say 工具 / [[字幕: …]]）：气泡里显示、开启语音时朗读 */
+  subs: [] as AssistantSubtitle[],
+  /** 气泡：分页后的内容；visible=false 时只显示小图标；more = 字幕之外还有完整正文 */
+  bubble: { visible: false, pages: [] as string[], index: 0, error: "", rev: 0, more: false },
   /** 展开的面板：null = 只有气泡；chat = 对话记录；memory = 记忆 */
   panel: null as null | "chat" | "memory",
   composer: false,
@@ -82,13 +84,62 @@ const newTurn = () => `ga-${Date.now().toString(36)}-${Math.random().toString(36
 /** 去掉记忆指令（含流式中尚未闭合的半截） */
 export function visibleText(raw: string): string {
   return raw
+    .replace(SUB_STRIP, "")
     .replace(/^[ \t]*\[\[\s*(记忆|忘记|memory|forget)\s*[:：][^\]]*\]\][ \t]*$/gim, "")
     .replace(/\[\[\s*(记忆|忘记|memory|forget)\s*[:：][^\]]*\]\]/gi, "")
-    .replace(/[ \t]*\[\[\s*(ja|en|ko|yue|zh)\s*[:：][^\[\]]*\]\]/gi, "")
+    .replace(/[ \t]*\[\[\s*(ja|en|ko|yue|zh|speech)\s*[:：][^\[\]]*\]\]/gi, "")
     .replace(/[ \t]*\[\[\s*(结束对话|结束|end[ _-]?(conversation|chat)?|跳过|skip)\s*\]\][ \t]*/gi, "")
     .replace(/\[\[[^\]]*$/, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+// ---------------- 字幕层 ----------------
+
+const SUB_STRIP = /[ \t]*\[\[\s*(字幕|subtitle|say)\s*[:：][^\[\]]*\]\](?:[ \t]*\[\[\s*(ja|en|ko|yue|zh|speech)\s*[:：][^\[\]]*\]\])?[ \t]*\n?/gi;
+const SUB_RE = /\[\[\s*(?:字幕|subtitle|say)\s*[:：]\s*([^\[\]]*?)\s*\]\](?:[ \t]*\[\[\s*(?:ja|en|ko|yue|zh|speech)\s*[:：]\s*([^\[\]]*?)\s*\]\])?/gi;
+
+/** 从流式原文里取出已写完的 [[字幕: …]]；配音模式下要等紧跟的 [[ja: …]] 也写完 */
+export function tagSubtitles(raw: string, final: boolean, layer: boolean): AssistantSubtitle[] {
+  const out: AssistantSubtitle[] = [];
+  for (const m of raw.matchAll(SUB_RE)) {
+    const text = m[1].trim();
+    if (!text) continue;
+    if (layer && !final && m[2] === undefined) {
+      const rest = raw.slice((m.index ?? 0) + m[0].length);
+      if (/^\s*(\[(\[[^\]]*)?)?$/.test(rest)) break;
+    }
+    out.push({ text, speech: (m[2] ?? "").trim() });
+  }
+  return out;
+}
+
+/** 本回合的配音设置（回合开始时取定） */
+let turnSpeech: { lang: string; layer: boolean } = { lang: "", layer: false };
+/** say 工具发来的字幕 */
+let toolSubs: AssistantSubtitle[] = [];
+
+/** 字幕 → 朗读原文：配音模式每条附 [[lang: …]]，没有配音版本的不读 */
+function subSpeech(subs: AssistantSubtitle[]): string {
+  const { lang, layer } = turnSpeech;
+  return subs.map((s) => (layer ? `${s.text}${s.speech ? ` [[${lang}: ${s.speech}]]` : ""}\n` : `${s.text}\n`)).join("");
+}
+
+export const subText = (subs: AssistantSubtitle[]) => subs.map((s) => s.text).join("\n");
+
+/** 合并工具字幕与标记字幕；有新字幕就送去朗读 */
+function syncSubs() {
+  const next = [...toolSubs, ...tagSubtitles(ga.streaming, false, turnSpeech.layer)];
+  if (next.length === ga.subs.length) return;
+  ga.subs = next;
+  feedSpeech(subSpeech(next), false);
+}
+
+/** 回合结束：补上最后的标记字幕；一条都没收到时改用后端给的（推导的），然后把朗读收尾 */
+function finishSubs(fallback: AssistantSubtitle[]) {
+  const streamed = [...toolSubs, ...tagSubtitles(ga.streaming, true, turnSpeech.layer)];
+  ga.subs = streamed.length ? streamed : fallback;
+  feedSpeech(subSpeech(ga.subs), true);
 }
 
 /** 把一条回复切成气泡页：按段落，超长段按句子再切；代码块整段保留 */
@@ -134,9 +185,10 @@ export function paginate(text: string, max = 110): string[] {
   return pages;
 }
 
-export function showBubble(text: string, error = "") {
-  ga.bubble = { visible: true, pages: text ? paginate(text) : [], index: 0, error, rev: ga.bubble.rev + 1 };
+export function showBubble(text: string, error = "", more = false) {
+  ga.bubble = { visible: true, pages: text ? paginate(text) : [], index: 0, error, rev: ga.bubble.rev + 1, more };
 }
+const blankBubble = () => ({ visible: true, pages: [] as string[], index: 0, error: "", rev: ga.bubble.rev + 1, more: false });
 export function hideBubble() {
   ga.bubble.visible = false;
 }
@@ -152,13 +204,16 @@ export async function initAssistant() {
       const p = e.payload;
       if (!p || !ga.turnId || p.turnId !== ga.turnId || ga.busy === "summarize") return;
       const u = p.update;
-      if (u?.sessionUpdate !== "agent_message_chunk" || u.content?.type !== "text" || typeof u.content.text !== "string") return;
-      ga.streaming += u.content.text;
-      feedSpeech(ga.streaming, false);
-      if (!opened && (!quietTurn || visibleText(ga.streaming))) {
+      if (u?.sessionUpdate === "assistant_subtitle" && typeof u.text === "string" && u.text.trim()) {
+        toolSubs = [...toolSubs, { text: u.text.trim(), speech: typeof u.speech === "string" ? u.speech.trim() : "" }];
+      } else if (u?.sessionUpdate === "agent_message_chunk" && u.content?.type === "text" && typeof u.content.text === "string") {
+        ga.streaming += u.content.text;
+      } else return;
+      syncSubs();
+      if (!opened && (!quietTurn || ga.subs.length || visibleText(ga.streaming))) {
         opened = true;
         emitSkinEvent("agent.streaming");
-        if (!ga.bubble.visible || ga.bubble.pages.length) ga.bubble = { visible: true, pages: [], index: 0, error: "", rev: ga.bubble.rev + 1 };
+        if (!ga.bubble.visible || ga.bubble.pages.length) ga.bubble = blankBubble();
       }
     });
   }
@@ -224,9 +279,13 @@ async function runTurn(kind: Busy, call: (turnId: string) => Promise<AssistantTu
   ga.turnId = turnId;
   ga.busy = kind;
   ga.streaming = "";
+  ga.subs = [];
+  toolSubs = [];
+  const sh = speechHint();
+  turnSpeech = { lang: sh?.lang ?? "", layer: !!sh?.layer };
   quietTurn = quiet;
   opened = false;
-  if (!quiet) ga.bubble = { visible: true, pages: [], index: 0, error: "", rev: ga.bubble.rev + 1 };
+  if (!quiet) ga.bubble = blankBubble();
   beginSpeech();
   try {
     const r = await call(turnId);
@@ -236,10 +295,12 @@ async function runTurn(kind: Busy, call: (turnId: string) => Promise<AssistantTu
       if (opened) hideBubble();
       return r;
     }
-    feedSpeech(ga.streaming || r.message?.content || "", true);
+    // 字幕以流式收到的为准（已在朗读）；一条都没收到时用后端解析 / 推导的
+    finishSubs(r.subtitles ?? []);
     if (r.message) {
       ga.messages = [...ga.messages, r.message].slice(-400);
-      showBubble(r.message.content);
+      if (ga.subs.length) showBubble(subText(ga.subs), "", !!r.has_body);
+      else showBubble(r.message.content);
     } else {
       showBubble("", t("（没有回复内容）"));
     }
@@ -263,15 +324,18 @@ async function runTurn(kind: Busy, call: (turnId: string) => Promise<AssistantTu
       return null;
     }
     if (String(e).includes("已停止") || String(e).toLowerCase().includes("cancel")) stopSpeaking();
-    else feedSpeech(ga.streaming, true);
-    const partial = visibleText(ga.streaming);
-    showBubble(partial, String(e));
+    else finishSubs([]);
+    const body = visibleText(ga.streaming);
+    const partial = ga.subs.length ? subText(ga.subs) : body;
+    showBubble(partial, String(e), !!ga.subs.length && !!body);
     emitSkinEvent("agent.error");
     return null;
   } finally {
     if (ga.turnId === turnId) {
       ga.busy = "";
       ga.streaming = "";
+      ga.subs = [];
+      toolSubs = [];
       quietTurn = false;
       void refreshView();
     }
@@ -320,7 +384,7 @@ export async function cancel() {
 export async function resetSession() {
   if (ga.busy) { toast("warn", t("助手正在回复中，请先停止")); return; }
   ga.busy = "reset";
-  ga.bubble = { visible: true, pages: [], index: 0, error: "", rev: ga.bubble.rev + 1 };
+  ga.bubble = blankBubble();
   try {
     ga.view = await api.assistantSessionReset();
   } catch (e) {
@@ -356,7 +420,7 @@ export async function summarize(mode: "consolidate" | "extract"): Promise<number
 
 /** 已发出、还没收到任何文字 */
 export function isThinking() {
-  return (ga.busy === "send" || ga.busy === "greet" || ga.busy === "care" || ga.busy === "reset") && !ga.streaming;
+  return (ga.busy === "send" || ga.busy === "greet" || ga.busy === "care" || ga.busy === "reset") && !ga.streaming && !ga.subs.length;
 }
 
 /** 点击人物 / 语音唤起：打开输入框 */

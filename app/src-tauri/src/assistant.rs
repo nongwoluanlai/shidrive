@@ -7,12 +7,15 @@
 //! - 记忆点由模型在回复末尾用 `[[记忆: …]]` / `[[忘记: …]]` 标出，这里解析落库并从展示文本中剥掉；
 //!   另有「整理记忆」「从最近对话提炼」两个摘要动作。
 //! - 人设来自前端（跟随皮肤看板角色或用户自定义），每轮随请求传入，变化时自动重新注入。
+//! - 回复分两层：正文（完整回答，进对话记录）+ 字幕（角色说出口的短句，显示在气泡里、开启语音时朗读）。
+//!   API 模式用 `say` 工具（function calling）实时给出字幕，接口不支持工具时自动改用 `[[字幕: …]]` 标记；
+//!   ACP 模式用标记。没给字幕时从正文第一句推导一条。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use rusqlite::params;
@@ -30,6 +33,10 @@ const EVT_UPDATE: &str = "acp://assistant-update";
 const MAX_MEMORY_LEN: usize = 200;
 const MAX_MEMORIES: i64 = 300;
 const MAX_MESSAGES: i64 = 2000;
+/// 设定版本：规则有变化时让已有 ACP 长期会话重新注入设定
+const PROMPT_REV: &str = "r13";
+/// 单条字幕的长度上限（字）
+const MAX_SUBTITLE_LEN: usize = 120;
 
 type DbState<'a> = State<'a, Arc<Db>>;
 type AgentsState<'a> = State<'a, Arc<AgentManager>>;
@@ -405,12 +412,119 @@ pub fn extract_flags(text: &str) -> (String, bool, bool) {
 /// 解析「- 条目」列表（整理 / 提炼记忆的输出）
 pub fn parse_bullets(text: &str) -> Vec<String> {
     let (text, _, _) = extract_directives(text);
+    let (text, _) = extract_subtitles(&text);
     text.lines()
         .map(str::trim)
         .filter(|l| l.starts_with("- ") || l.starts_with("* ") || l.starts_with("• "))
         .map(norm_memory)
         .filter(|l| l.chars().count() >= 2 && l != "无" && !l.eq_ignore_ascii_case("none"))
         .collect()
+}
+
+// ---------------------------------------------------------------- subtitles（字幕层）
+
+/// 字幕的产生方式
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SubMode {
+    /// API：`say` 工具（function calling）
+    Tool,
+    /// `[[字幕: …]]` 标记（ACP / 不支持工具的接口）
+    Tag,
+    /// 不要字幕（整理记忆等后台任务）
+    Off,
+}
+
+/// 一条字幕：text = 显示（界面语言），speech = 配音语言版本（角色语音与显示语言不同时）
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct Subtitle {
+    pub text: String,
+    pub speech: String,
+    /// 模型没给字幕，从正文推导的
+    pub derived: bool,
+}
+
+fn clean_sub(s: &str) -> String {
+    let t: String = s.replace('[', "［").replace(']', "］").split_whitespace().collect::<Vec<_>>().join(" ");
+    cap_chars(t.trim(), MAX_SUBTITLE_LEN)
+}
+
+fn sub_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)[ \t]*\[\[\s*(?:字幕|subtitle|say)\s*[:：]\s*([^\[\]]*?)\s*\]\](?:[ \t]*\[\[\s*(?:ja|en|ko|yue|zh|speech)\s*[:：]\s*([^\[\]]*?)\s*\]\])?[ \t]*\n?").unwrap()
+    })
+}
+
+/// 剥出 `[[字幕: …]]`（可紧跟一个配音标记 `[[ja: …]]`），返回 (正文, 字幕)
+pub fn extract_subtitles(text: &str) -> (String, Vec<Subtitle>) {
+    let re = sub_re();
+    let mut subs = Vec::new();
+    for cap in re.captures_iter(text) {
+        let t = clean_sub(&cap[1]);
+        if t.is_empty() { continue; }
+        let speech = cap.get(2).map(|m| clean_sub(m.as_str())).unwrap_or_default();
+        subs.push(Subtitle { text: t, speech, derived: false });
+    }
+    if subs.is_empty() && !re.is_match(text) { return (text.to_string(), subs); }
+    let out = re.replace_all(text, "").to_string();
+    let mut out = out.trim().to_string();
+    while out.contains("\n\n\n") { out = out.replace("\n\n\n", "\n\n"); }
+    (out, subs)
+}
+
+/// 工具给出的字幕编码成标记拼在回复前面，和标记协议走同一套解析
+fn encode_subtitles(subs: &[Subtitle]) -> String {
+    subs.iter()
+        .map(|s| if s.speech.is_empty() { format!("[[字幕: {}]]\n", s.text) } else { format!("[[字幕: {}]][[speech: {}]]\n", s.text, s.speech) })
+        .collect()
+}
+
+/// 模型没给字幕：取正文第一句（去掉代码块与 Markdown 记号，过长截断）
+pub fn derive_subtitle(body: &str) -> String {
+    static CODE: OnceLock<regex::Regex> = OnceLock::new();
+    static LINK: OnceLock<regex::Regex> = OnceLock::new();
+    static MARK: OnceLock<regex::Regex> = OnceLock::new();
+    let code = CODE.get_or_init(|| regex::Regex::new(r"(?s)```.*?(```|$)").unwrap());
+    let link = LINK.get_or_init(|| regex::Regex::new(r"!?\[([^\]]*)\]\([^)]*\)").unwrap());
+    let mark = MARK.get_or_init(|| regex::Regex::new(r"[*_`~]+|https?://\S+").unwrap());
+    let s = code.replace_all(body, "\n");
+    let line = s
+        .lines()
+        .map(|l| l.trim().trim_start_matches(|c: char| "#>-*+|".contains(c) || c.is_whitespace()))
+        .find(|l| l.chars().any(char::is_alphanumeric))
+        .unwrap_or("");
+    let line = link.replace_all(line, "$1");
+    let line = mark.replace_all(&line, "");
+    let chars: Vec<char> = line.trim().chars().collect();
+    let mut out = String::new();
+    const ENDS: &str = "。！？!?…";
+    for (i, ch) in chars.iter().enumerate() {
+        out.push(*ch);
+        if ENDS.contains(*ch) && i >= 6 {
+            // 连着的句末标点（……、？！）一并带上
+            out.extend(chars[i + 1..].iter().take_while(|c| ENDS.contains(**c)));
+            break;
+        }
+        if i + 1 >= 48 && i + 1 < chars.len() { out.push('…'); break; }
+    }
+    clean_sub(&out)
+}
+
+fn tools_key(api: &ApiConfig) -> String {
+    format!("{}|{}", api.base_url.trim().trim_end_matches('/'), api.model.trim())
+}
+
+/// 不支持工具调用的接口（运行期记住，重启后再试）
+fn no_tools() -> &'static Mutex<HashSet<String>> {
+    static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// 接口明确拒绝了 tools 参数
+fn tools_rejected(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    ["接口返回 http 400", "接口返回 http 404", "接口返回 http 405", "接口返回 http 422", "接口返回 http 501"].iter().any(|p| e.starts_with(p))
+        && (e.contains("tool") || e.contains("function"))
 }
 
 // ---------------------------------------------------------------- prompt building
@@ -449,7 +563,7 @@ fn recap_block(history: &[AssistantMessage], name: &str) -> String {
 }
 
 /// 设定块：人设 + 规则 + 长期记忆（ACP 首轮 / API 每轮的 system）
-pub fn system_prompt(p: &Persona, mems: &[AssistantMemory], cfg: &AssistantConfig) -> String {
+pub fn system_prompt(p: &Persona, mems: &[AssistantMemory], cfg: &AssistantConfig, sub: SubMode) -> String {
     let name = p.display_name();
     let persona = if p.persona.trim().is_empty() {
         "简洁、友好、靠谱的开发伙伴；先给结论，少说套话。".to_string()
@@ -460,10 +574,11 @@ pub fn system_prompt(p: &Persona, mems: &[AssistantMemory], cfg: &AssistantConfi
         "[使驾全局助手 · 设定]\n你是「{name}」，在使驾（ShiDrive，桌面 AI 开发工作台）里作为全局助手陪伴用户，可以闲聊，也可以回答开发与使用问题。\n\
 人设与说话风格：\n{persona}\n\n规则：\n\
 - {}\n\
-- 回复会显示在桌面角色旁的对话气泡里：像聊天一样自然简短，一般 1~4 句；用户需要时再展开，可用 Markdown。\n\
+{}\
 - 始终保持人设口吻，但信息要准确；不确定就直说，不编造。\n\
 - 这里是独立的助手会话，不是项目里的编程会话；除非用户明确要求，不要主动改动文件或执行命令。\n",
-        lang_line(p)
+        lang_line(p),
+        layer_rule(sub)
     );
     if cfg.auto_memory {
         s.push_str("- 对话中出现值得长期记住的信息（用户的称呼、偏好、身份、长期目标、约定、重要事实）时，在回复最后单独一行写 [[记忆: 一句话摘要]]，可多条、每条一行；没有就不写。普通闲聊和一次性任务细节不要记。用户要求忘掉某事时写 [[忘记: 关键词]]。这些标记不会展示给用户。\n");
@@ -472,6 +587,21 @@ pub fn system_prompt(p: &Persona, mems: &[AssistantMemory], cfg: &AssistantConfi
     s.push_str(&memory_block(mems, cfg.memory_limit));
     s
 }
+
+const TWO_LAYER_RULE: &str = "- 你的回复分两层：①「正文」是完整回答，存进对话记录、显示在对话面板里，可用 Markdown / 代码块，详略按需要；\
+②「字幕」是你这个角色此刻说出口的话，显示在桌面角色旁的气泡里（开启语音时会被朗读）。字幕要口语、简短：每条一句、不超过 30 字，一般 1~3 条，\
+说出你想对用户讲的重点或情绪，不放代码、路径、链接和列表；不要在正文里重复字幕。\n";
+
+fn layer_rule(sub: SubMode) -> String {
+    match sub {
+        SubMode::Tool => format!("{TWO_LAYER_RULE}- 用 say 工具说字幕：先调用 say 说第一句（越快越好），再写正文。闲聊、打招呼这类简短回复可以只调用 say、不写正文。\n"),
+        SubMode::Tag => format!("{TWO_LAYER_RULE}- 字幕写成单独一行的 [[字幕: …]]，放在回复最开头（可写多条，每条一行），正文接在后面。闲聊、打招呼这类简短回复可以只写字幕。字幕标记不会原样显示。\n"),
+        SubMode::Off => "- 回复会显示在桌面角色旁的对话气泡里：像聊天一样自然简短，一般 1~4 句；用户需要时再展开，可用 Markdown。\n".into(),
+    }
+}
+
+/// ACP 每轮附带的格式提醒（设定只在首轮注入，长对话里容易忘）
+const TAG_REMINDER: &str = "[输出格式] 先写 1~3 行 [[字幕: …]]（你说出口的简短台词），再写正文；简短闲聊可以只写字幕。";
 
 fn state_line(app_state: Option<&str>, cfg: &AssistantConfig) -> String {
     let t = chrono::Local::now().format("%Y-%m-%d %H:%M %a").to_string();
@@ -511,14 +641,41 @@ const CONVERSATION_RULE: &str = "[连续语音对话中] 用户正用语音和�
 请根据对话氛围判断要不要结束：用户道别、说「好了 / 没事了 / 先这样 / 谢谢」、明显要去忙，或话题已经自然收尾、再追问会显得啰嗦时，\
 用一句简短的话收尾，并在回复最后单独一行写 [[结束对话]]（之后就不再听）；还想继续聊就不写，结尾可以自然留个话头。这个标记不会展示给用户，也不要提起它。";
 
-pub fn speech_rule(h: Option<&SpeechHint>) -> Option<String> {
+pub fn speech_rule(h: Option<&SpeechHint>, sub: SubMode) -> Option<String> {
     let h = h?;
-    let voice = voice_rule(h);
+    let voice = match sub {
+        SubMode::Off => voice_rule(h),
+        _ => subtitle_voice_rule(h, sub),
+    };
     if !h.conversation { return voice; }
     Some(match voice {
         Some(v) => format!("{v}\n{CONVERSATION_RULE}"),
         None => CONVERSATION_RULE.to_string(),
     })
+}
+
+/// 配音语言（角色语音与显示语言不同时）
+fn speech_layer_lang(h: Option<&SpeechHint>) -> Option<String> {
+    let h = h?;
+    (h.enabled && h.layer && valid_speech_lang(&h.lang)).then(|| h.lang.clone())
+}
+
+/// 两层输出下的语音规则：只朗读字幕，正文不朗读
+fn subtitle_voice_rule(h: &SpeechHint, sub: SubMode) -> Option<String> {
+    if !h.enabled { return None; }
+    if let Some(tag) = speech_layer_lang(Some(h)) {
+        let ln = speech_lang_name(&tag);
+        let how = if sub == SubMode::Tool {
+            format!("每次调用 say 都要在 speech 参数里给出这句字幕的{ln}版本")
+        } else {
+            format!("每条字幕后紧跟它的{ln}版本，格式 [[字幕: 显示的字幕]][[{tag}: …]]")
+        };
+        return Some(format!(
+            "[语音输出已开启 · {ln}配音] 字幕会用角色的{ln}原声朗读（正文不朗读）。{how}：只放{ln}，口吻符合角色，数字、英文缩写写成{ln}读法；\
+每条字幕不超过 20 字，第一条尽快给出。这些标记不会显示给用户，也不要解释它们。"
+        ));
+    }
+    Some("[语音输出已开启] 字幕会被朗读（正文不朗读）：字幕用自然口语的短句（每条不超过 20 字，英文不超过 12 个词），第一条尽快给出；字幕里不要放 Markdown、表情符号和代码。".to_string())
 }
 
 fn voice_rule(h: &SpeechHint) -> Option<String> {
@@ -539,7 +696,7 @@ fn voice_rule(h: &SpeechHint) -> Option<String> {
 
 /// 去掉配音标记 `[[ja: …]]`（存库与展示只保留正文）
 pub fn strip_speech_tags(text: &str) -> String {
-    let re = regex::Regex::new(r"(?i)[ \t]*\[\[\s*(ja|en|ko|yue|zh)\s*[:：][^\[\]]*\]\]").unwrap();
+    let re = regex::Regex::new(r"(?i)[ \t]*\[\[\s*(ja|en|ko|yue|zh|speech)\s*[:：][^\[\]]*\]\]").unwrap();
     let out = re.replace_all(text, "").to_string();
     let mut lines: Vec<&str> = out.lines().map(|l| l.trim_end()).collect();
     while lines.last().is_some_and(|l| l.trim().is_empty()) { lines.pop(); }
@@ -691,42 +848,171 @@ fn emit_chunk(app: &AppHandle, session: &str, turn: &str, text: &str) {
     }));
 }
 
-/// OpenAI 兼容 /chat/completions（优先流式；服务端不支持流式时按普通 JSON 解析）
-fn api_chat(app: &AppHandle, api: &ApiConfig, messages: Vec<Value>, session: &str, turn: &str, cancel: &AtomicBool) -> Result<String, String> {
-    let url = chat_url(&api.base_url)?;
-    if api.model.is_empty() { return Err("请先在设置中填写模型名称".into()); }
-    let mut body = json!({ "model": api.model, "messages": messages, "stream": true });
-    if let Some(t) = api.temperature { body["temperature"] = json!(t); }
-    let mut req = http_agent().post(&url).set("Content-Type", "application/json").set("Accept", "text/event-stream, application/json");
-    if !api.api_key.is_empty() { req = req.set("Authorization", &format!("Bearer {}", api.api_key)); }
-    let resp = req.send_string(&body.to_string()).map_err(http_err)?;
-    let ct = resp.header("content-type").unwrap_or("").to_ascii_lowercase();
-    let mut out = String::new();
-    if !ct.contains("event-stream") {
-        let v: Value = serde_json::from_reader(resp.into_reader()).map_err(|e| format!("接口返回无法解析：{e}"))?;
-        if let Some(e) = v.get("error") { return Err(format!("接口错误：{}", cap_chars(&e.to_string(), 400))); }
-        out = v.pointer("/choices/0/message/content").and_then(Value::as_str).unwrap_or_default().to_string();
-        if !out.is_empty() { emit_chunk(app, session, turn, &out); }
-        return Ok(out);
+fn emit_subtitle(app: &AppHandle, session: &str, turn: &str, sub: &Subtitle) {
+    let _ = app.emit(EVT_UPDATE, json!({
+        "source": "assistant", "sessionId": session, "turnId": turn,
+        "update": { "sessionUpdate": "assistant_subtitle", "text": sub.text, "speech": sub.speech }
+    }));
+}
+
+/// `say` 工具定义；`speech_lang` = 需要配音版本时的语言
+fn say_tool(speech_lang: Option<&str>) -> Value {
+    let mut props = json!({
+        "text": { "type": "string", "description": "字幕：你此刻说出口的一句话（用户的语言，口语、简短，不超过 30 字）" }
+    });
+    let mut required = vec!["text"];
+    if let Some(l) = speech_lang {
+        props["speech"] = json!({ "type": "string", "description": format!("这句字幕的{}版本，用角色原声朗读", speech_lang_name(l)) });
+        required.push("speech");
     }
-    let reader = BufReader::new(resp.into_reader());
-    for line in reader.lines() {
-        if cancel.load(Ordering::SeqCst) { return Err(format!("{ASSISTANT_CANCELLED}{out}")); }
-        let line = line.map_err(|e| format!("读取接口流失败：{e}"))?;
-        let Some(data) = line.trim().strip_prefix("data:") else { continue };
-        let data = data.trim();
-        if data == "[DONE]" { break; }
-        let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
-        if let Some(e) = v.get("error") { return Err(format!("接口错误：{}", cap_chars(&e.to_string(), 400))); }
-        if let Some(d) = v.pointer("/choices/0/delta/content").and_then(Value::as_str) {
-            if !d.is_empty() {
-                out.push_str(d);
-                emit_chunk(app, session, turn, d);
-            }
+    json!([{
+        "type": "function",
+        "function": {
+            "name": "say",
+            "description": "在桌面角色旁的气泡里显示一句字幕（开启语音时会朗读）。可以多次调用，每次一句。完整回答请直接写在回复正文里。",
+            "parameters": { "type": "object", "properties": props, "required": required }
+        }
+    }])
+}
+
+#[derive(Default, Debug)]
+struct ToolCall {
+    id: String,
+    name: String,
+    args: String,
+    done: bool,
+}
+
+/// 解析 say 的参数；参数还没收全（JSON 不完整）时返回 None
+fn parse_say(args: &str) -> Option<Subtitle> {
+    let v: Value = serde_json::from_str(args.trim()).ok()?;
+    let text = clean_sub(v.get("text").and_then(Value::as_str).unwrap_or_default());
+    if text.is_empty() { return None; }
+    let speech = clean_sub(v.get("speech").and_then(Value::as_str).unwrap_or_default());
+    Some(Subtitle { text, speech, derived: false })
+}
+
+/// 一轮接口调用的上下文
+struct ApiCtx<'a> {
+    app: &'a AppHandle,
+    api: &'a ApiConfig,
+    session: &'a str,
+    turn: &'a str,
+    cancel: &'a AtomicBool,
+}
+
+impl ApiCtx<'_> {
+    /// 收到完整的 say 调用：立刻发给前端显示 / 朗读
+    fn take_call(&self, c: &mut ToolCall, subs: &mut Vec<Subtitle>) {
+        if c.done || c.name != "say" { return; }
+        if let Some(sub) = parse_say(&c.args) {
+            c.done = true;
+            emit_subtitle(self.app, self.session, self.turn, &sub);
+            subs.push(sub);
         }
     }
-    if cancel.load(Ordering::SeqCst) { return Err(format!("{ASSISTANT_CANCELLED}{out}")); }
-    Ok(out)
+
+    /// 发一次 /chat/completions，正文增量写入 `content`，工具调用实时解析；返回本次的工具调用
+    fn round(&self, messages: &[Value], tools: Option<&Value>, no_more_tools: bool, content: &mut String, subs: &mut Vec<Subtitle>) -> Result<Vec<ToolCall>, String> {
+        let url = chat_url(&self.api.base_url)?;
+        let mut body = json!({ "model": self.api.model, "messages": messages, "stream": true });
+        if let Some(t) = self.api.temperature { body["temperature"] = json!(t); }
+        if let Some(t) = tools {
+            body["tools"] = t.clone();
+            if no_more_tools { body["tool_choice"] = json!("none"); }
+        }
+        let mut req = http_agent().post(&url).set("Content-Type", "application/json").set("Accept", "text/event-stream, application/json");
+        if !self.api.api_key.is_empty() { req = req.set("Authorization", &format!("Bearer {}", self.api.api_key)); }
+        let resp = req.send_string(&body.to_string()).map_err(http_err)?;
+        let ct = resp.header("content-type").unwrap_or("").to_ascii_lowercase();
+        let mut calls: Vec<ToolCall> = Vec::new();
+        if !ct.contains("event-stream") {
+            let v: Value = serde_json::from_reader(resp.into_reader()).map_err(|e| format!("接口返回无法解析：{e}"))?;
+            if let Some(e) = v.get("error") { return Err(format!("接口错误：{}", cap_chars(&e.to_string(), 400))); }
+            for (i, tc) in v.pointer("/choices/0/message/tool_calls").and_then(Value::as_array).cloned().unwrap_or_default().iter().enumerate() {
+                let mut c = ToolCall {
+                    id: tc.get("id").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("call_{i}")),
+                    name: tc.pointer("/function/name").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    args: tc.pointer("/function/arguments").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    done: false,
+                };
+                self.take_call(&mut c, subs);
+                calls.push(c);
+            }
+            let out = v.pointer("/choices/0/message/content").and_then(Value::as_str).unwrap_or_default();
+            if !out.is_empty() {
+                content.push_str(out);
+                emit_chunk(self.app, self.session, self.turn, out);
+            }
+            return Ok(calls);
+        }
+        let reader = BufReader::new(resp.into_reader());
+        for line in reader.lines() {
+            if self.cancel.load(Ordering::SeqCst) { return Err(ASSISTANT_CANCELLED.into()); }
+            let line = line.map_err(|e| format!("读取接口流失败：{e}"))?;
+            let Some(data) = line.trim().strip_prefix("data:") else { continue };
+            let data = data.trim();
+            if data == "[DONE]" { break; }
+            let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
+            if let Some(e) = v.get("error") { return Err(format!("接口错误：{}", cap_chars(&e.to_string(), 400))); }
+            if let Some(d) = v.pointer("/choices/0/delta/content").and_then(Value::as_str) {
+                if !d.is_empty() {
+                    content.push_str(d);
+                    emit_chunk(self.app, self.session, self.turn, d);
+                }
+            }
+            for tc in v.pointer("/choices/0/delta/tool_calls").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default() {
+                let idx = tc.get("index").and_then(Value::as_u64).map(|i| i as usize).unwrap_or(calls.len().saturating_sub(1));
+                while calls.len() <= idx { calls.push(ToolCall { id: format!("call_{}", calls.len()), ..Default::default() }); }
+                let c = &mut calls[idx];
+                if let Some(id) = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) { c.id = id.to_string(); }
+                if let Some(n) = tc.pointer("/function/name").and_then(Value::as_str) { c.name.push_str(n); }
+                if let Some(a) = tc.pointer("/function/arguments").and_then(Value::as_str) { c.args.push_str(a); }
+                self.take_call(c, subs);
+            }
+        }
+        if self.cancel.load(Ordering::SeqCst) { return Err(ASSISTANT_CANCELLED.into()); }
+        for c in calls.iter_mut() { self.take_call(c, subs); }
+        Ok(calls)
+    }
+}
+
+/// OpenAI 兼容 /chat/completions（优先流式；服务端不支持流式时按普通 JSON 解析）。
+/// `tools` = say 工具：模型先调 say 给字幕、再写正文；只调了 say 没写正文时带上工具结果再请求一次（最多 3 轮）。
+/// 接口拒绝 tools 参数时换成 `tag_sys`（标记协议的设定）重试，并记住这个接口。
+/// 返回的文本 = 工具字幕（编码成标记）+ 正文。
+fn api_chat(ctx: &ApiCtx, mut messages: Vec<Value>, mut tools: Option<Value>, tag_sys: Option<String>) -> Result<String, String> {
+    if ctx.api.model.is_empty() { return Err("请先在设置中填写模型名称".into()); }
+    let mut content = String::new();
+    let mut subs: Vec<Subtitle> = Vec::new();
+    let partial = |subs: &[Subtitle], content: &str| format!("{ASSISTANT_CANCELLED}{}{content}", encode_subtitles(subs));
+    let max_rounds = 3;
+    let mut round = 0;
+    while round < max_rounds {
+        let last = round + 1 == max_rounds;
+        let calls = match ctx.round(&messages, tools.as_ref(), last && round > 0, &mut content, &mut subs) {
+            Ok(c) => c,
+            Err(e) if e.starts_with(ASSISTANT_CANCELLED) => return Err(partial(&subs, &content)),
+            Err(e) if round == 0 && tools.is_some() && subs.is_empty() && content.is_empty() && tools_rejected(&e) => {
+                log::warn!("[assistant] 接口不支持工具调用，字幕改用标记：{e}");
+                no_tools().lock().unwrap().insert(tools_key(ctx.api));
+                tools = None;
+                if let (Some(sys), Some(first)) = (tag_sys.as_ref(), messages.first_mut()) { first["content"] = json!(sys); }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        round += 1;
+        if tools.is_none() || calls.is_empty() || !content.trim().is_empty() { break; }
+        // 只说了字幕：把工具调用和结果补进上下文，让模型接着写正文（也可以什么都不写）
+        let tc: Vec<Value> = calls.iter().map(|c| json!({ "id": c.id, "type": "function", "function": { "name": c.name, "arguments": c.args } })).collect();
+        messages.push(json!({ "role": "assistant", "content": Value::Null, "tool_calls": tc }));
+        for c in &calls {
+            let r = if c.name == "say" { if c.done { "已显示" } else { "参数无效，需要 text" } } else { "没有这个工具" };
+            messages.push(json!({ "role": "tool", "tool_call_id": c.id, "content": r }));
+        }
+    }
+    Ok(format!("{}{content}", encode_subtitles(&subs)))
 }
 
 /// 执行一轮：组装提示词 → 发给 ACP / API → 返回原始回复文本（含指令标记）。
@@ -734,9 +1020,8 @@ fn api_chat(app: &AppHandle, api: &ApiConfig, messages: Vec<Value>, session: &st
 async fn run_turn(
     app: &AppHandle, db: &Arc<Db>, agents: &AgentManager, rt: &AssistantRuntime,
     cfg: &AssistantConfig, persona: &Persona, app_state: Option<&str>, turn: Turn<'_>,
-    turn_id: &str, cancel: Arc<AtomicBool>, speech: Option<&SpeechHint>,
+    turn_id: &str, cancel: Arc<AtomicBool>, speech: Option<&SpeechHint>, subtitles: bool,
 ) -> Result<String, String> {
-    let speech_line = speech_rule(speech);
     let mems = list_memories(db)?;
     let name = persona.display_name().to_string();
     let body = match &turn {
@@ -745,8 +1030,18 @@ async fn run_turn(
     };
     if cfg.provider == "api" {
         let st = ensure_api_session(db)?;
-        let mut sys = format!("{}\n\n{}", system_prompt(persona, &mems, cfg), state_line(app_state, cfg));
-        if let Some(l) = &speech_line { sys.push_str("\n"); sys.push_str(l); }
+        let sub = if !subtitles { SubMode::Off } else if no_tools().lock().unwrap().contains(&tools_key(&cfg.api)) { SubMode::Tag } else { SubMode::Tool };
+        let build_sys = |sub: SubMode| {
+            let mut sys = format!("{}\n\n{}", system_prompt(persona, &mems, cfg, sub), state_line(app_state, cfg));
+            if let Some(l) = speech_rule(speech, sub) { sys.push('\n'); sys.push_str(&l); }
+            sys
+        };
+        let sys = build_sys(sub);
+        let (tools, tag_sys) = if sub == SubMode::Tool {
+            (Some(say_tool(speech_layer_lang(speech).as_deref())), Some(build_sys(SubMode::Tag)))
+        } else {
+            (None, None)
+        };
         let mut messages = vec![json!({ "role": "system", "content": sys })];
         // 本轮用户消息已先入库：历史里排除最后一条（就是它）
         let mut hist = recent_messages(db, cfg.history_turns + 1)?;
@@ -760,22 +1055,27 @@ async fn run_turn(
         let app2 = app.clone();
         let sid = st.session_id.clone();
         let tid = turn_id.to_string();
-        return tokio::task::spawn_blocking(move || api_chat(&app2, &api, messages, &sid, &tid, &cancel))
+        return tokio::task::spawn_blocking(move || {
+            let ctx = ApiCtx { app: &app2, api: &api, session: &sid, turn: &tid, cancel: &cancel };
+            api_chat(&ctx, messages, tools, tag_sys)
+        })
             .await
             .map_err(|e| format!("接口任务异常：{e}"))?;
     }
     let (sid, cwd) = ensure_acp_session(db, agents, rt, cfg).await?;
     let st = load_state(db);
-    let primed_key = format!("{sid}|{}|{}", persona.key(), st.memory_version);
+    // 人设 + 设定版本：任一变化都整份重新注入
+    let pkey = format!("{}-{PROMPT_REV}", persona.key());
+    let primed_key = format!("{sid}|{pkey}|{}", st.memory_version);
     let mut text = String::new();
     if st.primed_key != primed_key {
-        let same_session_and_persona = st.primed_key.starts_with(&format!("{sid}|{}|", persona.key()));
+        let same_session_and_persona = st.primed_key.starts_with(&format!("{sid}|{pkey}|"));
         if same_session_and_persona {
             // 只是记忆有变化（用户在面板里改了）：补发最新记忆
             text.push_str("[长期记忆已更新]\n");
             text.push_str(&memory_block(&mems, cfg.memory_limit));
         } else {
-            text.push_str(&system_prompt(persona, &mems, cfg));
+            text.push_str(&system_prompt(persona, &mems, cfg, SubMode::Tag));
             let mut hist = recent_messages(db, cfg.history_turns + 1)?;
             if matches!(turn, Turn::User(_)) && hist.last().is_some_and(|m| m.role == "user") { hist.pop(); }
             if !hist.is_empty() && cfg.history_turns > 0 {
@@ -787,7 +1087,9 @@ async fn run_turn(
         text.push_str("\n\n");
     }
     text.push_str(&state_line(app_state, cfg));
-    if let Some(l) = &speech_line { text.push('\n'); text.push_str(l); }
+    let sub = if subtitles { SubMode::Tag } else { SubMode::Off };
+    if subtitles { text.push('\n'); text.push_str(TAG_REMINDER); }
+    if let Some(l) = speech_rule(speech, sub) { text.push('\n'); text.push_str(&l); }
     text.push_str("\n\n");
     match &turn {
         Turn::User(t) => { text.push_str("[用户消息]\n"); text.push_str(t); }
@@ -797,7 +1099,7 @@ async fn run_turn(
     // 只要请求已送达（成功或被停止）就视为设定已注入
     if r.is_ok() || r.as_ref().err().is_some_and(|e| e.starts_with(ASSISTANT_CANCELLED)) {
         let mut st = load_state(db);
-        st.primed_key = format!("{sid}|{}|{}", persona.key(), st.memory_version);
+        st.primed_key = format!("{sid}|{pkey}|{}", st.memory_version);
         let _ = save_state(db, &st);
     }
     r
@@ -812,6 +1114,10 @@ pub struct TurnResult {
     pub end_conversation: bool,
     /// 主动关怀：助手选择这次不打扰（没有消息）
     pub skipped: bool,
+    /// 字幕层：气泡里显示 / 朗读的短句（模型没给时从正文推导一条）
+    pub subtitles: Vec<Subtitle>,
+    /// 有字幕之外的正文（气泡里提示「查看完整回复」）
+    pub has_body: bool,
 }
 
 /// 处理回复：剥指令、落记忆、存消息
@@ -829,10 +1135,19 @@ fn finish_reply_ext(db: &Db, cfg: &AssistantConfig, raw: Result<String, String>,
     let (raw, end_conversation, skip) = extract_flags(&raw);
     let skipped = care && skip;
     if skipped {
-        return Ok(TurnResult { message: None, memories_added: 0, memories_forgotten: 0, end_conversation: false, skipped: true });
+        return Ok(TurnResult { message: None, memories_added: 0, memories_forgotten: 0, end_conversation: false, skipped: true, subtitles: Vec::new(), has_body: false });
     }
     let (clean, remember, forget) = extract_directives(&raw);
-    let clean = strip_speech_tags(&clean);
+    let (body, mut subtitles) = extract_subtitles(&clean);
+    let body = strip_speech_tags(&body);
+    if subtitles.is_empty() && !body.trim().is_empty() {
+        let d = derive_subtitle(&body);
+        if !d.is_empty() { subtitles.push(Subtitle { text: d, speech: String::new(), derived: true }); }
+    }
+    let sub_text = subtitles.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join("\n");
+    let has_body = !body.trim().is_empty() && body.trim() != sub_text.trim();
+    // 只有字幕（闲聊）：字幕就是这条记录
+    let clean = if body.trim().is_empty() { sub_text } else { body };
     let mut added = 0;
     let mut forgotten = 0;
     if !interrupted {
@@ -852,7 +1167,7 @@ fn finish_reply_ext(db: &Db, cfg: &AssistantConfig, raw: Result<String, String>,
         if greeting { flags.push("greeting"); }
         Some(insert_message(db, "assistant", &clean, &cfg.provider, &flags)?)
     };
-    Ok(TurnResult { message, memories_added: added, memories_forgotten: forgotten, end_conversation, skipped: false })
+    Ok(TurnResult { message, memories_added: added, memories_forgotten: forgotten, end_conversation, skipped: false, subtitles, has_body })
 }
 
 /// 回合已送达（成功或被停止）：当前会话视为已问候，之后不再自动打招呼
@@ -932,7 +1247,7 @@ pub async fn assistant_send(
     let (_g, cancel) = acquire(&rt, &turn_id)?;
     let db = db.inner().clone();
     insert_message(&db, "user", &text, &cfg.provider, &[])?;
-    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::User(&text), &turn_id, cancel, speech.as_ref()).await;
+    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::User(&text), &turn_id, cancel, speech.as_ref(), true).await;
     mark_greeted(&db, &raw);
     finish_reply(&db, &cfg, raw, false)
 }
@@ -947,13 +1262,13 @@ pub async fn assistant_greet(
     let (_g, cancel) = acquire(&rt, &turn_id)?;
     let db = db.inner().clone();
     let mut ev = match reason.as_deref() {
-        Some("resume") => "[系统事件] 用户刚打开使驾，请用人设简短地打个招呼（1~2 句），可自然地接上你记得的事情；不要自我介绍功能清单。".to_string(),
-        _ => "[系统事件] 这是一个新的长期会话：用户刚启用或新建了你。请用人设向用户打招呼并简单自我介绍（1~3 句），如果长期记忆里有相关内容可以自然提起。".to_string(),
+        Some("resume") => "[系统事件] 用户刚打开使驾，请用人设简短地打个招呼（1~2 句，只说字幕、不用写正文），可自然地接上你记得的事情；不要自我介绍功能清单。".to_string(),
+        _ => "[系统事件] 这是一个新的长期会话：用户刚启用或新建了你。请用人设向用户打招呼并简单自我介绍（1~3 句，只说字幕、不用写正文），如果长期记忆里有相关内容可以自然提起。".to_string(),
     };
     if !persona.greeting.trim().is_empty() {
         ev.push_str(&format!("\n参考开场白风格（不必照抄）：{}", persona.greeting.trim()));
     }
-    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(ev), &turn_id, cancel, speech.as_ref()).await;
+    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(ev), &turn_id, cancel, speech.as_ref(), true).await;
     mark_greeted(&db, &raw);
     finish_reply(&db, &cfg, raw, true)
 }
@@ -964,7 +1279,7 @@ pub fn care_event(context: &str) -> String {
     format!(
         "[系统事件 · 主动关怀] 这次不是用户在找你：用户此刻没在忙，你想主动搭句话。下面是你注意到的情况（挑最值得说的一点就好，不要逐条复述）：\n{ctx}\n\n\
 怎么说：\n\
-- 像身边熟悉的朋友 / 搭档随口一句，保持你的人设口吻；1~2 句，总共不超过 50 字。\n\
+- 像身边熟悉的朋友 / 搭档随口一句，保持你的人设口吻；1~2 句，总共不超过 50 字，只说字幕、不用写正文。\n\
 - 只围绕一个具体的点（很晚了、连续忙了很久、还有没做完的待办、到饭点了、今天过得怎么样…），说得具体、有温度，可以带点你自己的小情绪或小玩笑。\n\
 - 不说教、不催促、不列清单；不要提「系统」「提醒」「检测到」「主动关怀」这类字眼；别总用同一种开场。\n\
 - 结尾可以留一个轻松、好回答的小问题，方便用户接话。\n\
@@ -981,7 +1296,7 @@ pub async fn assistant_care(
     check_enabled(&cfg)?;
     let (_g, cancel) = acquire(&rt, &turn_id)?;
     let db = db.inner().clone();
-    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(care_event(&context)), &turn_id, cancel, speech.as_ref()).await;
+    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(care_event(&context)), &turn_id, cancel, speech.as_ref(), true).await;
     finish_reply_ext(&db, &cfg, raw, false, true)
 }
 
@@ -1086,7 +1401,7 @@ pub async fn assistant_memory_summarize(
             recap_block(&hist, persona.display_name())
         )
     };
-    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, None, Turn::Event(task), &turn_id, cancel, None).await
+    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, None, Turn::Event(task), &turn_id, cancel, None, false).await
         .map_err(|e| if e.starts_with(ASSISTANT_CANCELLED) { "已停止".to_string() } else { e })?;
     let items = parse_bullets(&raw);
     if mode == "consolidate" {
@@ -1159,19 +1474,19 @@ mod tests {
         let (clean, rem, _) = extract_directives(raw);
         assert_eq!(rem, vec!["用户在做使驾".to_string()]);
         assert_eq!(strip_speech_tags(&clean), "嗯，构建通过了。\n接下来跑测试吧。");
-        assert!(speech_rule(None).is_none());
-        assert!(speech_rule(Some(&SpeechHint { enabled: false, ..Default::default() })).is_none());
-        let ja = speech_rule(Some(&SpeechHint { enabled: true, lang: "ja".into(), layer: true, ..Default::default() })).unwrap();
+        assert!(speech_rule(None, SubMode::Off).is_none());
+        assert!(speech_rule(Some(&SpeechHint { enabled: false, ..Default::default() }), SubMode::Off).is_none());
+        let ja = speech_rule(Some(&SpeechHint { enabled: true, lang: "ja".into(), layer: true, ..Default::default() }), SubMode::Off).unwrap();
         assert!(ja.contains("[[ja: …]]") && ja.contains("日语"));
-        let plain = speech_rule(Some(&SpeechHint { enabled: true, lang: "zh".into(), layer: false, ..Default::default() })).unwrap();
+        let plain = speech_rule(Some(&SpeechHint { enabled: true, lang: "zh".into(), layer: false, ..Default::default() }), SubMode::Off).unwrap();
         assert!(plain.contains("短句") && !plain.contains("[["));
     }
 
     #[test]
     fn conversation_and_care_flags() {
-        let conv = speech_rule(Some(&SpeechHint { conversation: true, ..Default::default() })).unwrap();
+        let conv = speech_rule(Some(&SpeechHint { conversation: true, ..Default::default() }), SubMode::Off).unwrap();
         assert!(conv.contains("[[结束对话]]") && !conv.contains("语音输出已开启"));
-        let both = speech_rule(Some(&SpeechHint { enabled: true, lang: "zh".into(), conversation: true, ..Default::default() })).unwrap();
+        let both = speech_rule(Some(&SpeechHint { enabled: true, lang: "zh".into(), conversation: true, ..Default::default() }), SubMode::Off).unwrap();
         assert!(both.contains("语音输出已开启") && both.contains("[[结束对话]]"));
         assert_eq!(extract_flags("好，那先这样。\n[[结束对话]]"), ("好，那先这样。".to_string(), true, false));
         assert_eq!(extract_flags("[[跳过]]"), (String::new(), false, true));
@@ -1185,6 +1500,66 @@ mod tests {
         assert!(care_event("- 现在 23:40").contains("23:40"));
         let c = AssistantConfig { care_interval_minutes: 5, care_late_hour: 30, ..Default::default() }.normalized();
         assert_eq!((c.care_interval_minutes, c.care_late_hour, c.care_enabled, c.care_voice), (30, 23, false, true));
+    }
+
+    #[test]
+    fn subtitles_layer() {
+        // 标记协议：字幕 + 配音标记，正文保留
+        let raw = "[[字幕: 构建通过啦！]][[ja: ビルド通ったよ！]]\n[[字幕：接着跑测试吧]]\n## 结果\n全部 53 个测试通过。";
+        let (body, subs) = extract_subtitles(raw);
+        assert_eq!(body, "## 结果\n全部 53 个测试通过。");
+        assert_eq!(subs.len(), 2);
+        assert_eq!((subs[0].text.as_str(), subs[0].speech.as_str()), ("构建通过啦！", "ビルド通ったよ！"));
+        assert_eq!((subs[1].text.as_str(), subs[1].speech.as_str()), ("接着跑测试吧", ""));
+        assert_eq!(extract_subtitles("没有字幕").0, "没有字幕");
+        // 工具字幕编码后与标记走同一套解析（方括号被替换，不会破坏标记）
+        let enc = encode_subtitles(&[Subtitle { text: clean_sub("看 [这里]"), speech: "ここ".into(), derived: false }]);
+        let (b, s2) = extract_subtitles(&format!("{enc}正文"));
+        assert_eq!(b, "正文");
+        assert_eq!((s2[0].text.as_str(), s2[0].speech.as_str()), ("看 ［这里］", "ここ"));
+        // 推导：跳过代码块与标题记号，取第一句
+        assert_eq!(derive_subtitle("```rs\nfn main(){}\n```\n## 好的，已经改完了。接下来……"), "好的，已经改完了。");
+        assert_eq!(derive_subtitle(&"长".repeat(80)).chars().count(), 49);
+        assert_eq!(derive_subtitle("看 [文档](https://x.y) 就行"), "看 文档 就行");
+        // say 参数：不完整的 JSON 不算
+        assert!(parse_say(r#"{"text":"你好"#).is_none());
+        assert_eq!(parse_say(r#"{"text":" 你好 ","speech":"こんにちは"}"#).unwrap().speech, "こんにちは");
+        assert!(parse_say(r#"{"text":""}"#).is_none());
+        assert!(tools_rejected("接口返回 HTTP 400：{\"error\":\"model does not support tools\"}"));
+        assert!(!tools_rejected("接口返回 HTTP 401：unauthorized tool"));
+        assert!(!tools_rejected("接口返回 HTTP 400：bad request"));
+        let t = say_tool(Some("ja"));
+        assert_eq!(t[0]["function"]["parameters"]["required"], json!(["text", "speech"]));
+        assert!(say_tool(None)[0]["function"]["parameters"]["properties"].get("speech").is_none());
+    }
+
+    #[test]
+    fn finish_two_layers() {
+        let db = db();
+        let cfg = AssistantConfig::default();
+        // 字幕 + 正文：记录存正文
+        let r = finish_reply(&db, &cfg, Ok("[[字幕: 搞定了~]]\n改了 3 个文件：\n- a.rs".into()), false).unwrap();
+        assert_eq!(r.message.unwrap().content, "改了 3 个文件：\n- a.rs");
+        assert!(r.has_body && r.subtitles.len() == 1 && !r.subtitles[0].derived);
+        // 只有字幕：字幕就是记录
+        let r = finish_reply(&db, &cfg, Ok("[[字幕: 早上好！]][[speech: おはよう！]]".into()), true).unwrap();
+        assert_eq!(r.message.unwrap().content, "早上好！");
+        assert!(!r.has_body && r.subtitles[0].speech == "おはよう！");
+        // 没给字幕：从正文推导
+        let r = finish_reply(&db, &cfg, Ok("好的。下面是详细步骤……".into()), false).unwrap();
+        assert!(r.subtitles[0].derived && r.subtitles[0].text == "好的。下面是详细步骤……");
+        // 被停止：部分字幕照样解析
+        let r = finish_reply(&db, &cfg, Err(format!("{ASSISTANT_CANCELLED}[[字幕: 等一下]]\n正文写到一半")), false).unwrap();
+        assert!(r.message.as_ref().unwrap().interrupted && r.subtitles[0].text == "等一下");
+        // 两层规则
+        let tool = speech_rule(Some(&SpeechHint { enabled: true, lang: "ja".into(), layer: true, ..Default::default() }), SubMode::Tool).unwrap();
+        assert!(tool.contains("speech 参数") && tool.contains("正文不朗读"));
+        let tag = speech_rule(Some(&SpeechHint { enabled: true, lang: "ja".into(), layer: true, ..Default::default() }), SubMode::Tag).unwrap();
+        assert!(tag.contains("[[ja: …]]"));
+        let p = Persona::default();
+        assert!(system_prompt(&p, &[], &cfg, SubMode::Tool).contains("say 工具"));
+        assert!(system_prompt(&p, &[], &cfg, SubMode::Tag).contains("[[字幕: …]]"));
+        assert!(!system_prompt(&p, &[], &cfg, SubMode::Off).contains("字幕"));
     }
 
     #[test]
@@ -1229,7 +1604,7 @@ mod tests {
         let p = Persona { name: "牧濑红莉栖".into(), persona: "傲娇的天才科学家".into(), locale: "zh".into(), ..Default::default() };
         add_memory(&db, "用户叫阿乱", "auto", false).unwrap();
         let cfg = AssistantConfig::default();
-        let s = system_prompt(&p, &list_memories(&db).unwrap(), &cfg);
+        let s = system_prompt(&p, &list_memories(&db).unwrap(), &cfg, SubMode::Tag);
         assert!(s.contains("牧濑红莉栖") && s.contains("傲娇") && s.contains("- 用户叫阿乱") && s.contains("[[记忆"));
         let r = recap_block(&h, "红莉栖");
         assert!(r.starts_with("用户：你好") && r.contains("红莉栖：哼"));

@@ -37,8 +37,33 @@ export const ACCENTS = [
 const SHARED_VARS = [
   "--bg", "--bg-panel", "--bg-elev", "--bg-elev2", "--border", "--border-soft",
   "--text", "--text-dim", "--text-faint", "--accent", "--accent-contrast", "--accent-soft",
-  "--ok", "--warn", "--danger", "--code-bg", "--scroll", "--radius", "--user-bubble",
+  "--ok", "--warn", "--danger", "--code-bg", "--scroll", "--radius",
 ];
+
+/** 最近一次在界面上探测到的用户气泡样式（没有打开对话时沿用，避免快照来回跳变）。 */
+let bubbleProbe: { bg: string; fg: string; radius: string } | null = null;
+
+const isTransparent = (c: string) => !c || c === "transparent" || /^rgba\(.*,\s*0\)$/.test(c);
+
+/** 桌面端用户气泡的实际配色：优先读当前界面里的 .user-bubble（含皮肤覆盖），否则按 --accent 推导。 */
+function userBubbleVars(cs: CSSStyleDeclaration): Record<string, string> {
+  const el = document.querySelector<HTMLElement>(".user-bubble");
+  if (el) {
+    const st = getComputedStyle(el);
+    if (!isTransparent(st.backgroundColor)) {
+      bubbleProbe = { bg: st.backgroundColor, fg: st.color, radius: st.borderRadius };
+    }
+  }
+  const r = cs.getPropertyValue("--radius").trim() || "12px";
+  const bg = bubbleProbe?.bg || cs.getPropertyValue("--accent").trim();
+  const fg = bubbleProbe?.fg || cs.getPropertyValue("--accent-contrast").trim();
+  const radius = bubbleProbe?.radius || `${r} ${r} 4px ${r}`;
+  const out: Record<string, string> = {};
+  if (bg) out["--user-bubble"] = bg;
+  if (fg) out["--user-bubble-text"] = fg;
+  if (radius) out["--user-bubble-radius"] = radius;
+  return out;
+}
 
 export function exportThemeVars(): Record<string, string> {
   const cs = getComputedStyle(document.body);
@@ -46,6 +71,9 @@ export function exportThemeVars(): Record<string, string> {
   for (const k of SHARED_VARS) {
     const v = cs.getPropertyValue(k).trim();
     if (v && v.length < 120 && !/url\(|expression|[;{}<>]/i.test(v)) out[k] = v;
+  }
+  for (const [k, v] of Object.entries(userBubbleVars(cs))) {
+    if (v.length < 120 && !/url\(|expression|[;{}<>]/i.test(v)) out[k] = v;
   }
   return out;
 }

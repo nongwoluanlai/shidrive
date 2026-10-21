@@ -997,6 +997,9 @@ fn handle_api(stream: &mut TcpStream, req: &Req, ctx: &Ctx) -> Result<(), String
     if path == "/api/fs/raw" {
         return fs_raw(stream, req, ctx);
     }
+    if path == "/api/fs/download" {
+        return fs_download(stream, req, ctx);
+    }
     let result = route(req, ctx);
     match result {
         Ok(v) => respond_json(stream, 200, &v, ""),
@@ -1593,9 +1596,66 @@ fn fs_raw(stream: &mut TcpStream, req: &Req, ctx: &Ctx) -> Result<(), String> {
     }
 }
 
+/// Content-Disposition 头：ASCII 回退名 + RFC 5987 UTF-8 编码名（中文文件名也能正确保存）
+fn content_disposition(name: &str) -> String {
+    let fallback: String = name
+        .chars()
+        .map(|c| if (c.is_ascii_graphic() && !matches!(c, '"' | '\\' | '%' | ';')) || c == ' ' { c } else { '_' })
+        .collect();
+    let fallback = if fallback.trim_matches(|c| c == '_' || c == ' ' || c == '.').is_empty() { "download".to_string() } else { fallback };
+    let mut encoded = String::new();
+    for b in name.as_bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(b) {
+            encoded.push(*b as char);
+        } else {
+            encoded.push_str(&format!("%{b:02X}"));
+        }
+    }
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
+}
+
+/// 单文件下载：流式输出，不整体读入内存；路径同样限制在项目目录内
+fn fs_download(stream: &mut TcpStream, req: &Req, ctx: &Ctx) -> Result<(), String> {
+    let (_, target) = match resolve_path(ctx, &req.q("project"), &req.q("path")) {
+        Ok(v) => v,
+        Err(ApiErr(code, msg)) => return respond_json(stream, code, &err_json(msg), ""),
+    };
+    let meta = match std::fs::metadata(&target) {
+        Ok(m) => m,
+        Err(e) => return respond_json(stream, 404, &err_json(format!("无法读取文件: {e}")), ""),
+    };
+    if !meta.is_file() {
+        return respond_json(stream, 400, &err_json("只能下载单个文件"), "");
+    }
+    let mut file = match std::fs::File::open(&target) {
+        Ok(f) => f,
+        Err(e) => return respond_json(stream, 404, &err_json(format!("读取失败: {e}")), ""),
+    };
+    let name = target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    ctx.hub.log(format!("网页端下载文件：{}（{} 字节，来自 {}）", target.to_string_lossy(), meta.len(), req.ip));
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n{SEC_HEADERS}Content-Disposition: {}\r\nContent-Security-Policy: sandbox\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        content_disposition(&name),
+        meta.len()
+    );
+    stream.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+    std::io::copy(&mut file, stream).map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_disposition_encodes_names() {
+        assert_eq!(content_disposition("a b.txt"), "attachment; filename=\"a b.txt\"; filename*=UTF-8''a%20b.txt");
+        let cn = content_disposition("报告\".md");
+        assert!(cn.starts_with("attachment; filename=\"___.md\";"), "{cn}");
+        assert!(cn.contains("filename*=UTF-8''%E6%8A%A5%E5%91%8A%22.md"), "{cn}");
+        assert!(!cn.contains('\r') && !cn.contains('\n'));
+        assert!(content_disposition("中文").contains("filename=\"download\""));
+    }
 
     #[test]
     fn slim_truncates_long_strings_on_char_boundary() {

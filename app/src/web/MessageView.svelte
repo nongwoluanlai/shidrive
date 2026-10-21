@@ -117,7 +117,7 @@
   .row { padding: 6px 0; max-width: 100%; content-visibility: auto; contain-intrinsic-size: auto 80px; }
   .user { display: flex; justify-content: flex-end; }
   .bubble {
-    background: var(--user-bubble); padding: 9px 13px; border-radius: 16px 16px 4px 16px; max-width: min(85%, 720px);
+    background: var(--user-bubble); color: var(--user-bubble-text, var(--text)); padding: 9px 14px; border-radius: var(--user-bubble-radius, 16px 16px 4px 16px); max-width: min(85%, 720px);
     white-space: pre-wrap; word-break: break-word; user-select: text;
   }
   .assistant { user-select: text; }

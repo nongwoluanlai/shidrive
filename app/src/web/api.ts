@@ -140,6 +140,7 @@ export const api = {
   read: (project: string, path: string) =>
     request<{ content?: string; binary?: boolean; size: number; tooLarge?: boolean }>("GET", `/api/fs/read?${qs({ project, path })}`),
   rawUrl: (project: string, path: string) => `/api/fs/raw?${qs({ project, path })}`,
+  downloadUrl: (project: string, path: string) => `/api/fs/download?${qs({ project, path })}`,
   search: (project: string, q: string, mode: "files" | "content") =>
     request<{ files: FileHit[]; content: ContentHit[]; truncated?: boolean }>("GET", `/api/fs/search?${qs({ project, q, mode })}`),
 };

@@ -70,6 +70,8 @@ export const assistantEn: Record<string, string> = {
   "忘掉了 {n} 条": "Forgot {n}",
   "思考中": "Thinking",
   "想聊点什么？": "What's on your mind?",
+  "查看完整回复": "View full reply",
+  "完整回复在对话记录里": "Full reply is in the chat history",
   "手动添加一条记忆…": "Add a memory…",
   "接口地址": "Base URL",
   "撤销": "Revert",
