@@ -34,9 +34,13 @@ const MAX_MEMORY_LEN: usize = 200;
 const MAX_MEMORIES: i64 = 300;
 const MAX_MESSAGES: i64 = 2000;
 /// 设定版本：规则有变化时让已有 ACP 长期会话重新注入设定
-const PROMPT_REV: &str = "r13";
+const PROMPT_REV: &str = "r14";
 /// 单条字幕的长度上限（字）
 const MAX_SUBTITLE_LEN: usize = 120;
+/// API 模式一轮里最多几次工具往返（MCP 工具）
+const MAX_TOOL_ROUNDS: usize = 8;
+/// 单个工具结果交回模型的长度上限（字）
+const MAX_TOOL_RESULT: usize = 12000;
 
 type DbState<'a> = State<'a, Arc<Db>>;
 type AgentsState<'a> = State<'a, Arc<AgentManager>>;
@@ -96,6 +100,8 @@ pub struct AssistantConfig {
     pub care_late_hour: u32,
     /// 关怀说完后进入连续语音对话（需开启语音输入）
     pub care_voice: bool,
+    /// 给助手开放使驾本地 MCP（上下文 / 工作流 / 自己的定时等全部工具）：ACP 注入 MCP，API 走工具调用
+    pub mcp_tools: bool,
 }
 
 impl Default for AssistantConfig {
@@ -119,6 +125,7 @@ impl Default for AssistantConfig {
             care_interval_minutes: 120,
             care_late_hour: 23,
             care_voice: true,
+            mcp_tools: true,
         }
     }
 }
@@ -583,6 +590,9 @@ pub fn system_prompt(p: &Persona, mems: &[AssistantMemory], cfg: &AssistantConfi
     if cfg.auto_memory {
         s.push_str("- 对话中出现值得长期记住的信息（用户的称呼、偏好、身份、长期目标、约定、重要事实）时，在回复最后单独一行写 [[记忆: 一句话摘要]]，可多条、每条一行；没有就不写。普通闲聊和一次性任务细节不要记。用户要求忘掉某事时写 [[忘记: 关键词]]。这些标记不会展示给用户。\n");
     }
+    if cfg.mcp_tools && sub != SubMode::Off {
+        s.push_str(MCP_RULE);
+    }
     s.push_str("\n[长期记忆]（跨会话、跨客户端保存，按需参考，不必复述）\n");
     s.push_str(&memory_block(mems, cfg.memory_limit));
     s
@@ -766,7 +776,7 @@ async fn ensure_acp_session(db: &Db, agents: &AgentManager, rt: &AssistantRuntim
     let reuse = st.session_provider == "acp" && st.session_agent == cfg.agent_type && !st.session_id.is_empty();
     if reuse {
         let cwd0 = if st.session_cwd.is_empty() { cwd.clone() } else { st.session_cwd.clone() };
-        match agents.assistant_session_ensure(&cfg.agent_type, &st.session_id, &cwd0).await {
+        match agents.assistant_session_ensure(&cfg.agent_type, &st.session_id, &cwd0, cfg.mcp_tools).await {
             Ok(_) => {
                 apply_model(db, agents, cfg, &mut st).await;
                 return Ok((st.session_id.clone(), cwd0));
@@ -774,7 +784,7 @@ async fn ensure_acp_session(db: &Db, agents: &AgentManager, rt: &AssistantRuntim
             Err(e) => log::warn!("[assistant] 恢复长期会话失败，改为新建：{e}"),
         }
     }
-    let (sid, _) = agents.assistant_session_new(&cfg.agent_type, &cwd).await?;
+    let (sid, _) = agents.assistant_session_new(&cfg.agent_type, &cwd, cfg.mcp_tools).await?;
     st.session_id = sid.clone();
     st.session_agent = cfg.agent_type.clone();
     st.session_provider = "acp".into();
@@ -986,10 +996,13 @@ fn api_chat(ctx: &ApiCtx, mut messages: Vec<Value>, mut tools: Option<Value>, ta
     let mut content = String::new();
     let mut subs: Vec<Subtitle> = Vec::new();
     let partial = |subs: &[Subtitle], content: &str| format!("{ASSISTANT_CANCELLED}{}{content}", encode_subtitles(subs));
-    let max_rounds = 3;
+    // 带 MCP 工具时允许多轮（查项目 → 读上下文 → 回答）；只有 say 时最多 3 轮
+    let has_mcp = tools.as_ref().and_then(Value::as_array).is_some_and(|a| a.len() > 1);
+    let max_rounds = if has_mcp { MAX_TOOL_ROUNDS } else { 3 };
     let mut round = 0;
     while round < max_rounds {
         let last = round + 1 == max_rounds;
+        let start = content.len();
         let calls = match ctx.round(&messages, tools.as_ref(), last && round > 0, &mut content, &mut subs) {
             Ok(c) => c,
             Err(e) if e.starts_with(ASSISTANT_CANCELLED) => return Err(partial(&subs, &content)),
@@ -1003,13 +1016,31 @@ fn api_chat(ctx: &ApiCtx, mut messages: Vec<Value>, mut tools: Option<Value>, ta
             Err(e) => return Err(e),
         };
         round += 1;
-        if tools.is_none() || calls.is_empty() || !content.trim().is_empty() { break; }
-        // 只说了字幕：把工具调用和结果补进上下文，让模型接着写正文（也可以什么都不写）
+        if tools.is_none() || calls.is_empty() { break; }
+        let uses_mcp = calls.iter().any(|c| c.name != "say");
+        // 只说了字幕且写了正文：这轮完成
+        if !uses_mcp && !content.trim().is_empty() { break; }
+        // 把工具调用和结果补进上下文，让模型接着写（只说了字幕时也可以什么都不写）
+        let text = content[start..].to_string();
         let tc: Vec<Value> = calls.iter().map(|c| json!({ "id": c.id, "type": "function", "function": { "name": c.name, "arguments": c.args } })).collect();
-        messages.push(json!({ "role": "assistant", "content": Value::Null, "tool_calls": tc }));
+        messages.push(json!({ "role": "assistant", "content": if text.trim().is_empty() { Value::Null } else { json!(text) }, "tool_calls": tc }));
         for c in &calls {
-            let r = if c.name == "say" { if c.done { "已显示" } else { "参数无效，需要 text" } } else { "没有这个工具" };
+            if ctx.cancel.load(Ordering::SeqCst) { return Err(partial(&subs, &content)); }
+            let r = if c.name == "say" {
+                (if c.done { "已显示" } else { "参数无效，需要 text" }).to_string()
+            } else {
+                let args: Value = serde_json::from_str(c.args.trim()).unwrap_or_else(|_| json!({}));
+                match crate::mcp::assistant_call(ctx.app, &c.name, &args) {
+                    Ok(t) => cap_chars(&t, MAX_TOOL_RESULT),
+                    Err(e) => format!("错误：{}", cap_chars(&e, 2000)),
+                }
+            };
             messages.push(json!({ "role": "tool", "tool_call_id": c.id, "content": r }));
+        }
+        // 工具前后的两段正文之间空一行
+        if uses_mcp && !content.trim().is_empty() && !content.ends_with('\n') {
+            content.push_str("\n\n");
+            emit_chunk(ctx.app, ctx.session, ctx.turn, "\n\n");
         }
     }
     Ok(format!("{}{content}", encode_subtitles(&subs)))
@@ -1024,6 +1055,8 @@ async fn run_turn(
 ) -> Result<String, String> {
     let mems = list_memories(db)?;
     let name = persona.display_name().to_string();
+    // 助手自己设的定时（每轮附带，避免重复设、便于取消）
+    let wakes_now = if cfg.mcp_tools && subtitles { wake_block(db) } else { String::new() };
     let body = match &turn {
         Turn::User(t) => t.to_string(),
         Turn::Event(e) => e.clone(),
@@ -1033,12 +1066,17 @@ async fn run_turn(
         let sub = if !subtitles { SubMode::Off } else if no_tools().lock().unwrap().contains(&tools_key(&cfg.api)) { SubMode::Tag } else { SubMode::Tool };
         let build_sys = |sub: SubMode| {
             let mut sys = format!("{}\n\n{}", system_prompt(persona, &mems, cfg, sub), state_line(app_state, cfg));
+            if !wakes_now.is_empty() { sys.push('\n'); sys.push_str(&wakes_now); }
             if let Some(l) = speech_rule(speech, sub) { sys.push('\n'); sys.push_str(&l); }
             sys
         };
         let sys = build_sys(sub);
         let (tools, tag_sys) = if sub == SubMode::Tool {
-            (Some(say_tool(speech_layer_lang(speech).as_deref())), Some(build_sys(SubMode::Tag)))
+            let mut t = say_tool(speech_layer_lang(speech).as_deref());
+            if cfg.mcp_tools {
+                if let (Some(arr), Value::Array(more)) = (t.as_array_mut(), crate::mcp::assistant_function_tools()) { arr.extend(more); }
+            }
+            (Some(t), Some(build_sys(SubMode::Tag)))
         } else {
             (None, None)
         };
@@ -1065,7 +1103,7 @@ async fn run_turn(
     let (sid, cwd) = ensure_acp_session(db, agents, rt, cfg).await?;
     let st = load_state(db);
     // 人设 + 设定版本：任一变化都整份重新注入
-    let pkey = format!("{}-{PROMPT_REV}", persona.key());
+    let pkey = format!("{}-{PROMPT_REV}{}", persona.key(), if cfg.mcp_tools { "m" } else { "" });
     let primed_key = format!("{sid}|{pkey}|{}", st.memory_version);
     let mut text = String::new();
     if st.primed_key != primed_key {
@@ -1087,6 +1125,7 @@ async fn run_turn(
         text.push_str("\n\n");
     }
     text.push_str(&state_line(app_state, cfg));
+    if !wakes_now.is_empty() { text.push('\n'); text.push_str(&wakes_now); }
     let sub = if subtitles { SubMode::Tag } else { SubMode::Off };
     if subtitles { text.push('\n'); text.push_str(TAG_REMINDER); }
     if let Some(l) = speech_rule(speech, sub) { text.push('\n'); text.push_str(&l); }
@@ -1095,7 +1134,7 @@ async fn run_turn(
         Turn::User(t) => { text.push_str("[用户消息]\n"); text.push_str(t); }
         Turn::Event(e) => text.push_str(e),
     }
-    let r = agents.assistant_prompt(&cfg.agent_type, &sid, &cwd, &text, turn_id).await;
+    let r = agents.assistant_prompt(&cfg.agent_type, &sid, &cwd, &text, turn_id, cfg.mcp_tools).await;
     // 只要请求已送达（成功或被停止）就视为设定已注入
     if r.is_ok() || r.as_ref().err().is_some_and(|e| e.starts_with(ASSISTANT_CANCELLED)) {
         let mut st = load_state(db);
@@ -1182,6 +1221,462 @@ fn mark_greeted(db: &Db, raw: &Result<String, String>) {
 fn check_enabled(cfg: &AssistantConfig) -> Result<(), String> {
     if !cfg.enabled { return Err("全局助手未启用".into()); }
     if cfg.provider == "acp" && cfg.agent_type.trim().is_empty() { return Err("请先在设置中选择 ACP 客户端".into()); }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- wake（工作流唤醒助手 / 助手给自己设定时）
+
+/// 工作流的「全局助手」节点运行时推给前端的事件；前端带上人设与语音设置回调 `assistant_wake`
+pub const EVT_WAKE: &str = "assistant://wake";
+/// 助手通过 MCP 工具设 / 取消了定时（前端提示并刷新工作流列表）
+pub const EVT_SCHEDULES: &str = "assistant://schedules";
+/// 助手自己设的定时最多保留多少个
+const MAX_WAKES: usize = 30;
+
+/// 工作流里「全局助手」节点的一次请求
+#[derive(Clone, Debug)]
+pub struct WakeRequest {
+    pub workflow_id: String,
+    pub workflow_name: String,
+    pub step: String,
+    pub message: String,
+    /// 助手自己设的定时（唤醒自己）
+    pub by_assistant: bool,
+}
+
+type WakeReply = Result<String, String>;
+
+struct PendingWake {
+    tx: Option<tokio::sync::oneshot::Sender<WakeReply>>,
+    event: String,
+}
+
+fn wakes() -> &'static Mutex<HashMap<String, PendingWake>> {
+    static W: OnceLock<Mutex<HashMap<String, PendingWake>>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 唤醒时发给助手的系统事件
+pub fn wake_event(req: &WakeRequest) -> String {
+    let msg = cap_chars(req.message.trim(), 2000);
+    if req.by_assistant {
+        format!(
+            "[系统事件 · 定时唤醒] 你之前给自己设的定时到了。当时写给自己的话：\n{msg}\n\n\
+现在就按这件事行动：通常用字幕跟用户说一两句（保持人设口吻，像你自己想起来的那样自然），需要详细内容再写正文。\
+不要提「系统」「定时任务」「工作流」「唤醒」这类字眼。如果这件事是一年一次的（比如生日、纪念日），记得设好下一年的定时。\
+如果现在说这件事已经不合适（比如已经办完了、刚聊过），就只输出 [[跳过]]。"
+        )
+    } else {
+        format!(
+            "[系统事件 · 工作流「{}」] 用户在工作流里安排了这件事交给你（节点「{}」）：\n{msg}\n\n\
+请按要求处理。要跟用户说的话用字幕说（简短），详细结果写在正文里（正文会作为这个节点的输出交给工作流的后续步骤）。",
+            req.workflow_name, req.step
+        )
+    }
+}
+
+/// 工作流引擎调用：登记请求并通知前端；返回 (请求 id, 等待回复的接收端)
+pub fn wake_begin(app: &AppHandle, db: &Db, req: WakeRequest) -> Result<(String, tokio::sync::oneshot::Receiver<WakeReply>), String> {
+    let cfg = load_config(db);
+    check_enabled(&cfg)?;
+    let id = format!("wake-{}", uuid());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    wakes().lock().unwrap().insert(id.clone(), PendingWake { tx: Some(tx), event: wake_event(&req) });
+    let payload = json!({ "reqId": id, "workflowId": req.workflow_id, "workflowName": req.workflow_name, "byAssistant": req.by_assistant });
+    if let Err(e) = app.emit(EVT_WAKE, payload) {
+        wakes().lock().unwrap().remove(&id);
+        return Err(format!("通知界面失败：{e}"));
+    }
+    Ok((id, rx))
+}
+
+/// 工作流引擎调用：不再等待（完成 / 超时 / 停止）
+pub fn wake_end(id: &str) {
+    wakes().lock().unwrap().remove(id);
+}
+
+fn wake_resolve(id: &str, r: WakeReply) {
+    if let Some(p) = wakes().lock().unwrap().get_mut(id) {
+        if let Some(tx) = p.tx.take() { let _ = tx.send(r); }
+    }
+}
+
+/// 回合结果 → 交给工作流的文本
+fn wake_reply_text(t: &TurnResult) -> String {
+    if t.skipped { return "（助手选择这次不打扰）".into(); }
+    match &t.message {
+        Some(m) => m.content.clone(),
+        None => t.subtitles.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join("\n"),
+    }
+}
+
+/// 「早上 8 点半」「21:30」「9pm」→ (时, 分)；`period` = 外部给出的时段（今晚 / 明早）
+fn parse_tod(s: &str, period: Option<&str>) -> Option<(u32, u32)> {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(
+        r"(?i)^(早上|早晨|清晨|上午|中午|下午|傍晚|晚上|夜里|夜晚|凌晨)?\s*(\d{1,2})(?:\s*:\s*(\d{1,2})|\s*[点时]\s*(?:(\d{1,2})\s*分?|(半)|(一刻)|(三刻)|整)?)?\s*(am|pm)?$"
+    ).unwrap());
+    let c = re.captures(s.trim())?;
+    let mut h: u32 = c[2].parse().ok()?;
+    let m: u32 = if let Some(x) = c.get(3).or(c.get(4)) { x.as_str().parse().ok()? }
+        else if c.get(5).is_some() { 30 } else if c.get(6).is_some() { 15 } else if c.get(7).is_some() { 45 } else { 0 };
+    let per = c.get(1).map(|x| x.as_str()).or(period).unwrap_or("");
+    match per {
+        "下午" | "傍晚" | "晚上" | "夜里" | "夜晚" if h < 12 => h += 12,
+        "中午" if h < 11 => h += 12,
+        "凌晨" if h == 12 => h = 0,
+        _ => {}
+    }
+    match c.get(8).map(|x| x.as_str().to_ascii_lowercase()).as_deref() {
+        Some("pm") if h < 12 => h += 12,
+        Some("am") if h == 12 => h = 0,
+        _ => {}
+    }
+    (h < 24 && m < 60).then_some((h, m))
+}
+
+fn weekday_num(c: char) -> Option<u32> {
+    Some(match c {
+        '一' | '1' => 1, '二' | '2' => 2, '三' | '3' => 3, '四' | '4' => 4, '五' | '5' => 5, '六' | '6' => 6,
+        '日' | '天' | '七' | '7' => 7,
+        _ => return None,
+    })
+}
+
+fn hhmm(h: u32, m: u32) -> String { format!("{h:02}:{m:02}") }
+
+fn once_at(t: chrono::NaiveDateTime) -> crate::models::ScheduleConfig {
+    crate::models::ScheduleConfig::Once { at: t.format("%Y-%m-%d %H:%M").to_string(), delete_after_run: true }
+}
+
+/// 解析助手写的时间：相对（30分钟后）、今天/明晚 + 时刻、日期 + 时刻、每天 / 每周 / 工作日 / 每 N 小时
+pub fn parse_when(s: &str, now: chrono::NaiveDateTime) -> Result<crate::models::ScheduleConfig, String> {
+    use crate::models::ScheduleConfig as S;
+    use chrono::{Datelike, Duration as D, NaiveDate, NaiveTime};
+    let s0 = s.trim().replace('：', ":").replace('，', ",").replace('、', ",");
+    let s = s0.trim().trim_end_matches(['。', '.']).trim();
+    let bad = || format!("看不懂的时间「{s}」（可写：30分钟后 / 明天 9:00 / 06-18 20:00 / 每天 08:30 / 每周一三五 21:00 / 每2小时）");
+    if s.is_empty() { return Err(bad()); }
+    let at = |d: NaiveDate, h: u32, m: u32| d.and_time(NaiveTime::from_hms_opt(h, m, 0).unwrap());
+    let lower = s.to_lowercase();
+
+    // 相对时间
+    static REL: OnceLock<regex::Regex> = OnceLock::new();
+    let rel = REL.get_or_init(|| regex::Regex::new(
+        r"^(?:in\s*|过\s*)?(\d+(?:\.\d+)?|半)\s*(?:个)?\s*(分钟|分|mins?|minutes?|小时|钟头|h|hrs?|hours?|天|days?|周|星期|礼拜|weeks?)\s*(?:后|以后|之后|later)?$"
+    ).unwrap());
+    if let Some(c) = rel.captures(&lower) {
+        let n: f64 = if &c[1] == "半" { 0.5 } else { c[1].parse().map_err(|_| bad())? };
+        let unit = &c[2];
+        let mins = if unit.starts_with('分') || unit.starts_with("min") { n }
+            else if unit.starts_with('小') || unit.starts_with('钟') || unit.starts_with('h') { n * 60.0 }
+            else if unit.starts_with('天') || unit.starts_with("day") { n * 1440.0 }
+            else { n * 10080.0 };
+        let mins = mins.round() as i64;
+        if mins < 1 { return Err(bad()); }
+        if mins > 366 * 1440 { return Err("定时不能超过一年".into()); }
+        return Ok(once_at(now + D::minutes(mins)));
+    }
+
+    // 每 N 分钟 / 小时
+    static EVERY: OnceLock<regex::Regex> = OnceLock::new();
+    let every = EVERY.get_or_init(|| regex::Regex::new(
+        r"^(?:每隔?|every)\s*(\d+)?\s*(?:个)?\s*(分钟|mins?|minutes?|小时|钟头|hours?|hrs?|h)$"
+    ).unwrap());
+    if let Some(c) = every.captures(&lower) {
+        let n: i64 = c.get(1).map(|x| x.as_str().parse().unwrap_or(1)).unwrap_or(1).max(1);
+        let unit = &c[2];
+        let mins = if unit.starts_with('分') || unit.starts_with("min") { n } else { n * 60 };
+        if mins < 5 { return Err("重复定时的间隔至少 5 分钟".into()); }
+        return Ok(S::Interval { every_minutes: mins });
+    }
+    if lower.starts_with("每年") || lower.starts_with("every year") || lower.starts_with("yearly") {
+        return Err("不支持「每年」：请设具体日期（如 06-18 09:00），到点后再设下一年的".into());
+    }
+
+    // 每天 / 工作日 / 周末 / 每周X
+    let tod = |rest: &str| -> Result<(u32, u32), String> {
+        let rest = rest.trim().trim_start_matches(',').trim();
+        if rest.is_empty() { return Ok((9, 0)); }
+        parse_tod(rest, None).ok_or_else(bad)
+    };
+    for p in ["每天", "每日", "天天", "every day", "everyday", "daily"] {
+        if let Some(rest) = lower.strip_prefix(p) {
+            let (h, m) = tod(rest)?;
+            return Ok(S::Daily { time: hhmm(h, m) });
+        }
+    }
+    for (p, days) in [("工作日", vec![1, 2, 3, 4, 5]), ("每个工作日", vec![1, 2, 3, 4, 5]), ("weekdays", vec![1, 2, 3, 4, 5]), ("周末", vec![6, 7]), ("每周末", vec![6, 7]), ("weekends", vec![6, 7])] {
+        if let Some(rest) = lower.strip_prefix(p) {
+            let (h, m) = tod(rest)?;
+            return Ok(S::Weekly { weekdays: days, time: hhmm(h, m) });
+        }
+    }
+    for p in ["每个星期", "每星期", "每礼拜", "每周"] {
+        if let Some(rest) = s.strip_prefix(p) {
+            let mut days = Vec::new();
+            let mut idx = rest.len();
+            for (i, ch) in rest.char_indices() {
+                if let Some(d) = weekday_num(ch).filter(|_| !ch.is_ascii_digit()) {
+                    if !days.contains(&d) { days.push(d); }
+                } else if matches!(ch, ',' | '和' | '与' | ' ' | '周' | '星' | '期' | '及') {
+                } else {
+                    idx = i;
+                    break;
+                }
+            }
+            if days.is_empty() { return Err(bad()); }
+            days.sort();
+            let (h, m) = tod(&rest[idx..])?;
+            return Ok(S::Weekly { weekdays: days, time: hhmm(h, m) });
+        }
+    }
+
+    // 今天 / 今晚 / 明天 / 明早 / 后天 + 时刻
+    let today = now.date();
+    for (p, off, period, def) in [
+        ("今天", 0, None, None), ("今日", 0, None, None), ("today", 0, None, None),
+        ("今晚", 0, Some("晚上"), Some((20, 0))), ("tonight", 0, Some("晚上"), Some((20, 0))),
+        ("今早", 0, Some("早上"), None), ("今天早上", 0, Some("早上"), None),
+        ("明天", 1, None, Some((9, 0))), ("明日", 1, None, Some((9, 0))), ("tomorrow", 1, None, Some((9, 0))),
+        ("明早", 1, Some("早上"), Some((8, 0))), ("明晚", 1, Some("晚上"), Some((20, 0))),
+        ("后天", 2, None, Some((9, 0))), ("大后天", 3, None, Some((9, 0))),
+    ] {
+        if let Some(rest) = lower.strip_prefix(p) {
+            let rest = rest.trim().trim_start_matches(',').trim();
+            let (h, m) = if rest.is_empty() { def.ok_or_else(bad)? } else { parse_tod(rest, period).ok_or_else(bad)? };
+            let t = at(today + D::days(off), h, m);
+            if t <= now { return Err(format!("「{s}」已经过去了")); }
+            return Ok(once_at(t));
+        }
+    }
+
+    // 日期（可带年份）+ 时刻
+    static DATE: OnceLock<regex::Regex> = OnceLock::new();
+    let date = DATE.get_or_init(|| regex::Regex::new(r"^(?:(\d{4})\s*[-/年.]\s*)?(\d{1,2})\s*[-/月.]\s*(\d{1,2})\s*[日号]?\s*(?:t|\s)?\s*(.*)$").unwrap());
+    if let Some(c) = date.captures(&lower) {
+        let mo: u32 = c[2].parse().map_err(|_| bad())?;
+        let d: u32 = c[3].parse().map_err(|_| bad())?;
+        let rest = c.get(4).map(|x| x.as_str().trim()).unwrap_or("");
+        let (h, m) = if rest.is_empty() { (9, 0) } else { parse_tod(rest, None).ok_or_else(bad)? };
+        return match c.get(1) {
+            Some(y) => {
+                let y: i32 = y.as_str().parse().map_err(|_| bad())?;
+                let day = NaiveDate::from_ymd_opt(y, mo, d).ok_or_else(bad)?;
+                let t = at(day, h, m);
+                if t <= now { return Err(format!("「{s}」已经过去了")); }
+                Ok(once_at(t))
+            }
+            None => {
+                let mut y = today.year();
+                loop {
+                    if let Some(day) = NaiveDate::from_ymd_opt(y, mo, d) {
+                        let t = at(day, h, m);
+                        if t > now { break Ok(once_at(t)); }
+                    }
+                    y += 1;
+                    if y > today.year() + 4 { break Err(bad()); }
+                }
+            }
+        };
+    }
+
+    // 只有时刻：今天还没到就今天，否则明天
+    if let Some((h, m)) = parse_tod(&lower, None) {
+        let mut t = at(today, h, m);
+        if t <= now { t += D::days(1); }
+        return Ok(once_at(t));
+    }
+    Err(bad())
+}
+
+/// 定时的人类可读描述
+pub fn sched_label(s: &crate::models::ScheduleConfig) -> String {
+    use crate::models::ScheduleConfig as S;
+    match s {
+        S::Interval { every_minutes } if every_minutes % 60 == 0 => format!("每 {} 小时", every_minutes / 60),
+        S::Interval { every_minutes } => format!("每 {every_minutes} 分钟"),
+        S::Daily { time } => format!("每天 {time}"),
+        S::Weekly { weekdays, time } => {
+            const N: [&str; 7] = ["一", "二", "三", "四", "五", "六", "日"];
+            let d: Vec<&str> = weekdays.iter().filter_map(|w| N.get((*w as usize).wrapping_sub(1)).copied()).collect();
+            format!("每周{} {time}", d.join("、"))
+        }
+        S::Once { at, .. } => format!("{at}（一次）"),
+    }
+}
+
+/// 助手自己设的定时（工作流, 写给自己的话）
+pub fn list_wakes(db: &Db) -> Result<Vec<(crate::models::Workflow, String)>, String> {
+    Ok(db.list_workflows(crate::models::NO_PROJECT_ID)?
+        .into_iter()
+        .filter_map(|w| {
+            let msg = w.steps.iter().find_map(|s| match s {
+                crate::models::WorkflowStep::Assistant { message, by_assistant: true, .. } => Some(message.clone()),
+                _ => None,
+            })?;
+            Some((w, msg))
+        })
+        .collect())
+}
+
+/// 建一个「到点唤醒助手」的工作流（放在「无项目」下，用户可在工作流页查看 / 删除）
+/// 返回 (工作流, 是否已存在同样的定时)
+pub fn create_wake(db: &Db, when: &str, message: &str, now: chrono::NaiveDateTime) -> Result<(crate::models::Workflow, bool), String> {
+    use crate::models::WorkflowStep as W;
+    let msg = cap_chars(message.trim(), 500);
+    if msg.is_empty() { return Err("定时内容为空".into()); }
+    let sched = crate::schedule::normalize(parse_when(when, now)?);
+    let existing = list_wakes(db)?;
+    if let Some((w, _)) = existing.iter().find(|(w, m)| m.trim() == msg && w.schedule.as_ref() == Some(&sched)) {
+        return Ok((w.clone(), true));
+    }
+    if existing.len() >= MAX_WAKES { return Err(format!("助手的定时已达上限 {MAX_WAKES} 个，先取消一些")); }
+    let steps = vec![
+        W::Start { name: String::new(), x: 0.0, y: 0.0 },
+        W::Assistant { name: "唤醒助手".into(), message: msg.clone(), timeout_sec: None, continue_on_error: false, by_assistant: true, x: 0.0, y: 0.0 },
+    ];
+    let n = crate::wf_graph::normalize(steps, Some(vec![(0, 1)]), true)?;
+    let name = format!("助手定时 · {}", cap_chars(&msg.replace('\n', " "), 18));
+    let w = db.create_workflow(
+        crate::models::NO_PROJECT_ID, &name, "由全局助手创建：到点唤醒助手", true, "schedule",
+        Some(&sched), &n.steps, &std::collections::BTreeMap::new(), &n.edges,
+    )?;
+    crate::glog::info("assistant", format!("助手设了定时：{} · {}", sched_label(&sched), cap_chars(&msg, 40)));
+    Ok((w, false))
+}
+
+/// 按 id 取消助手设的定时（只能删助手自己建的）
+pub fn cancel_wake_id(db: &Db, id: &str) -> Result<usize, String> {
+    match list_wakes(db)?.into_iter().find(|(w, _)| w.id == id.trim()) {
+        Some((w, _)) => { db.delete_workflow(&w.id)?; Ok(1) }
+        None => Err(format!("没有 id 为 {id} 的助手定时（用 assistant_schedule_list 查看）")),
+    }
+}
+
+/// 按关键词取消助手设的定时（匹配名称或内容；「全部」= 全部取消）
+pub fn cancel_wakes(db: &Db, keyword: &str) -> Result<usize, String> {
+    let k = keyword.trim().to_lowercase();
+    let all = matches!(k.as_str(), "全部" | "所有" | "all" | "*");
+    if !all && k.chars().count() < 2 { return Ok(0); }
+    let mut n = 0;
+    for (w, m) in list_wakes(db)? {
+        if all || m.to_lowercase().contains(&k) || w.name.to_lowercase().contains(&k) {
+            db.delete_workflow(&w.id)?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// 每轮附带：当前已设的定时
+fn wake_block(db: &Db) -> String {
+    let list = match list_wakes(db) { Ok(l) if !l.is_empty() => l, _ => return String::new() };
+    let mut s = String::from("[你设下的定时]（用户看不到这段）");
+    for (w, m) in list.iter().take(10) {
+        let label = w.schedule.as_ref().map(sched_label).unwrap_or_default();
+        let next = w.next_run_at.as_deref().map(|t| format!(" · 下次 {}", t.replace('T', " ").chars().take(16).collect::<String>())).unwrap_or_default();
+        s.push_str(&format!("\n- {label}{next}：{}", cap_chars(&m.replace('\n', " "), 60)));
+    }
+    if list.len() > 10 { s.push_str(&format!("\n- …共 {} 个", list.len())); }
+    s
+}
+
+const MCP_RULE: &str = "- 你接入了使驾本地 MCP（服务名 shidrive），可以直接调用其中的工具：\
+assistant_schedule_create / assistant_schedule_list / assistant_schedule_cancel 给自己设、查、取消定时（到点使驾会唤醒你，你按当时写给自己的话行动）；\
+shidrive_overview 查看有哪些项目、共享上下文（拿到 context_id / project_name）；context_* 读写项目共享上下文；workflow_* 查看、创建、修改、运行工作流。\
+用户让你提醒什么事时一定要用 assistant_schedule_create 设好（字幕里简单确认）；你自己觉得该在某个时间主动出现时（记得的生日、约好的事、要回访的进展）也可以悄悄设，不必告诉用户；\
+一年一次的事设具体日期，到时候再设下一年的；写给自己的话要具体（谁、什么事、想怎么说）。已设的定时会附在每轮状态里，别重复设。\
+会改动或执行东西的操作（workflow_run / workflow_create / workflow_update / workflow_delete / context_update）只在用户明确要求时做，做完简单告诉用户结果。\n";
+
+/// 助手专用的 MCP 工具（使驾本地 MCP 以 `?assistant=1` 接入时追加；API 模式转成 function calling）
+pub fn mcp_tool_definitions() -> Value {
+    json!([
+        {
+            "name": "assistant_schedule_create",
+            "description": "给自己（全局助手）设一个定时：到点后使驾会唤醒你，并把 message 原样交还给你，你据此行动（提醒用户、送祝福、回访进展…）。会在工作流「无项目」下生成一个「助手定时 · …」工作流，用户可查看 / 删除；一次性的定时跑完自动删除。",
+            "inputSchema": { "type": "object", "required": ["when", "message"], "properties": {
+                "when": { "type": "string", "description": "时间：30分钟后 / 2小时后 / 今晚8点 / 明天 9:00 / 明早7点半 / 06-18 09:00 / 2026-01-01 00:00 / 21:30（今天没到就今天，否则明天）/ 每天 08:30 / 工作日 9:00 / 每周一三五 21:00 / 每2小时。不支持「每年」：设具体日期，到点后再设下一年的" },
+                "message": { "type": "string", "description": "写给到时候的自己的话：具体写清是谁、什么事、想怎么说（≤500 字）" }
+            }}
+        },
+        {
+            "name": "assistant_schedule_list",
+            "description": "列出你（全局助手）已设的定时：id、时间规则、下次触发时间、写给自己的话。",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "assistant_schedule_cancel",
+            "description": "取消你（全局助手）设的定时：按 id（来自 assistant_schedule_list）或关键词（匹配内容，至少 2 个字；「全部」= 全部取消）。",
+            "inputSchema": { "type": "object", "properties": {
+                "id": { "type": "string", "description": "定时 id" },
+                "keyword": { "type": "string", "description": "内容关键词" }
+            }}
+        }
+    ])
+}
+
+fn wake_item(w: &crate::models::Workflow, m: &str) -> Value {
+    json!({
+        "id": w.id,
+        "when": w.schedule.as_ref().map(sched_label).unwrap_or_default(),
+        "next_run_at": w.next_run_at,
+        "message": m,
+    })
+}
+
+/// 执行助手专用的 MCP 工具；不是助手工具时返回 None
+pub fn mcp_call(db: &Db, name: &str, args: &Value) -> Option<Result<Value, String>> {
+    let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::trim).unwrap_or_default().to_string();
+    Some(match name {
+        "assistant_schedule_create" => {
+            let (when, msg) = (s("when"), s("message"));
+            if when.is_empty() || msg.is_empty() { return Some(Err("缺少必填参数 when / message".into())); }
+            create_wake(db, &when, &msg, chrono::Local::now().naive_local()).map(|(w, existed)| {
+                let mut v = wake_item(&w, &msg);
+                v["existed"] = json!(existed);
+                v["message_to_user"] = json!(if existed { "同样的定时已存在，没有重复创建" } else { "已设好，到点会唤醒你" });
+                v
+            })
+        }
+        "assistant_schedule_list" => list_wakes(db).map(|l| json!({ "schedules": l.iter().map(|(w, m)| wake_item(w, m)).collect::<Vec<_>>() })),
+        "assistant_schedule_cancel" => {
+            let (id, kw) = (s("id"), s("keyword"));
+            if id.is_empty() && kw.is_empty() { return Some(Err("请给出 id 或 keyword".into())); }
+            let r = if !id.is_empty() { cancel_wake_id(db, &id) } else { cancel_wakes(db, &kw) };
+            r.map(|n| json!({ "cancelled": n }))
+        }
+        _ => return None,
+    })
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn assistant_wake(
+    app: AppHandle, db: DbState<'_>, agents: AgentsState<'_>, rt: RtState<'_>,
+    req_id: String, persona: Persona, app_state: Option<String>, turn_id: String, speech: Option<SpeechHint>,
+) -> Result<TurnResult, String> {
+    let ev = wakes().lock().unwrap().get(&req_id).map(|p| p.event.clone()).ok_or_else(|| "这次唤醒已过期".to_string())?;
+    let db = db.inner().clone();
+    let r = async {
+        let cfg = load_config(&db);
+        check_enabled(&cfg)?;
+        let (_g, cancel) = acquire(&rt, &turn_id)?;
+        let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(ev), &turn_id, cancel, speech.as_ref(), true).await;
+        finish_reply_ext(&db, &cfg, raw, false, true)
+    }
+    .await;
+    match &r {
+        Ok(t) => wake_resolve(&req_id, Ok(wake_reply_text(t))),
+        Err(e) => wake_resolve(&req_id, Err(e.clone())),
+    }
+    r
+}
+
+/// 前端无法处理这次唤醒（助手未启用 / 一直在忙）
+#[tauri::command]
+pub async fn assistant_wake_fail(req_id: String, reason: String) -> Result<(), String> {
+    wake_resolve(&req_id, Err(if reason.trim().is_empty() { "界面无法处理".into() } else { reason }));
     Ok(())
 }
 
@@ -1447,7 +1942,7 @@ pub async fn assistant_models(
     // 只取能力，不应用模型（避免用户还没保存就改掉当前会话的模型）
     cfg.model = Value::Null;
     let (sid, _) = ensure_acp_session(&db, &agents, &rt, &cfg).await?;
-    agents.assistant_session_ensure(&cfg.agent_type, &sid, &rt.workspace(&cfg)).await
+    agents.assistant_session_ensure(&cfg.agent_type, &sid, &rt.workspace(&cfg), cfg.mcp_tools).await
 }
 
 #[cfg(test)]
@@ -1622,5 +2117,114 @@ mod tests {
         assert_eq!(c.provider, "acp");
         assert_eq!(c.memory_limit, 200);
         assert!(c.auto_memory);
+    }
+
+    fn at(s: &str) -> chrono::NaiveDateTime { chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap() }
+    fn once(s: &str) -> crate::models::ScheduleConfig { crate::models::ScheduleConfig::Once { at: s.into(), delete_after_run: true } }
+
+    #[test]
+    fn parse_when_cases() {
+        use crate::models::ScheduleConfig as S;
+        let now = at("2025-06-10 14:20");
+        assert_eq!(parse_when("30分钟后", now).unwrap(), once("2025-06-10 14:50"));
+        assert_eq!(parse_when("2小时后", now).unwrap(), once("2025-06-10 16:20"));
+        assert_eq!(parse_when("半小时后", now).unwrap(), once("2025-06-10 14:50"));
+        assert_eq!(parse_when("in 10 min", now).unwrap(), once("2025-06-10 14:30"));
+        assert_eq!(parse_when("1天后", now).unwrap(), once("2025-06-11 14:20"));
+        assert_eq!(parse_when("今晚8点", now).unwrap(), once("2025-06-10 20:00"));
+        assert_eq!(parse_when("今晚", now).unwrap(), once("2025-06-10 20:00"));
+        assert_eq!(parse_when("明天 9:00", now).unwrap(), once("2025-06-11 09:00"));
+        assert!(parse_when("明早七点半", now).is_err()); // 汉字数字不支持
+        assert_eq!(parse_when("明早7点半", now).unwrap(), once("2025-06-11 07:30"));
+        assert_eq!(parse_when("明天下午3点", now).unwrap(), once("2025-06-11 15:00"));
+        assert_eq!(parse_when("后天 晚上9点", now).unwrap(), once("2025-06-12 21:00"));
+        assert_eq!(parse_when("大后天", now).unwrap(), once("2025-06-13 09:00"));
+        assert!(parse_when("今天 08:00", now).is_err());
+        assert_eq!(parse_when("21:30", now).unwrap(), once("2025-06-10 21:30"));
+        assert_eq!(parse_when("9:00", now).unwrap(), once("2025-06-11 09:00"));
+        assert_eq!(parse_when("9pm", now).unwrap(), once("2025-06-10 21:00"));
+        assert_eq!(parse_when("06-18 09:00", now).unwrap(), once("2025-06-18 09:00"));
+        assert_eq!(parse_when("6月18日晚上8点", now).unwrap(), once("2025-06-18 20:00"));
+        assert_eq!(parse_when("03-01", now).unwrap(), once("2026-03-01 09:00"));
+        assert_eq!(parse_when("2026-01-01 00:00", now).unwrap(), once("2026-01-01 00:00"));
+        assert!(parse_when("2024-01-01 00:00", now).is_err());
+        assert_eq!(parse_when("每天 08:30", now).unwrap(), S::Daily { time: "08:30".into() });
+        assert_eq!(parse_when("每天早上8点半", now).unwrap(), S::Daily { time: "08:30".into() });
+        assert_eq!(parse_when("每周一三五 21:00", now).unwrap(), S::Weekly { weekdays: vec![1, 3, 5], time: "21:00".into() });
+        assert_eq!(parse_when("每周日晚上10点", now).unwrap(), S::Weekly { weekdays: vec![7], time: "22:00".into() });
+        assert_eq!(parse_when("每周一、周三 9:00", now).unwrap(), S::Weekly { weekdays: vec![1, 3], time: "09:00".into() });
+        assert_eq!(parse_when("工作日 9:00", now).unwrap(), S::Weekly { weekdays: vec![1, 2, 3, 4, 5], time: "09:00".into() });
+        assert_eq!(parse_when("每2小时", now).unwrap(), S::Interval { every_minutes: 120 });
+        assert_eq!(parse_when("每小时", now).unwrap(), S::Interval { every_minutes: 60 });
+        assert!(parse_when("每1分钟", now).is_err());
+        assert!(parse_when("每年 06-18", now).is_err());
+        assert!(parse_when("找个时间", now).is_err());
+        assert_eq!(sched_label(&S::Weekly { weekdays: vec![1, 3], time: "09:00".into() }), "每周一、三 09:00");
+        assert_eq!(sched_label(&S::Interval { every_minutes: 120 }), "每 2 小时");
+    }
+
+    #[test]
+    fn wake_tools_and_workflows() {
+        let db = db();
+        let now = chrono::Local::now().naive_local();
+        let (w, existed) = create_wake(&db, "每天 08:30", "提醒用户喝水", now).unwrap();
+        assert!(!existed && w.name.starts_with("助手定时"));
+        assert!(create_wake(&db, "每天 08:30", "提醒用户喝水", now).unwrap().1);
+        create_wake(&db, "30分钟后", "问问构建修好没", now).unwrap();
+        assert!(create_wake(&db, "胡说", "x", now).is_err());
+        let list = list_wakes(&db).unwrap();
+        assert_eq!(list.len(), 2);
+        let w = &list[0].0;
+        assert_eq!(w.project_id, crate::models::NO_PROJECT_ID);
+        assert!(w.enabled && w.trigger_type == "schedule" && w.next_run_at.is_some());
+        assert_eq!(w.edges.len(), 1);
+        assert!(wake_block(&db).contains("提醒用户喝水"));
+        assert_eq!(cancel_wakes(&db, "x").unwrap(), 0);
+        assert_eq!(cancel_wakes(&db, "喝水").unwrap(), 1);
+        assert_eq!(list_wakes(&db).unwrap().len(), 1);
+
+        // MCP 工具
+        let defs = mcp_tool_definitions();
+        let names: Vec<&str> = defs.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(names, vec!["assistant_schedule_create", "assistant_schedule_list", "assistant_schedule_cancel"]);
+        assert!(mcp_call(&db, "workflow_list", &json!({})).is_none());
+        let v = mcp_call(&db, "assistant_schedule_create", &json!({"when": "明天 9:00", "message": "提醒用户交周报"})).unwrap().unwrap();
+        assert_eq!(v["existed"], json!(false));
+        assert!(v["when"].as_str().unwrap().contains("09:00"));
+        let id = v["id"].as_str().unwrap().to_string();
+        assert!(mcp_call(&db, "assistant_schedule_create", &json!({"when": "明天"})).unwrap().is_err());
+        assert!(mcp_call(&db, "assistant_schedule_create", &json!({"when": "找个时间", "message": "x"})).unwrap().is_err());
+        let l = mcp_call(&db, "assistant_schedule_list", &json!({})).unwrap().unwrap();
+        assert_eq!(l["schedules"].as_array().unwrap().len(), 2);
+        assert_eq!(mcp_call(&db, "assistant_schedule_cancel", &json!({"id": id})).unwrap().unwrap()["cancelled"], json!(1));
+        assert!(mcp_call(&db, "assistant_schedule_cancel", &json!({"id": "nope"})).unwrap().is_err());
+        assert!(mcp_call(&db, "assistant_schedule_cancel", &json!({})).unwrap().is_err());
+        assert_eq!(mcp_call(&db, "assistant_schedule_cancel", &json!({"keyword": "全部"})).unwrap().unwrap()["cancelled"], json!(1));
+        assert!(list_wakes(&db).unwrap().is_empty());
+
+        let cfg = AssistantConfig::default();
+        let off = AssistantConfig { mcp_tools: false, ..Default::default() };
+        assert!(system_prompt(&Persona::default(), &[], &cfg, SubMode::Tag).contains("assistant_schedule_create"));
+        assert!(!system_prompt(&Persona::default(), &[], &off, SubMode::Tag).contains("assistant_schedule_create"));
+        assert!(!system_prompt(&Persona::default(), &[], &cfg, SubMode::Off).contains("assistant_schedule_create"));
+    }
+
+    #[test]
+    fn wake_events_and_waiters() {
+        let mut req = WakeRequest { workflow_id: "w".into(), workflow_name: "日报".into(), step: "助手 2".into(), message: "总结今天的提交".into(), by_assistant: false };
+        let e = wake_event(&req);
+        assert!(e.contains("工作流「日报」") && e.contains("总结今天的提交"));
+        req.by_assistant = true;
+        let e = wake_event(&req);
+        assert!(e.contains("定时唤醒") && e.contains("[[跳过]]"));
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        wakes().lock().unwrap().insert("t1".into(), PendingWake { tx: Some(tx), event: e });
+        wake_resolve("t1", Ok("好".into()));
+        wake_resolve("t1", Ok("重复的会被忽略".into()));
+        assert_eq!(rx.try_recv().unwrap(), Ok("好".to_string()));
+        wake_end("t1");
+        assert!(wakes().lock().unwrap().get("t1").is_none());
+        let t = TurnResult { message: None, memories_added: 0, memories_forgotten: 0, end_conversation: false, skipped: true, subtitles: vec![], has_body: false };
+        assert!(wake_reply_text(&t).contains("不打扰"));
     }
 }

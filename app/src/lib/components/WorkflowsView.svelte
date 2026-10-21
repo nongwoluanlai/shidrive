@@ -204,7 +204,8 @@
         return;
       }
       selected.steps.push({ type, name: "", context_id: contexts[0].id, agent_type: "codex", prompt: "", session_id: null, timeout_sec: null, continue_on_error: false, ...base });
-    } else if (type === "delay") selected.steps.push({ type, name: "", seconds: 5, ...base });
+    } else if (type === "assistant") selected.steps.push({ type, name: "", message: "", timeout_sec: null, continue_on_error: false, ...base });
+    else if (type === "delay") selected.steps.push({ type, name: "", seconds: 5, ...base });
     else if (type === "env") selected.steps.push({ type, name: "", vars: {}, ...base });
     else if (type === "start") selected.steps.unshift({ type, name: "", ...{ x: 60, y: 20 } });
     else if (type === "note") selected.steps.push({ type, name: "", text: t("说明…"), ...base });
@@ -415,7 +416,7 @@
     const step: WorkflowStep = JSON.parse(JSON.stringify(clipboard));
     const i = selected.steps.length;
     const pos = { x: (atX ?? 60) + 24, y: (atY ?? 60) + 24 };
-    if (step.type === "shell" || step.type === "agent" || step.type === "delay" || step.type === "env") Object.assign(step, pos);
+    if (step.type === "shell" || step.type === "agent" || step.type === "assistant" || step.type === "delay" || step.type === "env") Object.assign(step, pos);
     const source = selected.steps.findIndex((_, k) => !hasOutgoing(selected, k));
     selected.steps.push(step);
     if (source >= 0 && source !== i) addEdge(selected, source, i);
@@ -563,8 +564,8 @@
   ];
 
   // ---------- misc ----------
-  const stepLabel: Record<string, string> = { start: "开始", note: "注释", balloon: "气泡", shell: "命令", agent: "Agent", delay: "等待", env: "变量" };
-  const stepIcon: Record<string, string> = { start: "🚩", note: "📝", balloon: "🔔", shell: "▶", agent: "🤖", delay: "⏱", env: "🔧" };
+  const stepLabel: Record<string, string> = { start: "开始", note: "注释", balloon: "气泡", shell: "命令", agent: "Agent", assistant: "助手", delay: "等待", env: "变量" };
+  const stepIcon: Record<string, string> = { start: "🚩", note: "📝", balloon: "🔔", shell: "▶", agent: "🤖", assistant: "💬", delay: "⏱", env: "🔧" };
 
   function envNewKey(step: { vars: Record<string, string> }): string {
     const base = "KEY";
@@ -709,6 +710,7 @@
               <button class="btn sm" onclick={() => addStep("note")}>📝 {t("注释")}</button>
               <button class="btn sm" onclick={() => addStep("shell")}>＋ {t("命令")}</button>
               <button class="btn sm" onclick={() => addStep("agent")}>＋ Agent</button>
+              <button class="btn sm" onclick={() => addStep("assistant")} title={t("交给全局助手：相当于给助手发一条消息")}>💬 {t("助手")}</button>
               <button class="btn sm" onclick={() => addStep("delay")}>＋ {t("等待")}</button>
               <button class="btn sm" onclick={() => addStep("env")}>＋ {t("变量")}</button>
               <button class="btn sm" onclick={() => addStep("balloon")}>🔔 {t("气泡")}</button>
@@ -799,6 +801,9 @@
                     {:else if step.type === "agent"}
                       {step.name || ((contexts.find((c) => c.id === step.context_id)?.name ?? t("未知上下文")) + " · " + (step.agent_type))}
                       {step.session_id ? "" : " · " + t("临时")}
+                    {:else if step.type === "assistant"}
+                      {step.name || firstLineOf(step.message) || t("全局助手")}
+                      {#if step.by_assistant}<span class="dim2"> · {t("助手创建")}</span>{/if}
                     {:else if step.type === "delay"}
                       {t("等待 {seconds} 秒", { seconds: step.seconds })}
                     {:else if step.type === "env"}
@@ -933,6 +938,16 @@
             <div class="field"><label>{t("超时秒")}</label><input class="num" type="number" min="0" value={st.timeout_sec ?? ""} oninput={(e) => (st.timeout_sec = (e.target as HTMLInputElement).value ? Number((e.target as HTMLInputElement).value) : null)} /></div>
             <label class="toggle"><input type="checkbox" bind:checked={st.continue_on_error} /> {t("失败继续")}</label>
           </div>
+        {:else if st.type === "assistant"}
+          <div class="field"><label>{t("节点名（可留空）")}</label><input bind:value={st.name} placeholder={t("如：日报总结")} /></div>
+          <div class="field"><label>{t("发给助手的内容（支持插值）")}</label><textarea rows="4" bind:value={st.message} placeholder={t("如：看看 {variable} 的构建结果，告诉我有没有问题", { variable: "{{env.build_stdout}}" })}></textarea></div>
+          <div class="srow">
+            <div class="field"><label>{t("超时秒（留空=600）")}</label><input class="num" type="number" min="0" value={st.timeout_sec ?? ""} oninput={(e) => (st.timeout_sec = (e.target as HTMLInputElement).value ? Number((e.target as HTMLInputElement).value) : null)} /></div>
+            <label class="toggle"><input type="checkbox" bind:checked={st.continue_on_error} /> {t("失败继续")}</label>
+          </div>
+          {#if st.by_assistant}<p class="hint">{t("这是全局助手给自己设的定时：到点唤醒她，按这段话行动。")}</p>{/if}
+          <p class="hint">{t("运行到该节点时相当于给全局助手发一条消息（带人设与长期记忆），回复显示在助手气泡里；需已启用全局助手且使驾界面在运行。")}</p>
+          <p class="hint">{t("输出变量：{variables}", { variables: "{{env." + (st.name || "step" + (idx + 1)) + "_reply}}" })}</p>
         {:else if st.type === "delay"}
           <div class="srow">
             <span>{t("等待")}</span>

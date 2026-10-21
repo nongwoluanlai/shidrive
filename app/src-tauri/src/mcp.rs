@@ -42,14 +42,20 @@ pub fn port_from_settings(db: &Db) -> i64 {
 /// Spawn the MCP HTTP server. Returns after binding; errors are logged.
 pub fn start(app: AppHandle, db: Arc<Db>, engine: Arc<crate::engine::Engine>) {
     let port = port_from_settings(&db) as u16;
+    let state = SHARED
+        .get_or_init(|| Arc::new(McpState { db, commit_lock: std::sync::Mutex::new(()), engine: std::sync::OnceLock::from(engine) }))
+        .clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = serve(app, db, engine, port).await {
+        if let Err(e) = serve(app, state, port).await {
             log::error!("MCP server failed on port {port}: {e}");
         }
     });
 }
 
-async fn serve(app: AppHandle, db: Arc<Db>, engine: Arc<crate::engine::Engine>, port: u16) -> Result<(), String> {
+/// 本机 MCP 的共享状态：HTTP 服务与全局助手（API 模式的工具调用在进程内执行）共用同一把提交锁
+static SHARED: std::sync::OnceLock<Arc<McpState>> = std::sync::OnceLock::new();
+
+async fn serve(app: AppHandle, state: Arc<McpState>, port: u16) -> Result<(), String> {
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
         Ok(l) => l,
         Err(e) => {
@@ -60,7 +66,6 @@ async fn serve(app: AppHandle, db: Arc<Db>, engine: Arc<crate::engine::Engine>, 
     };
     log::info!("MCP server listening on http://127.0.0.1:{port}/mcp");
     let _ = app.emit("mcp://status", json!({ "port": port, "running": true }));
-    let state = Arc::new(McpState { db, commit_lock: std::sync::Mutex::new(()), engine: std::sync::OnceLock::from(engine) });
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(x) => x,
@@ -153,7 +158,9 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, state: Arc<McpState>, ap
 
     // 会话绑定：使驾为每个 ACP 会话注入的地址形如 /mcp?ctx=<contextId>&agent=<type>，
     // 工具的 context_id / 项目参数缺省时自动落到该会话的上下文与项目。
-    let binding = parse_binding(&query, &hdr_ctx, &hdr_agent);
+    // 全局助手以 /mcp?assistant=1 接入：不绑定项目，开放全部工具 + 助手专用工具
+    let assistant = query_param(&query, "assistant").is_some_and(|v| !v.is_empty() && v != "0");
+    let binding = if assistant { None } else { parse_binding(&query, &hdr_ctx, &hdr_agent) };
     let bound = binding.as_ref();
 
     // 按「请求」判定（而非响应体）：通知 / 客户端回包只回 202 空体；initialize 才下发会话头。
@@ -172,9 +179,9 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, state: Arc<McpState>, ap
                     }
                     McpMessageKind::Initialize => {
                         is_initialize = true;
-                        (200, "application/json", handle_mcp(&state, &app, msg, bound).to_string())
+                        (200, "application/json", handle_mcp(&state, &app, msg, bound, assistant).to_string())
                     }
-                    McpMessageKind::Request => (200, "application/json", handle_mcp(&state, &app, msg, bound).to_string()),
+                    McpMessageKind::Request => (200, "application/json", handle_mcp(&state, &app, msg, bound, assistant).to_string()),
                 },
                 Err(e) => (
                     200,
@@ -355,7 +362,7 @@ fn skills_document(query: &str, port: u16) -> String {
 
 // ---------- MCP protocol ----------
 
-fn handle_mcp(state: &McpState, app: &AppHandle, msg: Value, bound: Option<&Binding>) -> Value {
+fn handle_mcp(state: &McpState, app: &AppHandle, msg: Value, bound: Option<&Binding>, assistant: bool) -> Value {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or_default().to_string();
     let params = msg.get("params").cloned().unwrap_or(json!({}));
@@ -368,7 +375,9 @@ fn handle_mcp(state: &McpState, app: &AppHandle, msg: Value, bound: Option<&Bind
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "shidrive", "title": "使驾共享上下文", "version": env!("CARGO_PKG_VERSION") }
             });
-            if let (Some(b), Some(info)) = (bound, info.as_ref()) {
+            if assistant {
+                result["instructions"] = Value::String(assistant_instructions().into());
+            } else if let (Some(b), Some(info)) = (bound, info.as_ref()) {
                 result["instructions"] = Value::String(server_instructions(info, &b.agent));
             }
             json!({ "jsonrpc": "2.0", "id": id, "result": result })
@@ -379,6 +388,7 @@ fn handle_mcp(state: &McpState, app: &AppHandle, msg: Value, bound: Option<&Bind
         "ping" => json!({"jsonrpc":"2.0","id":id,"result":{}}),
         "tools/list" => {
             let tools = match info.as_ref() {
+                _ if assistant => assistant_tool_definitions(),
                 Some(info) => bind_tool_definitions(tool_definitions(), info),
                 None => tool_definitions(),
             };
@@ -390,7 +400,8 @@ fn handle_mcp(state: &McpState, app: &AppHandle, msg: Value, bound: Option<&Bind
             if let (Some(b), Some(_)) = (bound, info.as_ref()) {
                 args = apply_binding(b, &name, args);
             }
-            match call_tool(state, app, &name, &args) {
+            let r = if assistant { call_assistant_tool(state, app, &name, &args) } else { call_tool(state, app, &name, &args) };
+            match r {
                 Ok(text) => json!({
                     "jsonrpc":"2.0","id":id,
                     "result":{"content":[{"type":"text","text":text}],"isError":false}
@@ -406,6 +417,73 @@ fn handle_mcp(state: &McpState, app: &AppHandle, msg: Value, bound: Option<&Bind
             "error":{"code":-32601,"message":format!("未知方法 {other}。可用方法：initialize、tools/list、tools/call（工具见 tools/list）。")}
         }),
     }
+}
+
+// ---------- 全局助手接入 ----------
+
+fn assistant_instructions() -> &'static str {
+    "你是使驾（ShiDrive）的全局助手，这里是使驾本机服务，开放了全部工具：shidrive_overview 查看项目与共享上下文；\
+context_* 读写共享上下文（需 context_id）；workflow_* 管理 / 运行工作流（project_name 省略 = 「无项目」）；\
+assistant_schedule_* 给自己设、查、取消定时（到点使驾会唤醒你）。会改动或执行东西的操作只在用户明确要求时做。"
+}
+
+/// 助手可见的工具：标准工具 + 总览 + 助手专用工具
+pub fn assistant_tool_definitions() -> Value {
+    let mut tools = tool_definitions();
+    if let Some(arr) = tools.as_array_mut() {
+        arr.push(json!({
+            "name": "shidrive_overview",
+            "description": "使驾总览：所有项目（名称 / 根目录 / 工作流数）及其共享上下文（context_id / 名称）。调用 context_* 前用它拿 context_id，调用 workflow_* 时用其中的项目名作 project_name。",
+            "inputSchema": { "type": "object", "properties": {} }
+        }));
+        if let Value::Array(more) = crate::assistant::mcp_tool_definitions() { arr.extend(more); }
+    }
+    tools
+}
+
+/// 同上，转成 OpenAI function calling 的格式（API 模式）
+pub fn assistant_function_tools() -> Value {
+    Value::Array(
+        assistant_tool_definitions()
+            .as_array()
+            .map(|a| a.iter().map(|t| json!({ "type": "function", "function": {
+                "name": t["name"], "description": t["description"], "parameters": t["inputSchema"]
+            }})).collect())
+            .unwrap_or_default(),
+    )
+}
+
+fn overview(state: &McpState) -> Result<Value, String> {
+    let mut out = Vec::new();
+    for p in state.db.list_projects()? {
+        let contexts: Vec<Value> = state.db.list_contexts(&p.id)?.iter().map(|c| json!({ "context_id": c.id, "name": c.name })).collect();
+        let workflows = state.db.list_workflows(&p.id).map(|l| l.len()).unwrap_or(0);
+        out.push(json!({ "project_name": p.name, "root": p.root_path, "workflows": workflows, "contexts": contexts }));
+    }
+    Ok(json_bytes(&json!({ "projects": out, "hint": "「无项目」下的工作流省略 project_name 即可；你自己设的定时也在那里（用 assistant_schedule_list 查看）。" })))
+}
+
+fn call_assistant_tool(state: &McpState, app: &AppHandle, name: &str, args: &Value) -> Result<Value, String> {
+    if name == "shidrive_overview" { return overview(state); }
+    if let Some(r) = crate::assistant::mcp_call(&state.db, name, args) {
+        let v = r?;
+        if name != "assistant_schedule_list" {
+            let _ = app.emit(crate::assistant::EVT_SCHEDULES, json!({ "tool": name, "result": v }));
+        }
+        return Ok(json_bytes(&v));
+    }
+    call_tool(state, app, name, args).map_err(|e| {
+        if e.starts_with("未知工具") { format!("{e} 另有：shidrive_overview、assistant_schedule_create、assistant_schedule_list、assistant_schedule_cancel。") } else { e }
+    })
+}
+
+/// 全局助手（API 模式）在进程内调用 MCP 工具，返回给模型的文本
+pub fn assistant_call(app: &AppHandle, name: &str, args: &Value) -> Result<String, String> {
+    let state = SHARED.get().ok_or("使驾本机 MCP 未启动")?;
+    call_assistant_tool(state, app, name, args).map(|v| match v {
+        Value::String(s) => s,
+        other => other.to_string(),
+    })
 }
 
 fn tool_definitions() -> Value {
@@ -480,7 +558,7 @@ fn tool_definitions() -> Value {
             "description": "在项目中创建工作流。返回 graph（最终索引与连线的简明结构）和 auto_adjustments（自动做了什么），请据此核对。连线写错（越界/自环/成环/连到注释）会直接报错而不是静默丢弃。",
             "inputSchema": { "type":"object", "required":["name","steps"], "properties":{
                 "name": {"type":"string","description":"工作流名称"},
-                "steps": {"type":"array","description":"节点数组，数组下标即节点索引（连线用它）。可省略 start：会自动插入到最前（此时你的索引整体 +1，返回的 graph 字段会给出最终索引）。类型：\n- shell：{\"type\":\"shell\",\"name\":\"构建\",\"command\":\"pnpm build\",\"cwd\":\"\",\"shell\":\"cmd|powershell|python\",\"timeout_sec\":600,\"continue_on_error\":false}（cwd 留空=项目根目录）\n- agent：{\"type\":\"agent\",\"name\":\"审查\",\"context_id\":\"<上下文id>\",\"agent_type\":\"codex|zcode\",\"prompt\":\"...\",\"session_id\":null}（session_id 为空=临时会话）\n- env：{\"type\":\"env\",\"name\":\"\",\"vars\":{\"KEY\":\"value\"}}\n- delay：{\"type\":\"delay\",\"seconds\":5}\n- balloon（系统气泡通知）：{\"type\":\"balloon\",\"title\":\"完成\",\"message\":\"...\",\"click_action\":\"none|open|url\",\"click_target\":\"\",\"sound\":false}\n- note（画布注释，不执行、不要连线）：{\"type\":\"note\",\"text\":\"...\"}\n模板：{{env.KEY}}、{{date:%Y%m%d}}；shell 节点结束后产出 {{env.<节点名>_stdout}} / _stderr / _exit（无名时为 step<序号>）。坐标 x/y 可省略——会按连线自动分层布局。","items": {"type":"object"}},
+                "steps": {"type":"array","description":"节点数组，数组下标即节点索引（连线用它）。可省略 start：会自动插入到最前（此时你的索引整体 +1，返回的 graph 字段会给出最终索引）。类型：\n- shell：{\"type\":\"shell\",\"name\":\"构建\",\"command\":\"pnpm build\",\"cwd\":\"\",\"shell\":\"cmd|powershell|python\",\"timeout_sec\":600,\"continue_on_error\":false}（cwd 留空=项目根目录）\n- agent：{\"type\":\"agent\",\"name\":\"审查\",\"context_id\":\"<上下文id>\",\"agent_type\":\"codex|zcode\",\"prompt\":\"...\",\"session_id\":null}（session_id 为空=临时会话）\n- env：{\"type\":\"env\",\"name\":\"\",\"vars\":{\"KEY\":\"value\"}}\n- delay：{\"type\":\"delay\",\"seconds\":5}\n- balloon（系统气泡通知）：{\"type\":\"balloon\",\"title\":\"完成\",\"message\":\"...\",\"click_action\":\"none|open|url\",\"click_target\":\"\",\"sound\":false}\n- assistant（交给使驾全局助手处理，相当于给助手发一条消息；助手带人设与长期记忆，回复显示在助手气泡里，需用户已启用全局助手）：{\"type\":\"assistant\",\"name\":\"\",\"message\":\"...\",\"timeout_sec\":600}，产出 {{env.<节点名>_reply}}\n- note（画布注释，不执行、不要连线）：{\"type\":\"note\",\"text\":\"...\"}\n模板：{{env.KEY}}、{{date:%Y%m%d}}；shell 节点结束后产出 {{env.<节点名>_stdout}} / _stderr / _exit（无名时为 step<序号>）。坐标 x/y 可省略——会按连线自动分层布局。","items": {"type":"object"}},
                 "edges": {"type":"array","description":"有向连线（无环）。写法任选：{\"from\":0,\"to\":1}、{\"source\":\"构建\",\"target\":\"测试\"}、[0,1]；端点可用索引或唯一的节点名。索引基于你传入的 steps。省略或 [] = 按顺序串联。所有无前驱节点会自动从开始节点并行起跑。并行示例（打包后同时上传和通知）：steps=[打包,上传,通知] edges=[[0,1],[0,2]]。"},
                 "auto_layout": {"type":"boolean","description":"强制按连线重新布局（默认仅在有节点未给坐标时布局）"},
                 "env": {"type":"object","description":"工作流级环境变量（值支持 {{date:格式}} 插值）"},
@@ -854,7 +932,7 @@ fn wf_public(w: &Workflow) -> Value {
 fn parse_steps(raw: &Value) -> Result<Vec<WorkflowStep>, String> {
     match raw {
         Value::Array(_) => serde_json::from_value::<Vec<WorkflowStep>>(raw.clone()).map_err(|e| {
-            format!("steps 格式不正确：{e}。每个步骤形如 {{\"type\":\"shell\",\"name\":\"构建\",\"command\":\"pnpm build\",\"cwd\":\"\",\"shell\":\"cmd\"}}；可选 type: start/agent/delay/env。")
+            format!("steps 格式不正确：{e}。每个步骤形如 {{\"type\":\"shell\",\"name\":\"构建\",\"command\":\"pnpm build\",\"cwd\":\"\",\"shell\":\"cmd\"}}；可选 type: start/shell/agent/assistant/env/delay/balloon/note。")
         }),
         _ => Err("steps 必须是数组。".into()),
     }
@@ -1308,5 +1386,23 @@ mod escape_tests {
     fn files_are_always_repaired() {
         assert_eq!(repair_path("src\test.rs"), "src\\test.rs");
         assert_eq!(repair_path(" app\nav.ts "), "app\\nav.ts");
+    }
+}
+
+#[cfg(test)]
+mod assistant_tests {
+    use super::*;
+
+    #[test]
+    fn assistant_tools_cover_everything() {
+        let t = assistant_tool_definitions();
+        let names: Vec<&str> = t.as_array().unwrap().iter().filter_map(|x| x["name"].as_str()).collect();
+        for k in KNOWN_TOOLS { assert!(names.contains(&k), "{k}"); }
+        for k in ["shidrive_overview", "assistant_schedule_create", "assistant_schedule_list", "assistant_schedule_cancel"] { assert!(names.contains(&k), "{k}"); }
+        let f = assistant_function_tools();
+        let f = f.as_array().unwrap();
+        assert_eq!(f.len(), names.len());
+        assert!(f.iter().all(|x| x["type"] == "function" && x["function"]["parameters"]["type"] == "object"));
+        assert!(!tool_definitions().as_array().unwrap().iter().any(|x| x["name"] == "assistant_schedule_create"));
     }
 }

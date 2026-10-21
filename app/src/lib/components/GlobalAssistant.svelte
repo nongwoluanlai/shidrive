@@ -71,7 +71,7 @@
   const liveText = $derived(ga.subs.length ? subText(ga.subs) : streamingText);
   const page = $derived(ga.bubble.pages[ga.bubble.index] ?? "");
   const pageCount = $derived(ga.bubble.pages.length);
-  const busy = $derived(ga.busy === "send" || ga.busy === "greet" || ga.busy === "care" || ga.busy === "reset");
+  const busy = $derived(ga.busy === "send" || ga.busy === "greet" || ga.busy === "care" || ga.busy === "wake" || ga.busy === "reset");
   /** 朗读刚读完：气泡继续显示最后一句字幕，片刻后收起 */
   let holdSub = $state(false);
   /** 人物气泡在朗读：显示与音频同步的字幕 */

@@ -13,14 +13,14 @@
 - **内置 ShiDrive Agent**：无需安装适配器，在「设置 → Agent 管理 → ShiDrive」填写 OpenAI 兼容接口（地址 / API Key / 模型）即可使用；可读写文件、执行命令、调用共享上下文工具，支持会话保存 / 恢复 / 列表，模式可选 询问（改文件 / 执行命令前确认）、自动、只读。
 - **多 Agent 注册表**：内置 Codex、ZCode、Claude、Cline、Codebuddy、Cursor、MiniMax、OpenCode、Qoder、Grok 十种 ACP 工具。启用顺序即会话页标签顺序；npm 类适配器在设置页一键安装（支持 HTTP 代理、npmmirror 镜像回退、`--omit=optional` 跳过大体积平台二进制）。
 <img width="892" height="793" alt="image" src="https://github.com/user-attachments/assets/b9bd3ffe-df63-4654-9694-c6974f1cf61b" />
-- **图形化工作流**：画布拖拽 / 自由连线 / 双击编辑；开始、注释、气泡提醒、环境变量、命令（cmd/powershell/python）、Agent 调度、延时等节点；并行分支、定时与手动触发、运行日志、复制粘贴、自动保存。
+- **图形化工作流**：画布拖拽 / 自由连线 / 双击编辑；开始、注释、气泡提醒、环境变量、命令（cmd/powershell/python）、Agent 调度、全局助手（把一件事交给助手处理）、延时等节点；并行分支、定时与手动触发、运行日志、复制粘贴、自动保存。
 <img width="1272" height="1298" alt="image" src="https://github.com/user-attachments/assets/812ee760-deea-4384-92f8-3cab691a1eed" />
 
 - **共享上下文 MCP**：本地 HTTP MCP 服务（默认 `127.0.0.1:8345`），把项目上下文以 git 式提交模型开放给 Agent——`context_get/update/history/search` + 工作流六工具，带版本冲突检测与字节限额。
 - **Coding MCP（独立模式）**：`shidrive.exe --coding-mcp` 以独立进程暴露文件与命令工具（路径越界防护、Token/Basic 认证、执行开关）。
 - **外部编程接入**：Passcode / OAuth 双接入；OAuth 请求由桌面端全局审批，复用「开放目录与上下文」中的当前权限，支持多项目访问、令牌吊销和标准 MCP 自动发现；详见 [OAuth 合并说明](docs/oauth-global-permissions.md)。
 - **文件树与编辑器**：目录树、系统剪贴板互操作、终端/资源管理器打开、内置编辑器。
-- **全局助手**：独立于项目会话的长期对话伙伴，左下角（或皮肤人物旁）气泡；大脑可选已安装的 ACP Agent 或 OpenAI 兼容 API；记住你的偏好（长期记忆），人设与说话风格跟随皮肤角色；你不忙时她会偶尔主动关怀（深夜、久坐、饭点、未完成待办…，可设最短间隔，每天最多 6 次）；标题栏附带轻量**待办**面板。
+- **全局助手**：独立于项目会话的长期对话伙伴，左下角（或皮肤人物旁）气泡；大脑可选已安装的 ACP Agent 或 OpenAI 兼容 API；记住你的偏好（长期记忆），人设与说话风格跟随皮肤角色；你不忙时她会偶尔主动关怀（深夜、久坐、饭点、未完成待办…，可设最短间隔，每天最多 6 次）；可开放使驾 MCP 全部工具（读写项目上下文、管理 / 运行工作流）并带助手专用工具：给自己设定时（「明天 9 点提醒我」或悄悄记下你的生日），到点由工作流唤醒她，定时放在工作流「无项目」里可查看 / 删除；标题栏附带轻量**待办**面板。
 - **语音**：双击 Ctrl / 唤醒词（默认「Christina」，离线检测）唤起，支持多轮语音对话；识别用本地 SenseVoice（离线）或百度短语音识别；朗读用本地 MeloTTS / Kokoro、系统语音或**角色语音包**（如牧濑红莉栖 · Amadeus 日语，字幕仍显示界面语言）。语音运行环境与模型都在设置里按需下载，不装进系统。
 - **皮肤**：内置「命运石之门」「地狱乐」两套，更多皮肤（含动态人物）从皮肤商店获取；皮肤包（`skin.json` + 图片，zip）可拖入导入，支持人物立绘、动态特效、时间线插画、不透明度调节，并可声明绑定的角色语音包。制作方法见 [皮肤开发指南](docs/skin-guide.md)。
 <img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/1221c69e-a69b-4fab-ba0d-126868d88cc0" />

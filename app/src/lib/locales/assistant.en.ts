@@ -134,4 +134,9 @@ export const assistantEn: Record<string, string> = {
   "她觉得现在不适合打扰你，这次没说话": "She decided not to disturb you this time",
   "这次没有生成关怀内容": "Nothing was generated this time",
   "她开口了：关掉设置就能看到气泡": "She said something — close Settings to see the bubble",
+  "全局助手未启用": "The global assistant is not enabled",
+  "助手一直在忙，这次没能处理": "The assistant stayed busy and couldn’t handle this",
+  "设了个定时：{when}": "Reminder set: {when}",
+  "取消了 {n} 个定时": "Cancelled {n} reminder(s)",
+  "给助手开放使驾 MCP 工具（读写项目上下文、管理 / 运行工作流、给自己设定时——到点由工作流唤醒她，定时在工作流「无项目」里可查看 / 删除）": "Give the assistant ShiDrive MCP tools (read/write project contexts, manage/run workflows, schedule reminders for herself — a workflow wakes her on time; view or delete them under Workflows → No project)",
 };

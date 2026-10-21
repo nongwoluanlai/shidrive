@@ -1,7 +1,7 @@
 // 全局助手前端状态：配置 / 对话 / 记忆，流式增量（acp://assistant-update）与气泡分页。
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../ipc";
-import { app, currentContext, currentProject, toast } from "../state.svelte";
+import { app, currentContext, currentProject, NO_PROJECT_ID, refreshWorkflows, toast } from "../state.svelte";
 import { skinAssistant } from "../skins.svelte";
 import { emitSkinEvent } from "../skin-fx/bus";
 import { skinPersona, toWire, type ResolvedPersona } from "./personas";
@@ -9,7 +9,7 @@ import { t } from "../i18n";
 import { beginSpeech, feedSpeech, initVoice, speechHint, stopSpeaking } from "./voice.svelte";
 import type { AssistantConfigView, AssistantMemory, AssistantMessage, AssistantSubtitle, AssistantTurnResult, SpeechHint } from "../types";
 
-type Busy = "" | "send" | "greet" | "care" | "summarize" | "reset";
+type Busy = "" | "send" | "greet" | "care" | "wake" | "summarize" | "reset";
 
 export const ga = $state({
   loaded: false,
@@ -217,6 +217,15 @@ export async function initAssistant() {
       }
     });
   }
+  if (!unlistenWake) {
+    unlistenWake = await listen<any>("assistant://wake", (e) => {
+      const id = e.payload?.reqId;
+      if (typeof id !== "string" || !id) return;
+      wakeQueue.push(id);
+      void drainWakes();
+    });
+    await listen<any>("assistant://schedules", (e) => onSchedules(e.payload));
+  }
   await reload();
   await initVoice();
   if (enabled() && needsNewSession()) {
@@ -224,6 +233,35 @@ export async function initAssistant() {
     await waitUntil(() => app.ready, 8000);
     if (app.skin) await waitUntil(() => skinAssistant.id === app.skin, 4000);
     if (enabled() && needsNewSession() && !ga.busy) void greet("new");
+  }
+}
+
+// ---------------- 唤醒（工作流「全局助手」节点 / 助手自己设的定时） ----------------
+
+let unlistenWake: (() => void) | null = null;
+const wakeQueue: string[] = [];
+let draining = false;
+
+/** 逐个处理唤醒请求：等助手空闲再跑（最多等 5 分钟），跑不了就告诉后端，工作流节点据此失败 */
+async function drainWakes() {
+  if (draining) return;
+  draining = true;
+  try {
+    while (wakeQueue.length) {
+      const id = wakeQueue.shift()!;
+      if (!ga.loaded) await waitUntil(() => ga.loaded, 10_000);
+      if (!enabled()) { void api.assistantWakeFail(id, t("全局助手未启用")).catch(() => {}); continue; }
+      await waitUntil(() => !ga.busy, 5 * 60_000);
+      if (ga.busy) { void api.assistantWakeFail(id, t("助手一直在忙，这次没能处理")).catch(() => {}); continue; }
+      let called = false;
+      await runTurn("wake", (turnId) => {
+        called = true;
+        return api.assistantWake(id, toWire(persona(), app.locale), appState(), turnId, hint());
+      }, true);
+      if (!called) void api.assistantWakeFail(id, t("助手一直在忙，这次没能处理")).catch(() => {});
+    }
+  } finally {
+    draining = false;
   }
 }
 
@@ -304,11 +342,13 @@ async function runTurn(kind: Busy, call: (turnId: string) => Promise<AssistantTu
     } else {
       showBubble("", t("（没有回复内容）"));
     }
+    const bits = [];
     if (r.memories_added || r.memories_forgotten) {
       void loadMemories();
-      const bits = [];
       if (r.memories_added) bits.push(t("记住了 {n} 条", { n: r.memories_added }));
       if (r.memories_forgotten) bits.push(t("忘掉了 {n} 条", { n: r.memories_forgotten }));
+    }
+    if (bits.length) {
       memoNote.text = bits.join(" · ");
       memoNote.rev++;
     }
@@ -340,6 +380,19 @@ async function runTurn(kind: Busy, call: (turnId: string) => Promise<AssistantTu
       void refreshView();
     }
   }
+}
+
+/** 助手用 MCP 工具设 / 取消了定时：小提示 + 刷新工作流列表（定时放在「无项目」下） */
+function onSchedules(p: any) {
+  const r = p?.result ?? {};
+  let text = "";
+  if (p?.tool === "assistant_schedule_create" && !r.existed) text = t("设了个定时：{when}", { when: String(r.when ?? "") });
+  else if (p?.tool === "assistant_schedule_cancel" && r.cancelled) text = t("取消了 {n} 个定时", { n: r.cancelled });
+  if (text) {
+    memoNote.text = text;
+    memoNote.rev++;
+  }
+  if (app.projectId === NO_PROJECT_ID) void refreshWorkflows().catch(() => {});
 }
 
 /** 记忆变动的小提示（气泡底部短暂显示） */
@@ -420,7 +473,7 @@ export async function summarize(mode: "consolidate" | "extract"): Promise<number
 
 /** 已发出、还没收到任何文字 */
 export function isThinking() {
-  return (ga.busy === "send" || ga.busy === "greet" || ga.busy === "care" || ga.busy === "reset") && !ga.streaming && !ga.subs.length;
+  return (ga.busy === "send" || ga.busy === "greet" || ga.busy === "care" || ga.busy === "wake" || ga.busy === "reset") && !ga.streaming && !ga.subs.length;
 }
 
 /** 点击人物 / 语音唤起：打开输入框 */

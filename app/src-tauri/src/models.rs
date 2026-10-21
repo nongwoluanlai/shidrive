@@ -254,6 +254,27 @@ pub enum WorkflowStep {
         #[serde(default)]
         y: f64,
     },
+    /// 全局助手：相当于给助手发一条（系统）消息，助手带着人设与长期记忆处理，回复显示在气泡里
+    #[serde(rename = "assistant")]
+    Assistant {
+        #[serde(default)]
+        name: String,
+        /// 发给助手的内容（支持插值）
+        #[serde(default)]
+        message: String,
+        /// 等助手回复的上限（秒）；None = 10 分钟
+        #[serde(default)]
+        timeout_sec: Option<u64>,
+        #[serde(default)]
+        continue_on_error: bool,
+        /// 由助手自己创建（定时唤醒自己）
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        by_assistant: bool,
+        #[serde(default)]
+        x: f64,
+        #[serde(default)]
+        y: f64,
+    },
     #[serde(rename = "delay")]
     Delay {
         #[serde(default)]
@@ -298,7 +319,8 @@ impl WorkflowStep {
             WorkflowStep::Shell { name, x, y, continue_on_error, .. } => StepMeta {
                 name: name.clone(), x: *x, y: *y, continue_on_error: *continue_on_error,
             },
-            WorkflowStep::Agent { name, x, y, continue_on_error, .. } => StepMeta {
+            WorkflowStep::Agent { name, x, y, continue_on_error, .. }
+            | WorkflowStep::Assistant { name, x, y, continue_on_error, .. } => StepMeta {
                 name: name.clone(), x: *x, y: *y, continue_on_error: *continue_on_error,
             },
             WorkflowStep::Delay { name, x, y, .. } => StepMeta {
@@ -317,6 +339,7 @@ impl WorkflowStep {
             | WorkflowStep::Balloon { x: ox, y: oy, .. }
             | WorkflowStep::Shell { x: ox, y: oy, .. }
             | WorkflowStep::Agent { x: ox, y: oy, .. }
+            | WorkflowStep::Assistant { x: ox, y: oy, .. }
             | WorkflowStep::Delay { x: ox, y: oy, .. }
             | WorkflowStep::EnvSet { x: ox, y: oy, .. } => {
                 *ox = x;
@@ -327,7 +350,7 @@ impl WorkflowStep {
 
     pub fn timeout(&self) -> Option<u64> {
         match self {
-            WorkflowStep::Shell { timeout_sec, .. } | WorkflowStep::Agent { timeout_sec, .. } => *timeout_sec,
+            WorkflowStep::Shell { timeout_sec, .. } | WorkflowStep::Agent { timeout_sec, .. } | WorkflowStep::Assistant { timeout_sec, .. } => *timeout_sec,
             _ => None,
         }
     }

@@ -471,6 +471,13 @@ impl Engine {
                 };
                 self.run_agent(run_id, ctrl.clone(), context_id, agent_type, target, &prompt, step.timeout()).await
             }
+            WorkflowStep::Assistant { message, by_assistant, .. } => {
+                let message = substitute(message, &snap);
+                let (ok, reply) = self.run_assistant(run_id, ctrl.clone(), w, &label, &message, *by_assistant, step.timeout()).await;
+                let key = step_output_key(step, i);
+                env.lock().unwrap().insert(format!("{key}_reply"), truncate_env(&reply));
+                ok
+            }
             WorkflowStep::Start { .. } => true,
             WorkflowStep::Note { .. } => {
                 // 注释节点：不执行任何操作
@@ -572,6 +579,56 @@ impl Engine {
             Err(e) => {
                 self.log(run_id, &format!("Agent 节点失败: {e}"));
                 false
+            }
+        }
+    }
+
+    /// 全局助手节点：交给前端的全局助手处理（人设 / 语音在前端），等它回复完
+    #[allow(clippy::too_many_arguments)]
+    async fn run_assistant(
+        &self,
+        run_id: &str,
+        ctrl: Arc<RunControl>,
+        w: &Workflow,
+        step: &str,
+        message: &str,
+        by_assistant: bool,
+        timeout_sec: Option<u64>,
+    ) -> (bool, String) {
+        if message.trim().is_empty() {
+            self.log(run_id, "助手节点没有填写要发给助手的内容");
+            return (false, String::new());
+        }
+        let req = crate::assistant::WakeRequest {
+            workflow_id: w.id.clone(),
+            workflow_name: w.name.clone(),
+            step: step.to_string(),
+            message: message.to_string(),
+            by_assistant,
+        };
+        let (req_id, rx) = match crate::assistant::wake_begin(&self.app, &self.db, req) {
+            Ok(v) => v,
+            Err(e) => {
+                self.log(run_id, &format!("助手节点失败: {e}"));
+                return (false, String::new());
+            }
+        };
+        self.log(run_id, &format!("→ [全局助手] {}", first_line(message)));
+        let secs = timeout_sec.filter(|s| *s > 0).unwrap_or(600);
+        let result = tokio::select! {
+            r = rx => r.unwrap_or_else(|_| Err("助手请求被丢弃".into())),
+            _ = tokio::time::sleep(Duration::from_secs(secs)) => Err(format!("等待助手回复超时（{secs} 秒；界面未打开或助手一直在忙？）")),
+            _ = wait_for_stop(ctrl.stop.clone()) => Err("助手节点已停止".into()),
+        };
+        crate::assistant::wake_end(&req_id);
+        match result {
+            Ok(reply) => {
+                self.log(run_id, &format!("← [全局助手] {}", if reply.is_empty() { "（没有回复内容）".to_string() } else { first_line(&reply) }));
+                (true, reply)
+            }
+            Err(e) => {
+                self.log(run_id, &format!("助手节点失败: {e}"));
+                (false, String::new())
             }
         }
     }
@@ -798,7 +855,7 @@ async fn execute_shell(
 
 fn step_output_key(step: &WorkflowStep, i: usize) -> String {
     match step {
-        WorkflowStep::Shell { name, .. } => {
+        WorkflowStep::Shell { name, .. } | WorkflowStep::Assistant { name, .. } => {
             if name.is_empty() {
                 format!("step{}", i + 1)
             } else {
@@ -914,6 +971,13 @@ fn step_name(step: &WorkflowStep, i: usize) -> String {
         WorkflowStep::Agent { name, prompt, .. } => {
             if name.is_empty() {
                 format!("Agent {0}：{1}", i + 1, first_line(prompt))
+            } else {
+                name.clone()
+            }
+        }
+        WorkflowStep::Assistant { name, message, .. } => {
+            if name.is_empty() {
+                format!("助手 {0}：{1}", i + 1, first_line(message))
             } else {
                 name.clone()
             }

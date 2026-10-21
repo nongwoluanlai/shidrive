@@ -547,4 +547,13 @@ export const workbenchEn: Record<string, string> = {
   "最大步数需为 1 ~ 500 的整数": "Max steps must be an integer from 1 to 500",
   "已保存，ShiDrive Agent 可以使用了": "Saved. The ShiDrive agent is ready to use",
   "已保存（还需填写接口地址与模型）": "Saved (endpoint and model are still required)",
+  "助手": "Assistant",
+  "交给全局助手：相当于给助手发一条消息": "Hand off to the global assistant — like sending her a message",
+  "助手创建": "set by assistant",
+  "如：日报总结": "e.g. Daily summary",
+  "发给助手的内容（支持插值）": "Message to the assistant (supports interpolation)",
+  "如：看看 {variable} 的构建结果，告诉我有没有问题": "e.g. Look at the build output in {variable} and tell me if anything is wrong",
+  "超时秒（留空=600）": "Timeout seconds (blank = 600)",
+  "这是全局助手给自己设的定时：到点唤醒她，按这段话行动。": "The global assistant scheduled this for herself: when it fires she wakes up and acts on this note.",
+  "运行到该节点时相当于给全局助手发一条消息（带人设与长期记忆），回复显示在助手气泡里；需已启用全局助手且使驾界面在运行。": "When this node runs it sends the global assistant a message (with her persona and long-term memory); the reply shows in her bubble. Requires the global assistant to be enabled and the ShiDrive window to be running.",
 };

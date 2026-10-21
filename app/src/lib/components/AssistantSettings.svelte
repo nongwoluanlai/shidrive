@@ -248,6 +248,7 @@
     <div class="sec">
       <h3>{t("记忆与气泡")}</h3>
       <label class="check"><input type="checkbox" bind:checked={draft.auto_memory} /> {t("自动记忆（助手在对话中发现值得记住的信息时自动记下）")}</label>
+      <label class="check"><input type="checkbox" bind:checked={draft.mcp_tools} /> {t("给助手开放使驾 MCP 工具（读写项目上下文、管理 / 运行工作流、给自己设定时——到点由工作流唤醒她，定时在工作流「无项目」里可查看 / 删除）")}</label>
       <label class="check"><input type="checkbox" bind:checked={draft.share_app_state} /> {t("附带使驾当前状态（项目名与路径、共享上下文、页面、编程 Agent）")}</label>
       <div class="row">
         <span class="lbl w2">{t("每轮带上记忆")}</span>

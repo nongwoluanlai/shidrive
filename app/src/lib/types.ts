@@ -214,6 +214,18 @@ export type WorkflowStep =
       x: number;
       y: number;
     }
+  | {
+      type: "assistant";
+      name: string;
+      /** 发给全局助手的内容（支持插值） */
+      message: string;
+      timeout_sec: number | null;
+      continue_on_error: boolean;
+      /** 由助手自己创建（定时唤醒自己） */
+      by_assistant?: boolean;
+      x: number;
+      y: number;
+    }
   | { type: "delay"; name: string; seconds: number; x: number; y: number }
   | {
       type: "env";
@@ -460,6 +472,8 @@ export interface AssistantConfig {
   care_interval_minutes: number;
   care_late_hour: number;
   care_voice: boolean;
+  /** 给助手开放使驾本地 MCP（上下文 / 工作流 / 自己的定时等全部工具） */
+  mcp_tools: boolean;
 }
 export interface AssistantConfigView {
   config: AssistantConfig;

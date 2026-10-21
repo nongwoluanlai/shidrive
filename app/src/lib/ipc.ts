@@ -248,6 +248,10 @@ export const api = {
     invoke<AssistantTurnResult>("assistant_greet", { persona, appState, turnId, reason, speech }),
   assistantCare: (persona: AssistantPersona, appState: string | null, turnId: string, context: string, speech: SpeechHint | null = null) =>
     invoke<AssistantTurnResult>("assistant_care", { persona, appState, turnId, context, speech }),
+  /** 工作流「全局助手」节点 / 助手自己设的定时到点：按 reqId 取事件跑一轮 */
+  assistantWake: (reqId: string, persona: AssistantPersona, appState: string | null, turnId: string, speech: SpeechHint | null = null) =>
+    invoke<AssistantTurnResult>("assistant_wake", { reqId, persona, appState, turnId, speech }),
+  assistantWakeFail: (reqId: string, reason: string) => invoke<void>("assistant_wake_fail", { reqId, reason }),
   voiceConfigGet: () => invoke<VoiceView>("voice_config_get"),
   voiceConfigSet: (config: VoiceConfig, baiduSecret?: string | null) => invoke<VoiceView>("voice_config_set", { config, baiduSecret: baiduSecret ?? null }),
   voiceStatus: () => invoke<VoiceStatus>("voice_status"),

@@ -362,6 +362,8 @@ fn main() {
             assistant::assistant_send,
             assistant::assistant_greet,
             assistant::assistant_care,
+            assistant::assistant_wake,
+            assistant::assistant_wake_fail,
             assistant::assistant_cancel,
             assistant::assistant_session_reset,
             assistant::assistant_messages,

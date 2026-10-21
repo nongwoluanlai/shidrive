@@ -1565,6 +1565,7 @@ import type { DisplayItem } from "../state.svelte";
             </select>
           </label>
         {/each}
+      <button class="btn ghost sm sched-btn cfg-sched" class:on={schedOpen} title={t("定时发送：到点自动发送输入框里的文字（回答中会等本回合结束）")} disabled={!ctx} onclick={openSched}>⏰ {t("定时")}</button>
       </div>
     <div class="grow-handle" title={t("拖拽调整输入框高度")} onpointerdown={startResize}><span></span></div>
     {#if mySched.length}
@@ -1609,7 +1610,6 @@ import type { DisplayItem } from "../state.svelte";
     <input class="img-picker" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" multiple bind:this={imagePicker} onchange={onPickImages} />
     <button class="btn ghost sched-btn img-btn" title={t("添加图片（可多选，最多 {n} 张）", { n: MAX_IMAGES })} aria-label={t("添加图片")} disabled={!ctx} onclick={() => imagePicker?.click()}><Icon name="plus" size={16} /></button>
     <div class="send-col">
-      <button class="btn ghost sched-btn" class:on={schedOpen} title={t("定时发送：到点自动发送输入框里的文字（回答中会等本回合结束）")} disabled={!ctx} onclick={openSched}>⏰</button>
       {#if streaming}
         <button class="btn danger" onclick={stop}>■ {t("停止")}</button>
       {:else}
@@ -1951,8 +1951,8 @@ import type { DisplayItem } from "../state.svelte";
     align-items: stretch;
     gap: 6px;
   }
-  .send-col .sched-btn {
-    align-self: flex-end;
+  .cfg-sched {
+    margin-left: auto;
   }
   .img-btn {
     display: inline-flex;

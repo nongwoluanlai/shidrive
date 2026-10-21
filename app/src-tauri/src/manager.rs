@@ -640,10 +640,19 @@ impl AgentManager {
     /// adapter supports HTTP MCP (or hasn't declared a capability). Other agents
     /// retain their old retry without MCP; DeepSeek preserves the first error.
     fn mcp_servers_param(&self, conn: &AcpConnection, context: &Context) -> Vec<McpServer> {
+        self.mcp_servers_for_url(conn, self.mcp_url_for(context, &conn.agent_type))
+    }
+
+    /// 全局助手会话的 mcpServers：同一个本机端点，以 `?assistant=1` 接入（不绑定项目，开放全部工具 + 助手专用工具）
+    fn assistant_mcp_servers(&self, conn: &AcpConnection, mcp: bool) -> Vec<McpServer> {
+        if !mcp { return vec![]; }
+        self.mcp_servers_for_url(conn, format!("{}?assistant=1&agent={}", self.mcp_url(), url_component(&conn.agent_type)))
+    }
+
+    fn mcp_servers_for_url(&self, conn: &AcpConnection, url: String) -> Vec<McpServer> {
         if conn.mcp_degraded() {
             return vec![];
         }
-        let url = self.mcp_url_for(context, &conn.agent_type);
         let mode = {
             let caps = conn.agent_info.lock().unwrap();
             mcp_transport_for(caps.get("agentCapabilities").and_then(|c| c.get("mcpCapabilities")))
@@ -1025,13 +1034,13 @@ impl AgentManager {
     }
 
     // ---------- 全局助手（不属于任何项目/上下文的独立长期会话） ----------
-    // 助手会话不写 agent_bindings、不注入使驾 MCP，回合输出走 acp://assistant-update，
+    // 助手会话不写 agent_bindings；开启「助手 MCP 工具」时以 ?assistant=1 注入使驾 MCP（不绑定项目），回合输出走 acp://assistant-update，
     // 与聊天页 / 工作流互不干扰；记忆与对话记录由 assistant.rs 自己落库。
 
     /// 新建助手会话，返回 (sessionId, 能力/配置项)。
-    pub async fn assistant_session_new(&self, agent_type: &str, cwd: &str) -> Result<(String, Value), String> {
+    pub async fn assistant_session_new(&self, agent_type: &str, cwd: &str, mcp: bool) -> Result<(String, Value), String> {
         let conn = self.ensure_connected(agent_type).await?;
-        let res = conn.new_session(cwd, vec![]).await?;
+        let res = conn.new_session(cwd, self.assistant_mcp_servers(&conn, mcp)).await?;
         let sid = res.get("sessionId").and_then(Value::as_str).unwrap_or_default().to_string();
         if sid.is_empty() { return Err("适配器未返回 sessionId".into()); }
         conn.mark_loaded(&sid);
@@ -1040,13 +1049,13 @@ impl AgentManager {
     }
 
     /// 确保助手会话已在当前连接上加载（重启后 session/load 恢复）。
-    pub async fn assistant_session_ensure(&self, agent_type: &str, sid: &str, cwd: &str) -> Result<Value, String> {
+    pub async fn assistant_session_ensure(&self, agent_type: &str, sid: &str, cwd: &str, mcp: bool) -> Result<Value, String> {
         let conn = self.ensure_connected(agent_type).await?;
         if !conn.is_loaded(sid) {
             let lock = self.prompt_lock(&conn, sid);
             let _g = lock.lock().await;
             if !conn.is_loaded(sid) {
-                let res = conn.load_session(sid, cwd, vec![]).await?;
+                let res = conn.load_session(sid, cwd, self.assistant_mcp_servers(&conn, mcp)).await?;
                 conn.mark_loaded(sid);
                 if res.get("configOptions").is_some() || res.get("models").is_some() { conn.cache_caps(sid, &res); }
             }
@@ -1062,13 +1071,13 @@ impl AgentManager {
     }
 
     /// 向助手会话发一轮提示词，等待回合结束，返回整轮回复文本。
-    pub async fn assistant_prompt(&self, agent_type: &str, sid: &str, cwd: &str, text: &str, turn_id: &str) -> Result<String, String> {
+    pub async fn assistant_prompt(&self, agent_type: &str, sid: &str, cwd: &str, text: &str, turn_id: &str, mcp: bool) -> Result<String, String> {
         let conn = self.ensure_connected(agent_type).await?;
         let lock = self.prompt_lock(&conn, sid);
         let _session = lock.lock_owned().await;
         if !conn.is_alive() { return Err("适配器连接已断开，请重试".into()); }
         if !conn.is_loaded(sid) {
-            conn.load_session(sid, cwd, vec![]).await?;
+            conn.load_session(sid, cwd, self.assistant_mcp_servers(&conn, mcp)).await?;
             conn.mark_loaded(sid);
         }
         conn.begin_turn(sid, ASSISTANT_CONTEXT_ID, turn_id, "assistant")?;
