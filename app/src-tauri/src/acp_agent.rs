@@ -23,6 +23,29 @@ const UI_TOOL_CHARS: usize = 4_000;
 const DIFF_MAX_BYTES: usize = 200 * 1024;
 pub const NOT_CONFIGURED: &str = "ShiDrive Agent 尚未配置：请在「设置 → Agent 管理 → ShiDrive」填写接口地址、模型与 API Key 后保存。";
 
+// ---------------------------------------------------------------- log
+
+static LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// 诊断日志：`SHIDRIVE_AGENT_HOME/agent.log`（超过 2MB 轮转为 agent.log.old），同时写 stderr。
+/// 只记录元信息与错误（接口状态码 / 错误正文、工具名与结果状态），不记 API Key 与对话正文。
+fn alog(msg: impl AsRef<str>) {
+    let line = format!("[{}] {}", chrono::Local::now().format("%m-%d %H:%M:%S"), msg.as_ref());
+    eprintln!("[shidrive-agent] {}", msg.as_ref());
+    let Some(path) = LOG_PATH.lock().ok().and_then(|g| g.clone()) else { return };
+    if std::fs::metadata(&path).map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(false) {
+        let _ = std::fs::rename(&path, path.with_extension("log.old"));
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+fn init_log(home: &Path) {
+    let _ = std::fs::create_dir_all(home);
+    if let Ok(mut g) = LOG_PATH.lock() { *g = Some(home.join("agent.log")); }
+}
+
 // ---------------------------------------------------------------- config
 
 #[derive(Clone, Debug)]
@@ -248,6 +271,8 @@ impl Shared {
 
 pub fn run() -> i32 {
     let cfg = Config::from_env();
+    init_log(&cfg.home);
+    alog(format!("启动 v{VERSION}：接口 {}，模型 {}，已配置={}", cfg.base_url, cfg.model, cfg.configured()));
     let out: Out = Box::new(|line: &str| {
         let so = std::io::stdout();
         let mut l = so.lock();
@@ -389,7 +414,7 @@ fn make_live(d: SessionData, mcp_servers: &Value) -> Live {
         let name = s.get("name").and_then(Value::as_str).unwrap_or("mcp").to_string();
         let url = s.get("url").and_then(Value::as_str).unwrap_or_default();
         if kind != "http" || url.is_empty() {
-            eprintln!("[shidrive-agent] 跳过不支持的 MCP 服务器 {name}（{kind}）");
+            alog(format!("跳过不支持的 MCP 服务器 {name}（{kind}）"));
             continue;
         }
         let headers: Vec<(String, String)> = s.get("headers").and_then(Value::as_array).into_iter().flatten()
@@ -413,7 +438,7 @@ fn make_live(d: SessionData, mcp_servers: &Value) -> Live {
                 }
                 clients.push(c);
             }
-            Err(e) => eprintln!("[shidrive-agent] 连接 MCP 服务器 {name} 失败：{e}"),
+            Err(e) => alog(format!("连接 MCP 服务器 {name} 失败：{e}")),
         }
     }
     Live {
@@ -454,6 +479,7 @@ fn session_new(sh: &Arc<Shared>, p: &Value) -> RpcResult {
     let resp = json!({ "sessionId": d.id, "modes": modes(&d), "configOptions": config_options(&sh.cfg, &d) });
     let id = d.id.clone();
     let live = Arc::new(make_live(d, &p["mcpServers"]));
+    alog(format!("新会话 {id}：cwd={cwd}，MCP 工具 {} 个", live.mcp_tools.len()));
     sh.sessions.lock().unwrap().insert(id, live);
     Ok(resp)
 }
@@ -471,6 +497,7 @@ fn session_open(sh: &Arc<Shared>, p: &Value, replay: bool) -> RpcResult {
     if replay { replay_history(sh, &d); }
     let resp = json!({ "modes": modes(&d), "configOptions": config_options(&sh.cfg, &d) });
     let live = Arc::new(make_live(d, &p["mcpServers"]));
+    alog(format!("{}会话 {sid}：MCP 工具 {} 个", if replay { "加载" } else { "恢复" }, live.mcp_tools.len()));
     sh.sessions.lock().unwrap().insert(sid, live);
     Ok(resp)
 }
@@ -583,6 +610,7 @@ fn session_prompt(sh: &Arc<Shared>, p: &Value) -> RpcResult {
     if !sh.cfg.configured() { return Err((-32603, NOT_CONFIGURED.into())); }
     let live = need_live(sh, p)?;
     if live.busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        alog("拒绝新消息：上一轮回复仍在进行中");
         return Err((-32603, "上一轮回复仍在进行中".into()));
     }
     let _guard = BusyGuard(&live.busy);
@@ -616,10 +644,19 @@ fn session_prompt(sh: &Arc<Shared>, p: &Value) -> RpcResult {
         d.updated_at = now_iso();
         let _ = save_session(&sh.cfg, &d);
     }
+    let sid = live.data.lock().unwrap().id.clone();
     match result {
-        Ok(reason) => Ok(json!({ "stopReason": reason })),
-        Err(e) if cancel.load(Ordering::SeqCst) => { let _ = e; Ok(json!({ "stopReason": "cancelled" })) }
-        Err(e) => Err((-32603, e)),
+        Ok(reason) => {
+            alog(format!("会话 {sid} 本轮结束：{reason}"));
+            Ok(json!({ "stopReason": reason }))
+        }
+        Err(e) if cancel.load(Ordering::SeqCst) => { alog(format!("会话 {sid} 已取消（{e}）")); Ok(json!({ "stopReason": "cancelled" })) }
+        Err(e) => {
+            alog(format!("会话 {sid} 本轮失败：{e}"));
+            // 同时作为正文输出，避免客户端只显示「已中断」而看不到原因（不写入模型历史）
+            sh.update(&sid, text_chunk("agent_message_chunk", &format!("\n\n⚠️ {e}")));
+            Err((-32603, e))
+        }
     }
 }
 
@@ -677,6 +714,10 @@ struct ToolCall {
     id: String,
     name: String,
     args: String,
+    /// 最近一个参数分片：个别接口每个分片都发完整参数（而非增量），据此纠正
+    last: String,
+    /// tool_call 上的其他字段（如 Gemini 的 extra_content.google.thought_signature），回传时原样带上
+    extra: serde_json::Map<String, Value>,
 }
 
 struct Reply {
@@ -696,15 +737,21 @@ fn run_turn(sh: &Arc<Shared>, live: &Arc<Live>, turn_start: usize, cancel: &Atom
         };
         let tools = tool_specs(&mode, live);
         let has_ctx = live.mcp_tools.iter().any(|t| t.tool.starts_with("context_"));
-        let (msgs, dropped) = fit_budget(api_messages(&history, turn_start), turn_start, sh.cfg.context_chars);
+        let (api_msgs, api_start) = api_messages(&history, turn_start);
+        let (msgs, dropped) = fit_budget(api_msgs, api_start, sh.cfg.context_chars);
         let mut sys = system_prompt(&cwd, &mode, has_ctx);
         if dropped { sys.push_str("\n\n（注意：更早的对话因上下文长度已省略。）"); }
         let mut all = vec![json!({ "role": "system", "content": sys })];
         all.extend(msgs);
+        let (all_len, tools_len) = (all.len(), tools.len());
         let mut body = json!({ "model": model, "messages": all, "stream": true, "tools": tools });
         if let Some(t) = sh.cfg.temperature { body["temperature"] = json!(t); }
         let sid = live.data.lock().unwrap().id.clone();
         let reply = chat(sh, &sid, &body, cancel)?;
+        alog(format!("会话 {sid} 第 {} 步：模型 {model}，消息 {} 条，工具 {} 个 → finish={}，正文 {} 字，思考 {} 字，工具调用 [{}]",
+            step + 1, all_len, tools_len, if reply.finish.is_empty() { "-" } else { reply.finish.as_str() },
+            reply.content.chars().count(), reply.reasoning.chars().count(),
+            reply.tool_calls.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")));
         let cancelled = cancel.load(Ordering::SeqCst);
         let mut tool_calls = if cancelled { Vec::new() } else { reply.tool_calls };
         for (i, tc) in tool_calls.iter_mut().enumerate() {
@@ -716,8 +763,13 @@ fn run_turn(sh: &Arc<Shared>, live: &Arc<Live>, turn_start: usize, cancel: &Atom
             if !reply.content.is_empty() || !tool_calls.is_empty() {
                 let mut m = json!({ "role": "assistant", "content": if reply.content.is_empty() && !tool_calls.is_empty() { Value::Null } else { json!(reply.content) } });
                 if !tool_calls.is_empty() {
-                    m["tool_calls"] = json!(tool_calls.iter().map(|t| json!({
-                        "id": t.id, "type": "function", "function": { "name": t.name, "arguments": t.args } })).collect::<Vec<_>>());
+                    m["tool_calls"] = json!(tool_calls.iter().map(|t| {
+                        let mut o = t.extra.clone();
+                        o.insert("id".into(), json!(t.id));
+                        o.insert("type".into(), json!("function"));
+                        o.insert("function".into(), json!({ "name": t.name, "arguments": t.args }));
+                        Value::Object(o)
+                    }).collect::<Vec<_>>());
                 }
                 if !reply.reasoning.is_empty() { m["_reasoning"] = json!(reply.reasoning); }
                 d.messages.push(m);
@@ -771,20 +823,57 @@ fn system_prompt(cwd: &str, mode: &str, has_ctx: bool) -> String {
 
 /// 历史 → API 消息：去掉内部字段（以 _ 开头）；只有本轮的 assistant 消息回传 reasoning_content
 /// （部分推理模型要求同一轮工具调用链携带思考内容，跨轮携带则会报错）。
-fn api_messages(history: &[Value], turn_start: usize) -> Vec<Value> {
-    history.iter().enumerate().map(|(i, m)| {
+/// 历史 → 接口消息：去掉内部字段（`_` 开头），并修复会让接口直接 400 的结构问题：
+/// - 思考内容：本轮全部回传；更早轮次只在带 tool_calls 的消息上回传（DeepSeek / Kimi 等思考模型要求）；
+/// - tool_calls 参数不是合法 JSON 时改为 `{}`；
+/// - 缺少结果的 tool_call 补一条「未执行」结果，没有对应调用的 tool 消息丢弃（中断 / 崩溃后的残留）。
+/// 返回 (消息, 本轮在新数组中的起始下标)。
+fn api_messages(history: &[Value], turn_start: usize) -> (Vec<Value>, usize) {
+    let mut out: Vec<Value> = Vec::with_capacity(history.len());
+    let mut new_start = None;
+    let mut pending: Vec<String> = Vec::new();
+    let close_pending = |out: &mut Vec<Value>, pending: &mut Vec<String>| {
+        for id in pending.drain(..) {
+            out.push(json!({ "role": "tool", "tool_call_id": id, "content": "（未执行：上一次回复中断）" }));
+        }
+    };
+    for (i, m) in history.iter().enumerate() {
+        let role = m["role"].as_str().unwrap_or_default();
+        if role == "tool" {
+            let id = m["tool_call_id"].as_str().unwrap_or_default();
+            let Some(pos) = pending.iter().position(|p| p == id) else { continue };
+            pending.remove(pos);
+        } else {
+            close_pending(&mut out, &mut pending);
+        }
+        if i >= turn_start && new_start.is_none() { new_start = Some(out.len()); }
+        let has_tools = m["tool_calls"].as_array().is_some_and(|a| !a.is_empty());
         let mut o = serde_json::Map::new();
         if let Some(obj) = m.as_object() {
             for (k, v) in obj {
                 if k == "_reasoning" {
-                    if i >= turn_start { o.insert("reasoning_content".into(), v.clone()); }
+                    if i >= turn_start || has_tools { o.insert("reasoning_content".into(), v.clone()); }
+                } else if k == "tool_calls" {
+                    if !has_tools { continue; }
+                    let mut calls = v.clone();
+                    for c in calls.as_array_mut().into_iter().flatten() {
+                        let ok = c["function"]["arguments"].as_str()
+                            .is_some_and(|a| serde_json::from_str::<Value>(a).map(|v| v.is_object()).unwrap_or(false));
+                        if !ok { c["function"]["arguments"] = json!("{}"); }
+                        if let Some(id) = c["id"].as_str() { pending.push(id.to_string()); }
+                    }
+                    o.insert(k.clone(), calls);
                 } else if !k.starts_with('_') {
                     o.insert(k.clone(), v.clone());
                 }
             }
         }
-        Value::Object(o)
-    }).collect()
+        out.push(Value::Object(o));
+    }
+    // 末尾仍缺结果的调用（本轮正在执行的调用不会出现在这里：执行完才发下一次请求）
+    close_pending(&mut out, &mut pending);
+    let start = new_start.unwrap_or(out.len());
+    (out, start)
 }
 
 fn msg_chars(m: &Value) -> usize {
@@ -841,7 +930,7 @@ fn fit_budget(mut msgs: Vec<Value>, turn_start: usize, budget: usize) -> (Vec<Va
 enum Ev {
     Text(String),
     Reasoning(String),
-    Tool { index: usize, id: String, name: String, args: String },
+    Tool { index: usize, id: String, name: String, args: String, extra: serde_json::Map<String, Value> },
     Finish(String),
     Done(Result<(), (bool, String)>),
 }
@@ -875,6 +964,9 @@ fn emit_delta(delta: &Value, tx: &mpsc::Sender<Ev>) -> bool {
                 Value::Null => String::new(),
                 other => other.to_string(),
             },
+            extra: tc.as_object().map(|o| o.iter()
+                .filter(|(k, v)| !["index", "id", "type", "function"].contains(&k.as_str()) && !v.is_null())
+                .map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default(),
         }).is_ok();
     }
     ok
@@ -937,16 +1029,20 @@ fn chat(sh: &Arc<Shared>, sid: &str, body: &Value, cancel: &AtomicBool) -> Resul
             match rx.recv_timeout(Duration::from_millis(150)) {
                 Ok(Ev::Text(t)) => { got_any = true; sh.update(sid, text_chunk("agent_message_chunk", &t)); reply.content.push_str(&t); }
                 Ok(Ev::Reasoning(t)) => { got_any = true; sh.update(sid, text_chunk("agent_thought_chunk", &t)); reply.reasoning.push_str(&t); }
-                Ok(Ev::Tool { index, id, name, args }) => {
+                Ok(Ev::Tool { index, id, name, args, extra }) => {
                     got_any = true;
-                    let e = tools.entry(index).or_insert(ToolCall { id: String::new(), name: String::new(), args: String::new() });
+                    let e = tools.entry(index).or_insert(ToolCall {
+                        id: String::new(), name: String::new(), args: String::new(), last: String::new(), extra: Default::default() });
                     if !id.is_empty() && e.id.is_empty() { e.id = id; }
                     if !name.is_empty() && e.name.is_empty() { e.name = name; }
                     e.args.push_str(&args);
+                    if !args.is_empty() { e.last = args; }
+                    e.extra.extend(extra);
                 }
                 Ok(Ev::Finish(f)) => reply.finish = f,
                 Ok(Ev::Done(Ok(()))) => break,
                 Ok(Ev::Done(Err((retryable, msg)))) => {
+                    alog(format!("模型请求失败（第 {} 次，可重试={retryable}）：{msg}", attempt + 1));
                     if !got_any && retryable && attempt < 2 {
                         attempt += 1;
                         let wait = Instant::now();
@@ -962,9 +1058,19 @@ fn chat(sh: &Arc<Shared>, sid: &str, body: &Value, cancel: &AtomicBool) -> Resul
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Err("模型请求线程意外退出".into()),
             }
         }
-        reply.tool_calls = tools.into_values().filter(|t| !t.name.is_empty()).collect();
+        reply.tool_calls = tools.into_values().filter(|t| !t.name.is_empty()).map(fix_args).collect();
         return Ok(reply);
     }
+}
+
+/// 参数拼接后不是合法 JSON、但最后一个分片本身是完整对象时（接口每片都发完整参数），改用最后一片。
+fn fix_args(mut t: ToolCall) -> ToolCall {
+    let ok = |s: &str| serde_json::from_str::<Value>(s).map(|v| v.is_object()).unwrap_or(false);
+    if !t.args.trim().is_empty() && !ok(&t.args) && ok(&t.last) {
+        alog(format!("工具 {} 的参数分片为完整重复，已按最后一片解析", t.name));
+        t.args = std::mem::take(&mut t.last);
+    }
+    t
 }
 
 // ---------------------------------------------------------------- tools
@@ -1074,6 +1180,7 @@ fn run_tool_call(sh: &Arc<Shared>, live: &Live, sid: &str, cfg: &Cfg, mode: &str
     u["sessionUpdate"] = json!("tool_call");
     sh.update(sid, u);
     let finish = |status: &str, model_text: String, content: Vec<Value>| -> Value {
+        if status != "completed" { alog(format!("工具 {} {status}：{}", tc.name, cap(&model_text, 300))); }
         let mut upd = json!({ "sessionUpdate": "tool_call_update", "toolCallId": tc.id, "status": status });
         if !content.is_empty() { upd["content"] = json!(content); }
         sh.update(sid, upd);
@@ -1325,7 +1432,7 @@ impl McpClient {
         let _ = c.post(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }), 15);
         let list = c.rpc("tools/list", json!({}), 15)?;
         c.tools = list["tools"].as_array().cloned().unwrap_or_default();
-        eprintln!("[shidrive-agent] MCP {name}: {} 个工具", c.tools.len());
+        alog(format!("MCP {name}: {} 个工具", c.tools.len()));
         Ok(c)
     }
     fn post(&self, body: &Value, read_secs: u64) -> Result<(String, String), String> {
@@ -1648,10 +1755,36 @@ mod tests {
             json!({ "role": "user", "content": "c" }),
             json!({ "role": "assistant", "content": "d", "_reasoning": "new" }),
         ];
-        let m = api_messages(&h, 2);
+        let (m, start) = api_messages(&h, 2);
+        assert_eq!(start, 2);
         assert!(m[0].get("_display").is_none());
         assert!(m[1].get("reasoning_content").is_none());
         assert_eq!(m[3]["reasoning_content"], "new");
         assert_eq!(mcp_api_name("shidrive", "context.get"), "mcp__shidrive__context_get");
+    }
+
+    #[test]
+    fn api_messages_repair_tool_history() {
+        let call = |id: &str, args: &str| json!({ "id": id, "type": "function", "function": { "name": "read_file", "arguments": args },
+            "extra_content": { "google": { "thought_signature": "sig" } } });
+        let h = vec![
+            json!({ "role": "user", "content": "a" }),
+            // 旧轮的工具调用：思考需回传；参数坏掉；c2 缺结果
+            json!({ "role": "assistant", "content": null, "_reasoning": "r1", "tool_calls": [call("c1", "{bad"), call("c2", "{}")] }),
+            json!({ "role": "tool", "tool_call_id": "c1", "content": "x", "_status": "failed" }),
+            json!({ "role": "tool", "tool_call_id": "zz", "content": "orphan" }),
+            json!({ "role": "user", "content": "b" }),
+        ];
+        let (m, start) = api_messages(&h, 4);
+        assert_eq!(m.len(), 5);
+        assert_eq!(m[1]["reasoning_content"], "r1");
+        assert_eq!(m[1]["tool_calls"][0]["function"]["arguments"], "{}");
+        assert_eq!(m[1]["tool_calls"][0]["extra_content"]["google"]["thought_signature"], "sig");
+        assert_eq!(m[2]["tool_call_id"], "c1");
+        assert_eq!(m[3]["tool_call_id"], "c2");
+        assert_eq!(m[4]["content"], "b");
+        assert_eq!(start, 4);
+        let f = fix_args(ToolCall { id: "i".into(), name: "n".into(), args: "{\"a\":1}{\"a\":1}".into(), last: "{\"a\":1}".into(), extra: Default::default() });
+        assert_eq!(f.args, "{\"a\":1}");
     }
 }

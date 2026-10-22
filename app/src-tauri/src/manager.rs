@@ -1017,6 +1017,7 @@ impl AgentManager {
                 }
             };
             let interrupted = was_cancelled || matches!(&result, Ok(v) if v.get("stopReason").and_then(Value::as_str) == Some("cancelled"));
+            if let Err(e) = &result { log::warn!("[{}] 回合失败：{}", turn.agent_type, e.chars().take(600).collect::<String>()); }
             turn.status(if result.is_err() || interrupted { "interrupted" } else { "completed" });
             let (text, _, _) = conn.end_turn(&sid, &turn_id);
             if source == "workflow" {

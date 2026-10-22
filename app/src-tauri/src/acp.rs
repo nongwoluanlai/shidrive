@@ -161,7 +161,9 @@ impl AcpConnection {
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if !line.trim().is_empty() {
-                    log::debug!("[{stderr_type} stderr] {line}");
+                    // 内置 Agent 的 stderr 只有诊断信息，常开写入 shidrive.log；第三方适配器较吵，仍走 debug
+                    if stderr_type == "shidrive" { log::info!("[shidrive-agent] {}", line.trim_start_matches("[shidrive-agent] ")); }
+                    else { log::debug!("[{stderr_type} stderr] {line}"); }
                 }
             }
         });
