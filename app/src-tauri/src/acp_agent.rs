@@ -458,9 +458,20 @@ fn mcp_api_name(server: &str, tool: &str) -> String {
     n
 }
 
+/// 去掉末尾分隔符，但保留根目录：`D:\` 不能变成 `D:`（后者在 Windows 上是「D 盘当前目录」的相对路径）。
+fn trim_cwd(cwd: &str) -> String {
+    let t = cwd.trim().trim_end_matches(['\\', '/']);
+    if t.is_empty() { return cwd.trim().chars().next().map(String::from).unwrap_or_default(); }
+    let b = t.as_bytes();
+    if b.len() == 2 && b[1] == b':' && b[0].is_ascii_alphabetic() { return format!("{t}\\"); }
+    t.to_string()
+}
+
 fn canonical_cwd(cwd: &str) -> Result<PathBuf, (i64, String)> {
     if cwd.trim().is_empty() { return Err((-32602, "缺少 cwd".into())); }
-    let p = Path::new(cwd);
+    // 兼容旧版本保存的盘符根目录会话（cwd 被存成了 `D:`）
+    let fixed = trim_cwd(cwd);
+    let p = Path::new(&fixed);
     if !p.is_absolute() { return Err((-32602, format!("cwd 必须为绝对路径：{cwd}"))); }
     std::fs::canonicalize(p).ok().filter(|c| c.is_dir()).ok_or_else(|| (-32602, format!("工作目录不存在：{cwd}")))
 }
@@ -472,7 +483,7 @@ fn session_new(sh: &Arc<Shared>, p: &Value) -> RpcResult {
     let now = now_iso();
     let d = SessionData {
         id: uuid::Uuid::new_v4().to_string(),
-        cwd: Some(cwd.trim_end_matches(['\\', '/'])).filter(|c| !c.is_empty()).unwrap_or(cwd).to_string(),
+        cwd: trim_cwd(cwd),
         created_at: now.clone(), updated_at: now, mode: "ask".into(), model: sh.cfg.model.clone(),
         ..Default::default()
     };
@@ -492,7 +503,7 @@ fn session_open(sh: &Arc<Shared>, p: &Value, replay: bool) -> RpcResult {
     let mut d = load_session(&sh.cfg, &sid).map_err(|e| (-32002, e))?;
     if let Some(cwd) = p["cwd"].as_str().filter(|c| !c.trim().is_empty()) {
         canonical_cwd(cwd)?;
-        d.cwd = cwd.trim_end_matches(['\\', '/']).to_string();
+        d.cwd = trim_cwd(cwd);
     }
     if replay { replay_history(sh, &d); }
     let resp = json!({ "modes": modes(&d), "configOptions": config_options(&sh.cfg, &d) });
@@ -1761,6 +1772,21 @@ mod tests {
         assert!(m[1].get("reasoning_content").is_none());
         assert_eq!(m[3]["reasoning_content"], "new");
         assert_eq!(mcp_api_name("shidrive", "context.get"), "mcp__shidrive__context_get");
+    }
+
+    #[test]
+    fn drive_root_cwd_stays_absolute() {
+        assert_eq!(trim_cwd(r"D:\"), r"D:\");
+        assert_eq!(trim_cwd("D:"), r"D:\");
+        assert_eq!(trim_cwd(r"D:\proj\"), r"D:\proj");
+        assert_eq!(trim_cwd("/"), "/");
+        assert_eq!(trim_cwd("/home/a/"), "/home/a");
+        #[cfg(windows)]
+        {
+            let sys = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+            assert!(canonical_cwd(&sys).is_ok(), "旧会话里的 `C:` 也应能打开");
+            assert!(canonical_cwd(&format!("{sys}\\")).is_ok());
+        }
     }
 
     #[test]
