@@ -58,6 +58,8 @@ export const voiceEn: Record<string, string> = {
   "需要先安装上面的语音运行环境；未就绪时自动改用系统语音。": "Requires the voice runtime above; falls back to the system voice until it is ready.",
   "语速": "Rate",
   "音量": "Volume",
+  "完整朗读回复（正文也逐句读出，代码、表格、链接不读）": "Read the whole reply aloud (body too, sentence by sentence; code, tables and links are skipped)",
+  "关闭后只读气泡里的简短字幕；角色配音（如日语）时会要求助手把要说的话全部写成字幕": "When off, only the short bubble subtitles are read; with a character dub (e.g. Japanese) the assistant is asked to put everything it says into subtitles",
   "皮肤角色有专属语音包时使用角色语音": "Use the character voice when the skin has a dedicated voice pack",
   "当前皮肤": "Current skin",
   "（无匹配）": "(no match)",

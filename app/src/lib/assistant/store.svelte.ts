@@ -7,6 +7,7 @@ import { emitSkinEvent } from "../skin-fx/bus";
 import { skinPersona, toWire, type ResolvedPersona } from "./personas";
 import { t } from "../i18n";
 import { beginSpeech, feedSpeech, initVoice, speechHint, stopSpeaking } from "./voice.svelte";
+import { newBodyCursor, takeBodySpeech } from "./speechBody";
 import type { AssistantConfigView, AssistantMemory, AssistantMessage, AssistantSubtitle, AssistantTurnResult, SpeechHint } from "../types";
 
 type Busy = "" | "send" | "greet" | "care" | "wake" | "summarize" | "reset";
@@ -116,29 +117,41 @@ export function tagSubtitles(raw: string, final: boolean, layer: boolean): Assis
 }
 
 /** 本回合的配音设置（回合开始时取定） */
-let turnSpeech: { lang: string; layer: boolean } = { lang: "", layer: false };
+let turnSpeech: { lang: string; layer: boolean; full: boolean } = { lang: "", layer: false, full: false };
 /** say 工具发来的字幕 */
 let toolSubs: AssistantSubtitle[] = [];
 /** 已并入 ga.subs 的工具字幕 / 标记字幕条数：字幕只追加不重排，朗读按偏移续读才不会漏句 */
 let toolSeen = 0;
 let tagSeen = 0;
+/** 本回合要朗读的原文（只追加）：字幕按到达顺序，完整朗读时再接上正文里可读的句子 */
+let speechLog = "";
+let bodyCur = newBodyCursor();
 
 function resetSubs() {
   ga.subs = [];
   toolSubs = [];
   toolSeen = 0;
   tagSeen = 0;
+  speechLog = "";
+  bodyCur = newBodyCursor();
 }
 
 /** 把新到的工具字幕与标记字幕按到达顺序追加到 ga.subs 末尾 */
-function appendSubs(final: boolean): boolean {
+function appendSubs(final: boolean): AssistantSubtitle[] {
   const tags = tagSubtitles(ga.streaming, final, turnSpeech.layer);
   const add = [...toolSubs.slice(toolSeen), ...tags.slice(tagSeen)];
   toolSeen = toolSubs.length;
   tagSeen = Math.max(tagSeen, tags.length);
-  if (!add.length) return false;
-  ga.subs = [...ga.subs, ...add];
-  return true;
+  if (add.length) ga.subs = [...ga.subs, ...add];
+  return add;
+}
+
+/** 新到的字幕 + （完整朗读时）正文里新写完的可读句子 */
+function newSpeech(final: boolean): string {
+  const add = appendSubs(final);
+  let more = add.length ? subSpeech(add) : "";
+  if (turnSpeech.full && !turnSpeech.layer) more += takeBodySpeech(ga.streaming, bodyCur, final, subText(ga.subs));
+  return more;
 }
 
 /** 字幕 → 朗读原文：配音模式每条附 [[lang: …]]，没有配音版本的不读 */
@@ -149,16 +162,25 @@ function subSpeech(subs: AssistantSubtitle[]): string {
 
 export const subText = (subs: AssistantSubtitle[]) => subs.map((s) => s.text).join("\n");
 
-/** 合并工具字幕与标记字幕；有新字幕就送去朗读 */
+/** 合并工具字幕与标记字幕；有新内容就送去朗读 */
 function syncSubs() {
-  if (appendSubs(false)) feedSpeech(subSpeech(ga.subs), false);
+  const more = newSpeech(false);
+  if (!more) return;
+  speechLog += more;
+  feedSpeech(speechLog, false);
 }
 
-/** 回合结束：补上最后的标记字幕；一条都没收到时改用后端给的（推导的），然后把朗读收尾 */
-function finishSubs(fallback: AssistantSubtitle[]) {
-  appendSubs(true);
-  if (!ga.subs.length && fallback.length) ga.subs = fallback;
-  feedSpeech(subSpeech(ga.subs), true);
+/** 回合结束：补上最后的字幕与正文；一条字幕都没收到时改用后端给的（推导的，完整朗读已读过正文就不再读），然后把朗读收尾 */
+function finishSubs(fallback: AssistantSubtitle[], body = "") {
+  let more = newSpeech(true);
+  // 没走流式（接口一次性返回）：完整朗读改读最终正文
+  if (turnSpeech.full && !turnSpeech.layer && !ga.streaming.trim() && body.trim()) more += takeBodySpeech(body, newBodyCursor(), true, subText(ga.subs));
+  if (!ga.subs.length && fallback.length) {
+    ga.subs = fallback;
+    if (!speechLog && !more) more = subSpeech(fallback);
+  }
+  speechLog += more;
+  feedSpeech(speechLog, true);
 }
 
 /** 把一条回复切成气泡页：按段落，超长段按句子再切；代码块整段保留 */
@@ -338,7 +360,7 @@ async function runTurn(kind: Busy, call: (turnId: string) => Promise<AssistantTu
   ga.streaming = "";
   resetSubs();
   const sh = speechHint();
-  turnSpeech = { lang: sh?.lang ?? "", layer: !!sh?.layer };
+  turnSpeech = { lang: sh?.lang ?? "", layer: !!sh?.layer, full: !!sh?.full };
   quietTurn = quiet;
   opened = false;
   if (!quiet) ga.bubble = blankBubble();
@@ -352,7 +374,7 @@ async function runTurn(kind: Busy, call: (turnId: string) => Promise<AssistantTu
       return r;
     }
     // 字幕以流式收到的为准（已在朗读）；一条都没收到时用后端解析 / 推导的
-    finishSubs(r.subtitles ?? []);
+    finishSubs(r.subtitles ?? [], r.message?.content ?? "");
     if (r.message) {
       ga.messages = [...ga.messages, r.message].slice(-400);
       if (ga.subs.length) showBubble(subText(ga.subs), "", !!r.has_body);

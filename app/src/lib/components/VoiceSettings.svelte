@@ -342,6 +342,7 @@
         <input type="range" min="0" max="1" step="0.05" bind:value={draft.volume} oninput={() => commit()} /><span class="pend">{Math.round(draft.volume * 100)}%</span>
       </div>
 
+      <label class="check" title={t("关闭后只读气泡里的简短字幕；角色配音（如日语）时会要求助手把要说的话全部写成字幕")}><input type="checkbox" bind:checked={draft.read_full} onchange={() => commit(0)} /> {t("完整朗读回复（正文也逐句读出，代码、表格、链接不读）")}</label>
       <label class="check"><input type="checkbox" bind:checked={draft.character_voice} onchange={() => commit(0)} /> {t("皮肤角色有专属语音包时使用角色语音")}</label>
       {#if draft.character_voice}
         {#if app.skin}

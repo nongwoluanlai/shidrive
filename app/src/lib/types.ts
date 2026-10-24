@@ -515,6 +515,8 @@ export interface VoiceConfig {
   kokoro_speaker: number;
   system_voice: string;
   character_voice: boolean;
+  /** 完整朗读：字幕之外正文也逐句读出 */
+  read_full: boolean;
   bindings: Record<string, string>;
   rate: number;
   volume: number;
@@ -545,4 +547,4 @@ export interface VoiceStatus {
   kws_running: boolean;
 }
 export interface VoiceView { config: VoiceConfig; baidu_secret_set: boolean; status: VoiceStatus }
-export interface SpeechHint { enabled: boolean; lang: string; layer: boolean; conversation?: boolean }
+export interface SpeechHint { enabled: boolean; lang: string; layer: boolean; conversation?: boolean; /** 完整朗读：正文也读（配音模式下要求把要说的话全部写成字幕） */ full?: boolean }

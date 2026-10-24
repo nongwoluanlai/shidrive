@@ -59,6 +59,8 @@ pub struct VoiceConfig {
     pub system_voice: String,
     /// 皮肤角色有专属语音包时用角色语音
     pub character_voice: bool,
+    /// 完整朗读：字幕之外，正文里可读的句子也逐句读出（代码块、表格、链接不读）
+    pub read_full: bool,
     /// 皮肤 id → 语音包 id（"none" = 该皮肤不用角色语音；缺省 = 按语音包声明自动匹配）
     pub bindings: BTreeMap<String, String>,
     pub rate: f32,
@@ -101,6 +103,7 @@ impl Default for VoiceConfig {
             kokoro_speaker: 3,
             system_voice: String::new(),
             character_voice: true,
+            read_full: true,
             bindings: BTreeMap::new(),
             rate: 1.0,
             volume: 1.0,

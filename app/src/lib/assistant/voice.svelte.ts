@@ -131,7 +131,7 @@ export function outputVoice(): OutputVoice | null {
 /** 发给后端的语音提示（约束模型的输出形态） */
 export function speechHint(): SpeechHint | null {
   const o = outputVoice();
-  return o ? { enabled: true, lang: o.lang, layer: o.layer } : null;
+  return o ? { enabled: true, lang: o.lang, layer: o.layer, full: vc.view?.config.read_full !== false } : null;
 }
 
 // ---------------------------------------------------------------- 切句
