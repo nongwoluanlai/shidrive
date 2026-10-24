@@ -178,6 +178,8 @@ const isWide = (ch: string) => /[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\
 const unitOf = (ch: string) => (isWide(ch) ? 1 : 0.34);
 export const segUnits = (s: string) => { let n = 0; for (const ch of s) n += unitOf(ch); return n; };
 const SOFT = "，,、：:；;—";
+/** 没有标点可断时，尽量断在虚词 / 连词后面，别把一个词从中间劈开 */
+const WEAK = "的了着过吧呢啊呀吗和与及并而但就也都还又再才把被让给在从向对";
 
 /** 把过长的一句在逗号 / 顿号 / 空格处拆成几段，实在没有停顿处就硬切 */
 export function splitLong(seg: string, max = SEG_MAX): string[] {
@@ -185,16 +187,17 @@ export function splitLong(seg: string, max = SEG_MAX): string[] {
   let rest = seg.trim();
   while (rest && segUnits(rest) > max) {
     const chars = Array.from(rest);
-    let u = 0, limit = chars.length, soft = -1, space = -1;
+    let u = 0, limit = chars.length, soft = -1, space = -1, weak = -1;
     for (let i = 0; i < chars.length; i++) {
       u += unitOf(chars[i]);
       if (u > max) { limit = i; break; }
       if (u >= max * 0.35) {
         if (SOFT.includes(chars[i])) soft = i + 1;
         else if (chars[i] === " ") space = i;
+        else if (WEAK.includes(chars[i]) && i + 1 < chars.length && !SOFT.includes(chars[i + 1])) weak = i + 1;
       }
     }
-    const cut = soft > 0 ? soft : space > 0 ? space : Math.max(1, limit);
+    const cut = soft > 0 ? soft : space > 0 ? space : weak > 0 ? weak : Math.max(1, limit);
     const head = chars.slice(0, cut).join("").trim();
     rest = chars.slice(cut).join("").trim();
     if (head) out.push(head);

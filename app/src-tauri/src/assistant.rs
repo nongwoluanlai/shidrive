@@ -458,7 +458,8 @@ fn clean_sub(s: &str) -> String {
 fn sub_re() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)[ \t]*\[\[\s*(?:字幕|subtitle|say)\s*[:：]\s*([^\[\]]*?)\s*\]\](?:[ \t]*\[\[\s*(?:ja|en|ko|yue|zh|speech)\s*[:：]\s*([^\[\]]*?)\s*\]\])?[ \t]*\n?").unwrap()
+        // 字幕里允许成对的单层方括号（「看看 [README] 吧」），否则整条匹配失败、字幕丢失
+        regex::Regex::new(r"(?i)[ \t]*\[\[\s*(?:字幕|subtitle|say)\s*[:：]\s*((?:[^\[\]]|\[[^\[\]]*\])*?)\s*\]\](?:[ \t]*\[\[\s*(?:ja|en|ko|yue|zh|speech)\s*[:：]\s*((?:[^\[\]]|\[[^\[\]]*\])*?)\s*\]\])?[ \t]*\n?").unwrap()
     })
 }
 
@@ -486,35 +487,61 @@ fn encode_subtitles(subs: &[Subtitle]) -> String {
         .collect()
 }
 
-/// 模型没给字幕：取正文第一句（去掉代码块与 Markdown 记号，过长截断）
-pub fn derive_subtitle(body: &str) -> String {
+/// 模型没给字幕：从正文开头推导几句（去掉代码块与 Markdown 记号）。
+/// 按整句取，不在句子中间截断：最多 3 句、合计约 80 字（第一句总会保留，超长的由 clean_sub 兜底）
+pub fn derive_subtitles(body: &str) -> Vec<String> {
     static CODE: OnceLock<regex::Regex> = OnceLock::new();
     static LINK: OnceLock<regex::Regex> = OnceLock::new();
     static MARK: OnceLock<regex::Regex> = OnceLock::new();
     let code = CODE.get_or_init(|| regex::Regex::new(r"(?s)```.*?(```|$)").unwrap());
     let link = LINK.get_or_init(|| regex::Regex::new(r"!?\[([^\]]*)\]\([^)]*\)").unwrap());
     let mark = MARK.get_or_init(|| regex::Regex::new(r"[*_`~]+|https?://\S+").unwrap());
-    let s = code.replace_all(body, "\n");
-    let line = s
-        .lines()
-        .map(|l| l.trim().trim_start_matches(|c: char| "#>-*+|".contains(c) || c.is_whitespace()))
-        .find(|l| l.chars().any(char::is_alphanumeric))
-        .unwrap_or("");
-    let line = link.replace_all(line, "$1");
-    let line = mark.replace_all(&line, "");
-    let chars: Vec<char> = line.trim().chars().collect();
-    let mut out = String::new();
+    static LIST: OnceLock<regex::Regex> = OnceLock::new();
+    let list = LIST.get_or_init(|| regex::Regex::new(r"^\d{1,2}(?:[.)]\s+|、\s*)").unwrap());
     const ENDS: &str = "。！？!?…";
-    for (i, ch) in chars.iter().enumerate() {
-        out.push(*ch);
-        if ENDS.contains(*ch) && i >= 6 {
-            // 连着的句末标点（……、？！）一并带上
-            out.extend(chars[i + 1..].iter().take_while(|c| ENDS.contains(**c)));
+    const MAX_SENTS: usize = 3;
+    const MAX_TOTAL: usize = 80;
+    let s = code.replace_all(body, "\n\n");
+    // 第一段（遇到空行 / 表格就停）里的文字
+    let mut para = String::new();
+    for l in s.lines() {
+        let l = l.trim();
+        if l.is_empty() || l.starts_with('|') {
+            if para.is_empty() { continue; }
             break;
         }
-        if i + 1 >= 48 && i + 1 < chars.len() { out.push('…'); break; }
+        let l = l.trim_start_matches(|c: char| "#>-*+".contains(c) || c.is_whitespace());
+        let l = list.replace(l, "");
+        if !l.chars().any(char::is_alphanumeric) { continue; }
+        let l = link.replace_all(&l, "$1");
+        let l = mark.replace_all(&l, "");
+        if !para.is_empty() { para.push(if para.ends_with(|c: char| ENDS.contains(c) || "，,：:；;".contains(c)) { ' ' } else { '，' }); }
+        para.push_str(l.trim());
     }
-    clean_sub(&out)
+    // 切句：句末标点（连着的一并带上）；太短的开头（「好的。」）和下一句合并
+    let chars: Vec<char> = para.chars().collect();
+    let mut sents: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        cur.push(chars[i]);
+        if ENDS.contains(chars[i]) {
+            while i + 1 < chars.len() && ENDS.contains(chars[i + 1]) { i += 1; cur.push(chars[i]); }
+            if cur.trim().chars().count() >= 7 { sents.push(cur.trim().to_string()); cur.clear(); }
+        }
+        i += 1;
+    }
+    if !cur.trim().is_empty() { sents.push(cur.trim().to_string()); }
+    let mut out = Vec::new();
+    let mut total = 0;
+    for x in sents {
+        let n = x.chars().count();
+        if !out.is_empty() && (out.len() >= MAX_SENTS || total + n > MAX_TOTAL) { break; }
+        total += n;
+        let c = clean_sub(&x);
+        if !c.is_empty() { out.push(c); }
+    }
+    out
 }
 
 fn tools_key(api: &ApiConfig) -> String {
@@ -685,7 +712,8 @@ fn subtitle_voice_rule(h: &SpeechHint, sub: SubMode) -> Option<String> {
 每条字幕不超过 20 字，第一条尽快给出。这些标记不会显示给用户，也不要解释它们。"
         ));
     }
-    Some("[语音输出已开启] 字幕会被朗读（正文不朗读）：字幕用自然口语的短句（每条不超过 20 字，英文不超过 12 个词），第一条尽快给出；字幕里不要放 Markdown、表情符号和代码。".to_string())
+    let zh = if h.lang == "en" { "" } else { "；尽量用中文说法，少夹英文单词和缩写（中文语音容易读不出来）" };
+    Some(format!("[语音输出已开启] 字幕会被朗读（正文不朗读）：字幕用自然口语的短句（每条不超过 20 字，英文不超过 12 个词），第一条尽快给出；字幕里不要放 Markdown、表情符号和代码{zh}。"))
 }
 
 fn voice_rule(h: &SpeechHint) -> Option<String> {
@@ -1180,8 +1208,7 @@ fn finish_reply_ext(db: &Db, cfg: &AssistantConfig, raw: Result<String, String>,
     let (body, mut subtitles) = extract_subtitles(&clean);
     let body = strip_speech_tags(&body);
     if subtitles.is_empty() && !body.trim().is_empty() {
-        let d = derive_subtitle(&body);
-        if !d.is_empty() { subtitles.push(Subtitle { text: d, speech: String::new(), derived: true }); }
+        subtitles.extend(derive_subtitles(&body).into_iter().map(|text| Subtitle { text, speech: String::new(), derived: true }));
     }
     let sub_text = subtitles.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join("\n");
     let has_body = !body.trim().is_empty() && body.trim() != sub_text.trim();
@@ -2012,10 +2039,17 @@ mod tests {
         let (b, s2) = extract_subtitles(&format!("{enc}正文"));
         assert_eq!(b, "正文");
         assert_eq!((s2[0].text.as_str(), s2[0].speech.as_str()), ("看 ［这里］", "ここ"));
-        // 推导：跳过代码块与标题记号，取第一句
-        assert_eq!(derive_subtitle("```rs\nfn main(){}\n```\n## 好的，已经改完了。接下来……"), "好的，已经改完了。");
-        assert_eq!(derive_subtitle(&"长".repeat(80)).chars().count(), 49);
-        assert_eq!(derive_subtitle("看 [文档](https://x.y) 就行"), "看 文档 就行");
+        // 推导：跳过代码块与标题记号，按整句取开头几句，不在句中截断
+        assert_eq!(derive_subtitles("```rs\nfn main(){}\n```\n## 好的，已经改完了。接下来……"), vec!["好的，已经改完了。", "接下来……"]);
+        assert_eq!(derive_subtitles(&"长".repeat(80)), vec!["长".repeat(80)]);
+        assert_eq!(derive_subtitles("看 [文档](https://x.y) 就行"), vec!["看 文档 就行"]);
+        assert_eq!(derive_subtitles("好的。我把构建脚本改好了！\n测试也都过了。\n\n## 细节\n很长的说明。"), vec!["好的。我把构建脚本改好了！", "测试也都过了。"]);
+        let many = "第一句话在这里。第二句话在这里。第三句话在这里。第四句话在这里。";
+        assert_eq!(derive_subtitles(many).len(), 3);
+        // 字幕里成对的方括号不再让整条字幕丢失
+        let (b, s3) = extract_subtitles("[[字幕: 看看 [README] 吧]]\n正文");
+        assert_eq!((b.as_str(), s3.len()), ("正文", 1));
+        assert_eq!(s3[0].text, "看看 ［README］ 吧");
         // say 参数：不完整的 JSON 不算
         assert!(parse_say(r#"{"text":"你好"#).is_none());
         assert_eq!(parse_say(r#"{"text":" 你好 ","speech":"こんにちは"}"#).unwrap().speech, "こんにちは");

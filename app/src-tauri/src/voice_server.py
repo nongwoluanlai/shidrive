@@ -202,6 +202,32 @@ def tts_pack(d, text, speed):
     return pcm16_b64(wav, meta.get("sample_rate", 22050))
 
 
+# 英文缩写：Kokoro / Melo 会把整串大写（API、JSON）当成未登录词直接跳过，拆成单个字母才读；
+# 中文 VITS 语音包只有汉字词典，英文一律跳过：缩写和 3 个字母以内的短词改成中文字母读法
+_ACRONYM = re.compile(r"(?<![A-Za-z])[A-Z]{2,6}(?![A-Za-z])")
+_SHORT_EN = re.compile(r"(?<![A-Za-z])[A-Za-z]{1,3}(?![A-Za-z])")
+_ZH_LETTERS = dict(zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ", [
+    "诶", "必", "西", "迪", "伊", "艾弗", "吉", "艾尺", "爱", "杰", "开", "艾勒", "艾姆",
+    "恩", "欧", "批", "扣", "阿", "艾斯", "替", "优", "维", "达布溜", "艾克斯", "歪", "贼"]))
+_END_PUNCT = "。！？!?.…~～，,、；;：:」』）)\"'”’"
+
+
+def speech_text(kind, text):
+    """合成前整理文本：英文缩写改成读得出来的形式；句末没有标点时补「。」（VITS 遇到没有句末标点的结尾容易把最后一个字吞掉）"""
+    text = (text or "").strip()
+    if not text:
+        return text
+    if kind in ("kokoro", "melo"):
+        text = _ACRONYM.sub(lambda m: " " + " ".join(m.group(0).lower()) + " ", text)
+    elif kind == "vits":
+        spell = lambda m: "".join(_ZH_LETTERS.get(c, "") for c in m.group(0).upper())
+        text = _SHORT_EN.sub(spell, _ACRONYM.sub(spell, text))
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    if text and text[-1] not in _END_PUNCT:
+        text += "。"
+    return text
+
+
 def tts_preset(req, d, text, speed):
     """预设音色语音包：底模（kokoro/melo/vits 语音包）的某个说话人 + 变调。
     变调不做 DSP：先按 1/f 放慢合成，再把采样率标成 rate*f 播放——音高升 f 倍、时长复原。"""
@@ -209,6 +235,7 @@ def tts_preset(req, d, text, speed):
     if base not in ("melo", "kokoro", "vits"):
         raise RuntimeError("未知的底模：%s" % base)
     tts = tts_sherpa(base, d)
+    text = speech_text(base, text)
     if not text:
         return pcm16_b64([], tts.sample_rate)
     pitch = max(-8.0, min(8.0, float(req.get("pitch") or 0.0)))
@@ -232,6 +259,7 @@ def op_tts(req):
     if engine not in ("melo", "kokoro"):
         raise RuntimeError("未知的语音引擎：%s" % engine)
     tts = tts_sherpa(engine, d)
+    text = speech_text(engine, text)
     if not text:
         return pcm16_b64([], tts.sample_rate)
     sid = int(req.get("sid") or 0)

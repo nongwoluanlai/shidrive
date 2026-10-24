@@ -9,6 +9,41 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { runWorkflowInteractive, scheduleText } from "./wf-shared";
   import { t } from "../i18n";
 
+  // 侧栏宽度：拖动右边缘调整（双击恢复默认），记在本机
+  const SB_KEY = "shidrive.sidebarWidth";
+  const SB_DEFAULT = 240;
+  const SB_MIN = 200;
+  const sbMax = (w: number) => Math.max(SB_MIN, Math.min(560, Math.floor(w * 0.4)));
+  let sbWidth = $state(Math.min(Math.max(Number(localStorage.getItem(SB_KEY)) || SB_DEFAULT, SB_MIN), 560));
+  let sbDragging = $state(false);
+  let sbWinW = $state(window.innerWidth);
+  function startSbDrag(e: PointerEvent) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const el = e.currentTarget as HTMLElement;
+    el.setPointerCapture(e.pointerId);
+    const startX = e.clientX;
+    const startW = Math.min(sbWidth, sbMax(window.innerWidth));
+    sbDragging = true;
+    const move = (ev: PointerEvent) => {
+      sbWidth = Math.round(Math.min(sbMax(window.innerWidth), Math.max(SB_MIN, startW + (ev.clientX - startX))));
+    };
+    const up = () => {
+      sbDragging = false;
+      el.removeEventListener("pointermove", move);
+      el.removeEventListener("pointerup", up);
+      el.removeEventListener("pointercancel", up);
+      localStorage.setItem(SB_KEY, String(sbWidth));
+    };
+    el.addEventListener("pointermove", move);
+    el.addEventListener("pointerup", up);
+    el.addEventListener("pointercancel", up);
+  }
+  function resetSbWidth() {
+    sbWidth = SB_DEFAULT;
+    localStorage.setItem(SB_KEY, String(SB_DEFAULT));
+  }
+
   let showNewContext = $state(false);
   let projectName = $state("");
   let projectPath = $state("");
@@ -293,7 +328,9 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
 
 </script>
 
-<aside class="sidebar">
+<svelte:window bind:innerWidth={sbWinW} />
+<aside class="sidebar" class:dragging={sbDragging} style="width: {Math.min(sbWidth, sbMax(sbWinW))}px">
+  <div class="sb-handle" title={t("拖动调整宽度，双击恢复默认")} onpointerdown={startSbDrag} ondblclick={resetSbWidth}></div>
   <!-- project switcher -->
   <div class="proj">
     <button class="btn sm projbtn add" onclick={openNewProject}><Icon name="plus" size={14} /> {t("添加项目")}</button>
@@ -454,10 +491,27 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     display: flex;
     flex-direction: column;
     min-height: 0;
-    /* 固定宽度：不随项目/上下文名称长短抖动，超长内容由内部省略号消化 */
+    /* 宽度由用户拖动决定（style），不随项目/上下文名称长短抖动，超长内容由内部省略号消化 */
+    position: relative;
     flex: none;
     width: 240px;
-    min-width: 240px;
+    min-width: 200px;
+  }
+  .sb-handle {
+    position: absolute;
+    right: -3px;
+    top: 0;
+    bottom: 0;
+    width: 6px;
+    cursor: col-resize;
+    z-index: 5;
+  }
+  .sb-handle:hover,
+  .sidebar.dragging .sb-handle {
+    background: color-mix(in srgb, var(--accent) 35%, transparent);
+  }
+  .sidebar.dragging {
+    user-select: none;
   }
   .proj {
     padding: 10px 12px 8px;
@@ -518,11 +572,13 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     display: flex;
     flex-direction: column;
     min-height: 0;
-    flex: none;
+    flex: 0 1 auto;
     max-height: 52%;
+    overflow: hidden;
   }
   .sec.grow {
-    flex: 1;
+    flex: 1 1 0;
+    min-height: 96px;
     max-height: none;
     border-top: 1px solid var(--border-soft);
   }
@@ -548,7 +604,8 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     min-height: 56px;
   }
   .ctx-list {
-    flex: none;
+    flex: 0 1 auto;
+    min-height: 48px;
     max-height: 360px;
   }
   .wf-list {

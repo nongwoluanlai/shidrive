@@ -96,8 +96,9 @@ export function visibleText(raw: string): string {
 
 // ---------------- 字幕层 ----------------
 
-const SUB_STRIP = /[ \t]*\[\[\s*(字幕|subtitle|say)\s*[:：][^\[\]]*\]\](?:[ \t]*\[\[\s*(ja|en|ko|yue|zh|speech)\s*[:：][^\[\]]*\]\])?[ \t]*\n?/gi;
-const SUB_RE = /\[\[\s*(?:字幕|subtitle|say)\s*[:：]\s*([^\[\]]*?)\s*\]\](?:[ \t]*\[\[\s*(?:ja|en|ko|yue|zh|speech)\s*[:：]\s*([^\[\]]*?)\s*\]\])?/gi;
+// 字幕内容允许成对的单层方括号（如「看看 [README] 吧」），否则整条字幕会匹配失败、被跳过不读；与后端 sub_re 保持一致
+const SUB_STRIP = /[ \t]*\[\[\s*(字幕|subtitle|say)\s*[:：](?:[^\[\]]|\[[^\[\]]*\])*\]\](?:[ \t]*\[\[\s*(ja|en|ko|yue|zh|speech)\s*[:：](?:[^\[\]]|\[[^\[\]]*\])*\]\])?[ \t]*\n?/gi;
+const SUB_RE = /\[\[\s*(?:字幕|subtitle|say)\s*[:：]\s*((?:[^\[\]]|\[[^\[\]]*\])*?)\s*\]\](?:[ \t]*\[\[\s*(?:ja|en|ko|yue|zh|speech)\s*[:：]\s*((?:[^\[\]]|\[[^\[\]]*\])*?)\s*\]\])?/gi;
 
 /** 从流式原文里取出已写完的 [[字幕: …]]；配音模式下要等紧跟的 [[ja: …]] 也写完 */
 export function tagSubtitles(raw: string, final: boolean, layer: boolean): AssistantSubtitle[] {
@@ -118,6 +119,27 @@ export function tagSubtitles(raw: string, final: boolean, layer: boolean): Assis
 let turnSpeech: { lang: string; layer: boolean } = { lang: "", layer: false };
 /** say 工具发来的字幕 */
 let toolSubs: AssistantSubtitle[] = [];
+/** 已并入 ga.subs 的工具字幕 / 标记字幕条数：字幕只追加不重排，朗读按偏移续读才不会漏句 */
+let toolSeen = 0;
+let tagSeen = 0;
+
+function resetSubs() {
+  ga.subs = [];
+  toolSubs = [];
+  toolSeen = 0;
+  tagSeen = 0;
+}
+
+/** 把新到的工具字幕与标记字幕按到达顺序追加到 ga.subs 末尾 */
+function appendSubs(final: boolean): boolean {
+  const tags = tagSubtitles(ga.streaming, final, turnSpeech.layer);
+  const add = [...toolSubs.slice(toolSeen), ...tags.slice(tagSeen)];
+  toolSeen = toolSubs.length;
+  tagSeen = Math.max(tagSeen, tags.length);
+  if (!add.length) return false;
+  ga.subs = [...ga.subs, ...add];
+  return true;
+}
 
 /** 字幕 → 朗读原文：配音模式每条附 [[lang: …]]，没有配音版本的不读 */
 function subSpeech(subs: AssistantSubtitle[]): string {
@@ -129,16 +151,13 @@ export const subText = (subs: AssistantSubtitle[]) => subs.map((s) => s.text).jo
 
 /** 合并工具字幕与标记字幕；有新字幕就送去朗读 */
 function syncSubs() {
-  const next = [...toolSubs, ...tagSubtitles(ga.streaming, false, turnSpeech.layer)];
-  if (next.length === ga.subs.length) return;
-  ga.subs = next;
-  feedSpeech(subSpeech(next), false);
+  if (appendSubs(false)) feedSpeech(subSpeech(ga.subs), false);
 }
 
 /** 回合结束：补上最后的标记字幕；一条都没收到时改用后端给的（推导的），然后把朗读收尾 */
 function finishSubs(fallback: AssistantSubtitle[]) {
-  const streamed = [...toolSubs, ...tagSubtitles(ga.streaming, true, turnSpeech.layer)];
-  ga.subs = streamed.length ? streamed : fallback;
+  appendSubs(true);
+  if (!ga.subs.length && fallback.length) ga.subs = fallback;
   feedSpeech(subSpeech(ga.subs), true);
 }
 
@@ -317,8 +336,7 @@ async function runTurn(kind: Busy, call: (turnId: string) => Promise<AssistantTu
   ga.turnId = turnId;
   ga.busy = kind;
   ga.streaming = "";
-  ga.subs = [];
-  toolSubs = [];
+  resetSubs();
   const sh = speechHint();
   turnSpeech = { lang: sh?.lang ?? "", layer: !!sh?.layer };
   quietTurn = quiet;
@@ -374,8 +392,7 @@ async function runTurn(kind: Busy, call: (turnId: string) => Promise<AssistantTu
     if (ga.turnId === turnId) {
       ga.busy = "";
       ga.streaming = "";
-      ga.subs = [];
-      toolSubs = [];
+      resetSubs();
       quietTurn = false;
       void refreshView();
     }
