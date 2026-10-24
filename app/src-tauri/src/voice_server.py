@@ -84,7 +84,29 @@ def tts_sherpa(kind, d):
         import sherpa_onnx
 
         fsts = ",".join(x for x in [p(d, n) for n in ("date.fst", "number.fst", "phone.fst", "date-zh.fst", "number-zh.fst", "phone-zh.fst")] if os.path.exists(x))
-        if kind == "kokoro":
+        if kind == "vits":  # sherpa-vits 语音包：文件名 / 参数来自 voice.json
+            meta = json.load(open(p(d, "voice.json"), encoding="utf-8"))
+            rules = meta.get("rule_fsts")
+            if not isinstance(rules, list):
+                rules = [n for n in ("phone.fst", "date.fst", "number.fst", "new_heteronym.fst") if os.path.exists(p(d, n))]
+            fsts = ",".join(p(d, n) for n in rules if isinstance(n, str) and os.path.exists(p(d, n)))
+            dd = p(d, meta.get("dict") or "dict")
+
+            def num(k, dv, lo, hi):
+                try:
+                    return max(lo, min(hi, float(meta.get(k, dv))))
+                except (TypeError, ValueError):
+                    return dv
+
+            mc = sherpa_onnx.OfflineTtsModelConfig(
+                vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                    model=p(d, meta.get("model") or "model.onnx"), lexicon=p(d, meta.get("lexicon") or "lexicon.txt"),
+                    tokens=p(d, meta.get("tokens") or "tokens.txt"), dict_dir=dd if os.path.isdir(dd) else "",
+                    noise_scale=num("noise_scale", 0.667, 0.0, 1.5), noise_scale_w=num("noise_scale_w", 0.8, 0.0, 1.5),
+                ),
+                num_threads=threads(),
+            )
+        elif kind == "kokoro":
             model = p(d, "model.int8.onnx") if os.path.exists(p(d, "model.int8.onnx")) else p(d, "model.onnx")
             lex = ",".join(x for x in [p(d, "lexicon-us-en.txt"), p(d, "lexicon-zh.txt")] if os.path.exists(x))
             mc = sherpa_onnx.OfflineTtsModelConfig(
@@ -181,10 +203,10 @@ def tts_pack(d, text, speed):
 
 
 def tts_preset(req, d, text, speed):
-    """预设音色语音包：底模（kokoro/melo）的某个说话人 + 变调。
+    """预设音色语音包：底模（kokoro/melo/vits 语音包）的某个说话人 + 变调。
     变调不做 DSP：先按 1/f 放慢合成，再把采样率标成 rate*f 播放——音高升 f 倍、时长复原。"""
     base = req.get("base", "")
-    if base not in ("melo", "kokoro"):
+    if base not in ("melo", "kokoro", "vits"):
         raise RuntimeError("未知的底模：%s" % base)
     tts = tts_sherpa(base, d)
     if not text:

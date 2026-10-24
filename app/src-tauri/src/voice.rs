@@ -381,7 +381,7 @@ pub struct VoicePack {
     pub name: String,
     pub lang: String,
     pub engine: String,
-    /// engine = "preset" 时的底模："kokoro" | "melo"（音色 = 底模说话人 + 变调/语速）
+    /// engine = "preset" 时的底模："kokoro" | "melo" | "pack:<sherpa-vits 语音包 id>"（音色 = 底模说话人 + 变调/语速）
     pub base: String,
     pub skins: Vec<String>,
     pub characters: Vec<String>,
@@ -840,19 +840,48 @@ fn preset_base(base: &str) -> Option<&'static str> {
     match base { "kokoro" => Some("tts-kokoro"), "melo" => Some("tts-melo"), _ => None }
 }
 
-/// preset 语音包的合成请求：底模目录 + 说话人 + 变调（半音，±8）+ 语速倍率（0.5–2）
-fn preset_request(rt: &VoiceRuntime, meta: &Value, text: &str, rate: f32) -> Result<Value, String> {
+/// preset 的底模也可以是另一个 sherpa-vits 语音包（多说话人模型只装一份，各角色音色做成只有 voice.json 的小包）
+fn preset_pack_ref(base: &str) -> Option<&str> {
+    base.strip_prefix("pack:").filter(|id| valid_id(id))
+}
+
+fn read_pack_meta(dir: &Path) -> Option<Value> {
+    std::fs::read_to_string(dir.join("voice.json")).ok().and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// sherpa-vits 语音包里引用的相对路径（不得越出包目录）
+fn pack_rel_ok(f: &str) -> bool {
+    !f.is_empty() && !f.contains("..") && !f.starts_with('/') && !f.starts_with('\\') && !f.contains(':')
+}
+
+/// preset / sherpa-vits 语音包的合成请求：模型目录 + 说话人 + 变调（半音，±8）+ 语速倍率（0.5–2）
+/// meta = 被选中语音包的 voice.json；dir = 该语音包目录
+fn preset_request(rt: &VoiceRuntime, meta: &Value, dir: &Path, text: &str, rate: f32) -> Result<Value, String> {
+    let name = meta.get("name").and_then(Value::as_str).unwrap_or("语音包");
+    let num = |k: &str, lo: f64, hi: f64, d: f64| meta.get(k).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(d).clamp(lo, hi);
+    let speed = (rate as f64 * num("speed", 0.5, 2.0, 1.0)).clamp(0.5, 2.0);
+    let pitch = num("pitch", -8.0, 8.0, 0.0);
+    let sid = meta.get("sid").and_then(Value::as_u64).unwrap_or(0);
+    let vits = |d: PathBuf, sid: u64| json!({ "op": "tts", "engine": "preset", "base": "vits", "dir": d, "text": text, "speed": speed, "sid": sid.min(9999), "pitch": pitch });
+    if meta.get("engine").and_then(Value::as_str) == Some("sherpa-vits") {
+        return Ok(vits(dir.to_path_buf(), sid));
+    }
     let base = meta.get("base").and_then(Value::as_str).unwrap_or("");
+    if let Some(id) = preset_pack_ref(base) {
+        let d = rt.packs_dir().join(id);
+        let engine = read_pack_meta(&d).and_then(|m| m.get("engine").and_then(Value::as_str).map(str::to_string));
+        if engine.as_deref() != Some("sherpa-vits") {
+            return Err(format!("「{name}」基于语音包 {id}，请先导入该语音包"));
+        }
+        return Ok(vits(d, sid));
+    }
     let id = preset_base(base).ok_or_else(|| format!("语音包底模无效：{base}"))?;
     let m = model_spec(id).unwrap();
     if !rt.model_installed(m) {
-        let name = meta.get("name").and_then(Value::as_str).unwrap_or("语音包");
         return Err(format!("「{name}」基于 {}，请先在 设置 → 全局助手 → 语音 里安装该模型", m.name));
     }
-    let num = |k: &str, lo: f64, hi: f64, d: f64| meta.get(k).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(d).clamp(lo, hi);
-    let sid = meta.get("sid").and_then(Value::as_u64).unwrap_or(0).min(if base == "kokoro" { 102 } else { 0 });
-    let speed = (rate as f64 * num("speed", 0.5, 2.0, 1.0)).clamp(0.5, 2.0);
-    Ok(json!({ "op": "tts", "engine": "preset", "base": base, "dir": rt.model_dir(id), "text": text, "speed": speed, "sid": sid, "pitch": num("pitch", -8.0, 8.0, 0.0) }))
+    let sid = sid.min(if base == "kokoro" { 102 } else { 0 });
+    Ok(json!({ "op": "tts", "engine": "preset", "base": base, "dir": rt.model_dir(id), "text": text, "speed": speed, "sid": sid, "pitch": pitch }))
 }
 
 fn import_pack(rt: &VoiceRuntime, path: &Path, overwrite: bool) -> Result<VoicePack, String> {
@@ -875,9 +904,26 @@ fn import_pack(rt: &VoiceRuntime, path: &Path, overwrite: bool) -> Result<VoiceP
                     if f.contains("..") || !dir.join(f).is_file() { return Err(format!("语音包缺少文件：{f}")); }
                 }
             }
-            // 预设音色：不带模型，复用已安装的通用 TTS（Kokoro / Melo）的某个说话人 + 变调
+            // 预设音色：不带模型，复用已安装的通用 TTS（Kokoro / Melo）或 sherpa-vits 语音包的某个说话人 + 变调
             "preset" => {
-                if preset_base(&pack.base).is_none() { return Err(format!("preset 语音包的 base 只能是 kokoro 或 melo：{}", pack.base)); }
+                if preset_base(&pack.base).is_none() && preset_pack_ref(&pack.base).is_none() {
+                    return Err(format!("preset 语音包的 base 只能是 kokoro、melo 或 pack:<语音包 id>：{}", pack.base));
+                }
+                if preset_pack_ref(&pack.base) == Some(pack.id.as_str()) { return Err("preset 语音包的 base 不能指向自己".into()); }
+            }
+            // sherpa-onnx VITS（中文 lexicon + jieba 词典，如原神/崩坏 804 角色模型）：复用运行环境里的 sherpa_onnx，无新依赖
+            "sherpa-vits" => {
+                let s = |k: &str, d: &'static str| v.get(k).and_then(Value::as_str).unwrap_or(d).to_string();
+                for f in [s("model", "model.onnx"), s("lexicon", "lexicon.txt"), s("tokens", "tokens.txt")] {
+                    if !pack_rel_ok(&f) || !dir.join(&f).is_file() { return Err(format!("语音包缺少文件：{f}")); }
+                }
+                let dict = s("dict", "dict");
+                if !pack_rel_ok(&dict) { return Err(format!("语音包 dict 路径无效：{dict}")); }
+                if let Some(a) = v.get("rule_fsts").and_then(Value::as_array) {
+                    for f in a.iter().filter_map(Value::as_str) {
+                        if !pack_rel_ok(f) || !dir.join(f).is_file() { return Err(format!("语音包缺少文件：{f}")); }
+                    }
+                }
             }
             other => return Err(format!("暂不支持的语音包引擎：{other}")),
         }
@@ -1129,9 +1175,9 @@ pub async fn voice_tts(db: DbState<'_>, rt: VState<'_>, text: String, voice: Str
         if !valid_id(p) { return Err("语音包 id 无效".into()); }
         let d = rt.packs_dir().join(p);
         if !d.join("voice.json").is_file() { return Err(format!("语音包未安装：{p}")); }
-        let meta: Value = std::fs::read_to_string(d.join("voice.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
-        if meta.get("engine").and_then(Value::as_str) == Some("preset") {
-            preset_request(&rt, &meta, &text, cfg.rate)?
+        let meta = read_pack_meta(&d).unwrap_or(Value::Null);
+        if matches!(meta.get("engine").and_then(Value::as_str), Some("preset" | "sherpa-vits")) {
+            preset_request(&rt, &meta, &d, &text, cfg.rate)?
         } else {
             json!({ "op": "tts", "engine": "pack", "dir": d, "text": text, "speed": cfg.rate })
         }
@@ -1291,11 +1337,44 @@ mod tests {
         let bad = preset("bad.zip", br#"{"id":"fish2","engine":"preset","base":"espeak"}"#);
         assert!(import_pack(&rt, &bad, false).unwrap_err().contains("base"));
         let meta: Value = serde_json::from_str(r#"{"name":"Fish","base":"kokoro","sid":999,"pitch":40,"speed":0.1}"#).unwrap();
-        assert!(preset_request(&rt, &meta, "你好", 1.0).unwrap_err().contains("Kokoro"));
+        let pd = rt.packs_dir().join("fish");
+        assert!(preset_request(&rt, &meta, &pd, "你好", 1.0).unwrap_err().contains("Kokoro"));
         std::fs::create_dir_all(rt.model_dir("tts-kokoro")).unwrap();
         std::fs::write(rt.model_dir("tts-kokoro").join(model_spec("tts-kokoro").unwrap().check), b"x").unwrap();
-        let r = preset_request(&rt, &meta, "你好", 1.0).unwrap();
+        let r = preset_request(&rt, &meta, &pd, "你好", 1.0).unwrap();
         assert_eq!((r["engine"].as_str(), r["sid"].as_u64(), r["pitch"].as_f64(), r["speed"].as_f64()), (Some("preset"), Some(102), Some(8.0), Some(0.5)));
+        // sherpa-vits：模型 / lexicon / tokens 必须在包里；rule_fsts 不得越界
+        let vz = |name: &str, json: &[u8], files: &[&str]| {
+            let zp = dir.join(name);
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&zp).unwrap());
+            let o = zip::write::SimpleFileOptions::default();
+            z.start_file("gv/voice.json", o).unwrap();
+            z.write_all(json).unwrap();
+            for f in files { z.start_file(format!("gv/{f}"), o).unwrap(); z.write_all(b"x").unwrap(); }
+            z.finish().unwrap();
+            zp
+        };
+        let gv = br#"{"id":"gv","name":"GV","lang":"zh","engine":"sherpa-vits","sid":127,"rule_fsts":["number.fst"]}"#;
+        assert!(import_pack(&rt, &vz("gv0.zip", gv, &["model.onnx", "lexicon.txt"]), false).unwrap_err().contains("tokens.txt"));
+        assert!(import_pack(&rt, &vz("gv1.zip", gv, &["model.onnx", "lexicon.txt", "tokens.txt"]), false).unwrap_err().contains("number.fst"));
+        let evil = br#"{"id":"gv","engine":"sherpa-vits","model":"../x.onnx"}"#;
+        assert!(import_pack(&rt, &vz("gv2.zip", evil, &["model.onnx", "lexicon.txt", "tokens.txt"]), false).is_err());
+        let p = import_pack(&rt, &vz("gv3.zip", gv, &["model.onnx", "lexicon.txt", "tokens.txt", "number.fst"]), false).unwrap();
+        assert_eq!(p.engine, "sherpa-vits");
+        let gmeta = read_pack_meta(&rt.packs_dir().join("gv")).unwrap();
+        let r = preset_request(&rt, &gmeta, &rt.packs_dir().join("gv"), "你好", 1.0).unwrap();
+        assert_eq!((r["base"].as_str(), r["sid"].as_u64()), (Some("vits"), Some(127)));
+        // preset 指向 sherpa-vits 包：只带 voice.json 的角色小包
+        let ayaka = preset("ayaka.zip", br#"{"id":"gv-ayaka","name":"Ayaka","lang":"zh","engine":"preset","base":"pack:gv","sid":87,"pitch":-0.5}"#);
+        let p = import_pack(&rt, &ayaka, false).unwrap();
+        assert_eq!(p.base, "pack:gv");
+        let am = read_pack_meta(&rt.packs_dir().join("gv-ayaka")).unwrap();
+        let r = preset_request(&rt, &am, &rt.packs_dir().join("gv-ayaka"), "你好", 1.0).unwrap();
+        assert_eq!((r["base"].as_str(), r["sid"].as_u64(), r["dir"].as_str().map(|d| d.ends_with("gv"))), (Some("vits"), Some(87), Some(true)));
+        let orphan: Value = serde_json::from_str(r#"{"name":"O","engine":"preset","base":"pack:nope"}"#).unwrap();
+        assert!(preset_request(&rt, &orphan, &pd, "你好", 1.0).unwrap_err().contains("nope"));
+        let selfref = preset("self.zip", br#"{"id":"loop","engine":"preset","base":"pack:loop"}"#);
+        assert!(import_pack(&rt, &selfref, false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

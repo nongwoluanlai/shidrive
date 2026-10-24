@@ -113,4 +113,5 @@ export const voiceEn: Record<string, string> = {
   "唤醒后多轮对话（她说完自动继续听，由她判断何时结束）": "Multi-turn after wake (keeps listening after she replies; she decides when to stop)",
   "基于 {base} 的预设音色": "Preset voice based on {base}",
   "需先安装该模型": "install that model first",
+  "需先导入该语音包": "import that voice pack first",
 };

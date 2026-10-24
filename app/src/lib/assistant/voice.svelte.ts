@@ -92,11 +92,21 @@ export function localModelReady(id: "melo" | "kokoro") {
   return !!st?.runtime_installed && !!st.models.find((m) => m.id === `tts-${id}`)?.installed;
 }
 
-/** 语音包能否合成：preset 包复用通用 TTS 模型，需要先安装底模 */
+/** 语音包能否合成：preset 包复用通用 TTS 模型或另一个 sherpa-vits 语音包，需要先装好底模 */
 export function packReady(p: VoicePack): boolean {
   if (!vc.view?.status.runtime_installed) return false;
-  if (p.engine === "preset") return (p.base === "kokoro" || p.base === "melo") && localModelReady(p.base);
-  return true;
+  if (p.engine !== "preset") return true;
+  if (p.base === "kokoro" || p.base === "melo") return localModelReady(p.base);
+  const ref = p.base?.startsWith("pack:") ? p.base.slice(5) : "";
+  return !!ref && ref !== p.id && !!vc.view.status.packs.find((x) => x.id === ref && x.engine === "sherpa-vits");
+}
+
+/** preset 语音包的底模名（设置页提示用） */
+export function packBaseName(p: VoicePack): string {
+  if (p.base === "melo") return "MeloTTS";
+  if (p.base === "kokoro") return "Kokoro";
+  const ref = p.base?.startsWith("pack:") ? p.base.slice(5) : "";
+  return vc.view?.status.packs.find((x) => x.id === ref)?.name ?? ref ?? "";
 }
 
 export function outputVoice(): OutputVoice | null {

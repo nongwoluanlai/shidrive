@@ -6,7 +6,7 @@
   import { api } from "../ipc";
   import { t } from "../i18n";
   import { confirmDialog } from "../dialog.svelte";
-  import { vc, initVoice, refreshVoice, saveVoice, packForSkin, packReady, outputVoice, previewVoice, systemVoices, listenOnce, stopCapture, stopSpeaking, displayLang, localModelReady, type OutputVoice } from "../assistant/voice.svelte";
+  import { vc, initVoice, refreshVoice, saveVoice, packForSkin, packReady, packBaseName, outputVoice, previewVoice, systemVoices, listenOnce, stopCapture, stopSpeaking, displayLang, localModelReady, type OutputVoice } from "../assistant/voice.svelte";
   import { wk } from "../assistant/wake.svelte";
   import type { VoiceConfig, VoicePack, VoiceTask } from "../types";
 
@@ -360,7 +360,7 @@
             <span class="dot on"></span>
             <span class="grow">
               {p.name} <span class="dim">· {langName(p.lang)}{p.skins.length ? ` · ${t("皮肤")} ${p.skins.join(", ")}` : ""}{p.license ? ` · ${p.license}` : ""}</span>
-              {#if p.engine === "preset"}<span class="dim block">{t("基于 {base} 的预设音色", { base: p.base === "melo" ? "MeloTTS" : "Kokoro" })}{packReady(p) ? "" : ` · ${t("需先安装该模型")}`}</span>{/if}
+              {#if p.engine === "preset"}<span class="dim block">{t("基于 {base} 的预设音色", { base: packBaseName(p) })}{packReady(p) ? "" : ` · ${p.base?.startsWith("pack:") ? t("需先导入该语音包") : t("需先安装该模型")}`}</span>{/if}
               {#if p.credits || p.source}<span class="dim block">{p.credits}{p.source ? ` ${p.source}` : ""}</span>{/if}
             </span>
             <button class="btn ghost sm" disabled={!packReady(p)} onclick={() => preview(packPreview(p))}>{t("试听")}</button>
