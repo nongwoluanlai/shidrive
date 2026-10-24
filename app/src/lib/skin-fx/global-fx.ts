@@ -56,7 +56,7 @@ function sanitizeStep(raw: unknown): FxStep | null {
     case "tint": return { at, fx, color: hex(r.color, "#ff9a3c"), opacity: num(r.opacity, 0.05, 0.6, 0.2), blend: BLENDS.includes(r.blend as string) ? r.blend : "color", dur: num(r.dur, 200, 3000, 900) };
     case "ring": return { at, fx, color: hex(r.color, "#ffb347"), x: num(r.x, 0, 1, 0.5), y: num(r.y, 0, 1, 0.5), size: num(r.size, 0.1, 2, 0.9), width: num(r.width, 1, 12, 3), dur: num(r.dur, 200, 2000, 800) };
     case "particles": {
-      const shape = ["dot", "spark", "digit"].includes(r.shape as string) ? r.shape : "dot";
+      const shape = ["dot", "spark", "digit", "bubble"].includes(r.shape as string) ? r.shape : "dot";
       return { at, fx, color: hex(r.color, "#ffb347"), n: Math.round(num(r.n, 1, 40, 18)), shape, dir: r.dir === "down" ? "down" : "up", dur: num(r.dur, 400, 3000, 1600) };
     }
   }
@@ -290,6 +290,7 @@ export class GlobalFx {
       case "particles": {
         const n = Number(s.n), color = String(s.color), up = s.dir !== "down";
         for (let i = 0; i < n; i++) {
+          if (s.shape === "bubble") { this.bubble(color, up, dur); continue; }
           const size = s.shape === "digit" ? R(12, 20) : R(2, 5);
           const el = this.overlay({ inset: "auto", left: `${R(0, 100)}%`, top: up ? "100%" : "-4%", width: s.shape === "digit" ? "auto" : `${size}px`, height: s.shape === "spark" ? `${size * 4}px` : s.shape === "digit" ? "auto" : `${size}px`,
             borderRadius: s.shape === "dot" ? "50%" : "2px", background: s.shape === "digit" ? "transparent" : color, color, font: `${size}px var(--mono, monospace)`, boxShadow: s.shape === "digit" ? "none" : `0 0 6px ${color}`, textShadow: s.shape === "digit" ? `0 0 4px ${color}` : "none", willChange: "transform, opacity" });
@@ -300,6 +301,22 @@ export class GlobalFx {
         break;
       }
     }
+  }
+
+  /** Underwater bubble: hollow glossy ring that wobbles sideways while rising. */
+  private bubble(color: string, up: boolean, dur: number) {
+    const R = (a: number, b: number) => a + Math.random() * (b - a);
+    const size = R(6, 18);
+    const el = this.overlay({ inset: "auto", left: `${R(0, 100)}%`, top: up ? "100%" : "-4%", width: `${size}px`, height: `${size}px`, borderRadius: "50%",
+      border: `1px solid ${color}`, background: "radial-gradient(circle at 32% 30%, rgba(255,255,255,.9) 0 14%, rgba(255,255,255,0) 16%), radial-gradient(circle, rgba(255,255,255,0) 55%, rgba(255,255,255,.18) 100%)",
+      boxShadow: `0 0 6px ${color}, inset 0 0 ${Math.round(size / 3)}px ${color}`, willChange: "transform, opacity" });
+    const dy = (up ? -1 : 1) * innerHeight * R(0.4, 1.05), w = R(8, 22) * (Math.random() < 0.5 ? -1 : 1), d = dur * R(0.7, 1.15);
+    const frames: Keyframe[] = [];
+    for (let k = 0; k <= 6; k++) {
+      const f = k / 6;
+      frames.push({ offset: f, transform: `translate(${Math.sin(f * Math.PI * 3) * w}px, ${dy * f}px) scale(${0.7 + f * 0.45})`, opacity: k === 0 ? 0 : k === 6 ? 0 : k === 1 ? 0.95 : 0.85 - f * 0.3 });
+    }
+    this.track(el.animate(frames, { duration: d, delay: R(0, dur * 0.4), easing: "cubic-bezier(.3,.1,.5,1)", fill: "both" }), () => el.remove());
   }
 }
 

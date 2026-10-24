@@ -532,7 +532,7 @@ export interface VoiceConfig {
   wake_multiturn: boolean;
 }
 export interface VoiceTask { id: string; stage: string; received: number; total: number; message: string; running: boolean }
-export interface VoicePack { id: string; name: string; lang: string; engine: string; skins: string[]; characters: string[]; license: string; source: string; credits: string }
+export interface VoicePack { id: string; name: string; lang: string; engine: string; /** engine = "preset" 的底模：kokoro | melo */ base?: string; skins: string[]; characters: string[]; license: string; source: string; credits: string }
 export interface VoiceModelStatus { id: string; kind: "asr" | "tts" | "kws"; name: string; size_mb: number; installed: boolean }
 export interface VoiceStatus {
   root: string;

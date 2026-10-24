@@ -92,6 +92,13 @@ export function localModelReady(id: "melo" | "kokoro") {
   return !!st?.runtime_installed && !!st.models.find((m) => m.id === `tts-${id}`)?.installed;
 }
 
+/** 语音包能否合成：preset 包复用通用 TTS 模型，需要先安装底模 */
+export function packReady(p: VoicePack): boolean {
+  if (!vc.view?.status.runtime_installed) return false;
+  if (p.engine === "preset") return (p.base === "kokoro" || p.base === "melo") && localModelReady(p.base);
+  return true;
+}
+
 export function outputVoice(): OutputVoice | null {
   const v = vc.view;
   if (!v?.config.output_enabled) return null;
@@ -100,7 +107,7 @@ export function outputVoice(): OutputVoice | null {
   const hasCharacter = !!app.skin && skinAssistant.id === app.skin && skinAssistant.character;
   if (c.character_voice && hasCharacter && v.status.runtime_installed) {
     const p = packForSkin(app.skin);
-    if (p) {
+    if (p && packReady(p)) {
       const pl = p.lang || "ja";
       return { kind: "pack", id: `pack:${p.id}`, name: p.name, lang: pl, layer: pl !== lang };
     }

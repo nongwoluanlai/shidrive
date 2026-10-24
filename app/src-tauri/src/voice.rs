@@ -381,6 +381,8 @@ pub struct VoicePack {
     pub name: String,
     pub lang: String,
     pub engine: String,
+    /// engine = "preset" 时的底模："kokoro" | "melo"（音色 = 底模说话人 + 变调/语速）
+    pub base: String,
     pub skins: Vec<String>,
     pub characters: Vec<String>,
     pub license: String,
@@ -833,6 +835,26 @@ fn valid_id(s: &str) -> bool {
         && !s.starts_with('.')
 }
 
+/// preset 语音包的底模 → 模型 id
+fn preset_base(base: &str) -> Option<&'static str> {
+    match base { "kokoro" => Some("tts-kokoro"), "melo" => Some("tts-melo"), _ => None }
+}
+
+/// preset 语音包的合成请求：底模目录 + 说话人 + 变调（半音，±8）+ 语速倍率（0.5–2）
+fn preset_request(rt: &VoiceRuntime, meta: &Value, text: &str, rate: f32) -> Result<Value, String> {
+    let base = meta.get("base").and_then(Value::as_str).unwrap_or("");
+    let id = preset_base(base).ok_or_else(|| format!("语音包底模无效：{base}"))?;
+    let m = model_spec(id).unwrap();
+    if !rt.model_installed(m) {
+        let name = meta.get("name").and_then(Value::as_str).unwrap_or("语音包");
+        return Err(format!("「{name}」基于 {}，请先在 设置 → 全局助手 → 语音 里安装该模型", m.name));
+    }
+    let num = |k: &str, lo: f64, hi: f64, d: f64| meta.get(k).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(d).clamp(lo, hi);
+    let sid = meta.get("sid").and_then(Value::as_u64).unwrap_or(0).min(if base == "kokoro" { 102 } else { 0 });
+    let speed = (rate as f64 * num("speed", 0.5, 2.0, 1.0)).clamp(0.5, 2.0);
+    Ok(json!({ "op": "tts", "engine": "preset", "base": base, "dir": rt.model_dir(id), "text": text, "speed": speed, "sid": sid, "pitch": num("pitch", -8.0, 8.0, 0.0) }))
+}
+
 fn import_pack(rt: &VoiceRuntime, path: &Path, overwrite: bool) -> Result<VoicePack, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("无法读取文件：{e}"))?;
     if meta.len() > 1024 * 1024 * 1024 { return Err("语音包超过 1GB".into()); }
@@ -845,11 +867,19 @@ fn import_pack(rt: &VoiceRuntime, path: &Path, overwrite: bool) -> Result<VoiceP
         let v: Value = serde_json::from_str(&raw).map_err(|e| format!("voice.json 格式错误：{e}"))?;
         let mut pack: VoicePack = serde_json::from_value(v.clone()).map_err(|e| format!("voice.json 格式错误：{e}"))?;
         if !valid_id(&pack.id) { return Err("voice.json 的 id 只能包含小写字母、数字、-_.".to_string()); }
-        if pack.engine != "espnet-vits-onnx" { return Err(format!("暂不支持的语音包引擎：{}", pack.engine)); }
-        let model = v.get("model").and_then(Value::as_str).unwrap_or("model.onnx");
-        let tokens = v.get("tokens").and_then(Value::as_str).unwrap_or("tokens.json");
-        for f in [model, tokens] {
-            if f.contains("..") || !dir.join(f).is_file() { return Err(format!("语音包缺少文件：{f}")); }
+        match pack.engine.as_str() {
+            "espnet-vits-onnx" => {
+                let model = v.get("model").and_then(Value::as_str).unwrap_or("model.onnx");
+                let tokens = v.get("tokens").and_then(Value::as_str).unwrap_or("tokens.json");
+                for f in [model, tokens] {
+                    if f.contains("..") || !dir.join(f).is_file() { return Err(format!("语音包缺少文件：{f}")); }
+                }
+            }
+            // 预设音色：不带模型，复用已安装的通用 TTS（Kokoro / Melo）的某个说话人 + 变调
+            "preset" => {
+                if preset_base(&pack.base).is_none() { return Err(format!("preset 语音包的 base 只能是 kokoro 或 melo：{}", pack.base)); }
+            }
+            other => return Err(format!("暂不支持的语音包引擎：{other}")),
         }
         let dest = packs.join(&pack.id);
         if dest.exists() && !overwrite { return Err(format!("EXISTS:{}", pack.id)); }
@@ -1099,7 +1129,12 @@ pub async fn voice_tts(db: DbState<'_>, rt: VState<'_>, text: String, voice: Str
         if !valid_id(p) { return Err("语音包 id 无效".into()); }
         let d = rt.packs_dir().join(p);
         if !d.join("voice.json").is_file() { return Err(format!("语音包未安装：{p}")); }
-        json!({ "op": "tts", "engine": "pack", "dir": d, "text": text, "speed": cfg.rate })
+        let meta: Value = std::fs::read_to_string(d.join("voice.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
+        if meta.get("engine").and_then(Value::as_str) == Some("preset") {
+            preset_request(&rt, &meta, &text, cfg.rate)?
+        } else {
+            json!({ "op": "tts", "engine": "pack", "dir": d, "text": text, "speed": cfg.rate })
+        }
     } else {
         let id = match voice.as_str() { "melo" => "tts-melo", "kokoro" => "tts-kokoro", other => return Err(format!("未知语音：{other}")) };
         let m = model_spec(id).unwrap();
@@ -1241,6 +1276,26 @@ mod tests {
         let packs = list_packs(&rt);
         assert_eq!(packs.len(), 1);
         assert_eq!(packs[0].skins, vec!["kurisu-dynamic".to_string()]);
+        // preset：只有 voice.json，base 必须是 kokoro / melo；合成前要求底模已安装
+        let preset = |name: &str, json: &[u8]| {
+            let zp = dir.join(name);
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&zp).unwrap());
+            z.start_file("voice.json", zip::write::SimpleFileOptions::default()).unwrap();
+            z.write_all(json).unwrap();
+            z.finish().unwrap();
+            zp
+        };
+        let ok = preset("ok.zip", br#"{"id":"fish","name":"Fish","lang":"zh","engine":"preset","base":"kokoro","sid":50,"pitch":2.5,"skins":["dafeiyu-dynamic"]}"#);
+        let p = import_pack(&rt, &ok, false).unwrap();
+        assert_eq!((p.engine.as_str(), p.base.as_str()), ("preset", "kokoro"));
+        let bad = preset("bad.zip", br#"{"id":"fish2","engine":"preset","base":"espeak"}"#);
+        assert!(import_pack(&rt, &bad, false).unwrap_err().contains("base"));
+        let meta: Value = serde_json::from_str(r#"{"name":"Fish","base":"kokoro","sid":999,"pitch":40,"speed":0.1}"#).unwrap();
+        assert!(preset_request(&rt, &meta, "你好", 1.0).unwrap_err().contains("Kokoro"));
+        std::fs::create_dir_all(rt.model_dir("tts-kokoro")).unwrap();
+        std::fs::write(rt.model_dir("tts-kokoro").join(model_spec("tts-kokoro").unwrap().check), b"x").unwrap();
+        let r = preset_request(&rt, &meta, "你好", 1.0).unwrap();
+        assert_eq!((r["engine"].as_str(), r["sid"].as_u64(), r["pitch"].as_f64(), r["speed"].as_f64()), (Some("preset"), Some(102), Some(8.0), Some(0.5)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

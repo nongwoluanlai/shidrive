@@ -180,6 +180,24 @@ def tts_pack(d, text, speed):
     return pcm16_b64(wav, meta.get("sample_rate", 22050))
 
 
+def tts_preset(req, d, text, speed):
+    """预设音色语音包：底模（kokoro/melo）的某个说话人 + 变调。
+    变调不做 DSP：先按 1/f 放慢合成，再把采样率标成 rate*f 播放——音高升 f 倍、时长复原。"""
+    base = req.get("base", "")
+    if base not in ("melo", "kokoro"):
+        raise RuntimeError("未知的底模：%s" % base)
+    tts = tts_sherpa(base, d)
+    if not text:
+        return pcm16_b64([], tts.sample_rate)
+    pitch = max(-8.0, min(8.0, float(req.get("pitch") or 0.0)))
+    f = 2.0 ** (pitch / 12.0)
+    sid = int(req.get("sid") or 0)
+    if sid < 0 or sid >= max(1, tts.num_speakers):
+        sid = 0
+    audio = tts.generate(text, sid=sid, speed=max(0.3, min(2.5, speed / f)))
+    return pcm16_b64(audio.samples, int(round(audio.sample_rate * f)))
+
+
 def op_tts(req):
     engine = req.get("engine", "")
     d = req["dir"]
@@ -187,6 +205,8 @@ def op_tts(req):
     speed = float(req.get("speed") or 1.0)
     if engine == "pack":
         return tts_pack(d, text, speed)
+    if engine == "preset":
+        return tts_preset(req, d, text, speed)
     if engine not in ("melo", "kokoro"):
         raise RuntimeError("未知的语音引擎：%s" % engine)
     tts = tts_sherpa(engine, d)
