@@ -6,6 +6,7 @@ mod assistant;
 mod voice;
 mod agents;
 mod coding_mcp;
+mod desktop;
 mod commands;
 mod db;
 mod engine;

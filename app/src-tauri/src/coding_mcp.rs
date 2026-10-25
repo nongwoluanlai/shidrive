@@ -976,7 +976,7 @@ fn search_walk(
     }
 }
 
-fn run_exec(command: &str, dir: &Path, timeout: u64, max_chars: usize, stdin_data: Option<&str>) -> Result<Value, String> {
+pub(crate) fn run_exec(command: &str, dir: &Path, timeout: u64, max_chars: usize, stdin_data: Option<&str>) -> Result<Value, String> {
     use std::process::{Command, Stdio};
     let mut cmd = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
     cmd.current_dir(dir);

@@ -39,6 +39,10 @@ const PROMPT_REV: &str = "r14";
 const MAX_SUBTITLE_LEN: usize = 120;
 /// API 模式一轮里最多几次工具往返（MCP 工具）
 const MAX_TOOL_ROUNDS: usize = 8;
+/// 操作电脑时的最多轮数（截图 → 点击 → 再截图…）
+const MAX_DESKTOP_ROUNDS: usize = 30;
+/// 上下文里最多保留几张截图 / 图片
+const MAX_IMAGES: usize = 2;
 /// 单个工具结果交回模型的长度上限（字）
 const MAX_TOOL_RESULT: usize = 12000;
 
@@ -102,6 +106,14 @@ pub struct AssistantConfig {
     pub care_voice: bool,
     /// 给助手开放使驾本地 MCP（上下文 / 工作流 / 自己的定时等全部工具）：ACP 注入 MCP，API 走工具调用
     pub mcp_tools: bool,
+    /// 电脑操作（仅 API 模式）：终端命令、打开程序、窗口切换、截图 / 读图、鼠标键盘
+    pub desktop_tools: bool,
+    /// 执行命令 / 打开程序 / 鼠标键盘前先弹窗确认
+    pub desktop_confirm: bool,
+    /// 操作电脑时把使驾窗口最小化（免得挡住目标），回合结束后还原
+    pub desktop_hide: bool,
+    /// 模型支持读图：截图 / 图片按 OpenAI image_url（base64）发给模型
+    pub vision: bool,
 }
 
 impl Default for AssistantConfig {
@@ -126,6 +138,10 @@ impl Default for AssistantConfig {
             care_late_hour: 23,
             care_voice: true,
             mcp_tools: true,
+            desktop_tools: false,
+            desktop_confirm: true,
+            desktop_hide: true,
+            vision: true,
         }
     }
 }
@@ -555,6 +571,61 @@ fn no_tools() -> &'static Mutex<HashSet<String>> {
 }
 
 /// 接口明确拒绝了 tools 参数
+/// 接口不支持图片输入（记住后不再发图）
+fn no_vision() -> &'static Mutex<HashSet<String>> {
+    static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// 带图请求被拒（多为模型不支持图片输入）
+fn vision_rejected(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    ["接口返回 http 400", "接口返回 http 413", "接口返回 http 415", "接口返回 http 422"].iter().any(|p| e.starts_with(p))
+}
+
+/// 消息里的图片只保留最近 `keep` 张（截图很占上下文），其余换成文字说明；keep = 0 全部去掉
+fn prune_images(messages: &mut [Value], keep: usize) {
+    let mut seen = 0;
+    for m in messages.iter_mut().rev() {
+        let Some(parts) = m.get_mut("content").and_then(Value::as_array_mut) else { continue };
+        for p in parts.iter_mut().rev() {
+            if p["type"] != "image_url" { continue; }
+            seen += 1;
+            if seen > keep { *p = json!({ "type": "text", "text": "[较早的截图 / 图片已省略]" }); }
+        }
+    }
+}
+
+fn has_images(messages: &[Value]) -> bool {
+    messages.iter().any(|m| m["content"].as_array().is_some_and(|a| a.iter().any(|p| p["type"] == "image_url")))
+}
+
+/// 等待用户确认的电脑操作：request_id → 回传选项
+type PermTx = std::sync::mpsc::Sender<String>;
+fn pending_perms() -> &'static Mutex<HashMap<String, PermTx>> {
+    static S: OnceLock<Mutex<HashMap<String, PermTx>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// 「本次启动期间始终允许」的工具
+static ALWAYS_ALLOW: Mutex<Vec<String>> = Mutex::new(Vec::new());
+pub const PERM_PREFIX: &str = "assistant:";
+
+/// 权限弹窗的应答（manager.respond_permission 按 request_id 前缀 `assistant:` 转到这里）
+pub fn resolve_permission(request_id: &str, option_id: &str) -> Result<(), String> {
+    match pending_perms().lock().unwrap().remove(request_id) {
+        Some(tx) => { let _ = tx.send(option_id.to_string()); Ok(()) }
+        None => Err("请求已失效".into()),
+    }
+}
+
+/// 电脑操作的运行选项
+#[derive(Clone)]
+struct DeskCfg {
+    confirm: bool,
+    hide: bool,
+    vision: bool,
+}
+
 fn tools_rejected(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
     ["接口返回 http 400", "接口返回 http 404", "接口返回 http 405", "接口返回 http 422", "接口返回 http 501"].iter().any(|p| e.starts_with(p))
@@ -619,6 +690,10 @@ pub fn system_prompt(p: &Persona, mems: &[AssistantMemory], cfg: &AssistantConfi
     }
     if cfg.mcp_tools && sub != SubMode::Off {
         s.push_str(MCP_RULE);
+    }
+    if desktop_on(cfg, sub) {
+        s.push_str(DESKTOP_RULE);
+        if !cfg.vision { s.push_str("- 当前模型没有开启读图，看不到屏幕：界面操作只能靠窗口列表、快捷键和命令完成，做不到时如实告诉用户。\n"); }
     }
     s.push_str("\n[长期记忆]（跨会话、跨客户端保存，按需参考，不必复述）\n");
     s.push_str(&memory_block(mems, cfg.memory_limit));
@@ -949,9 +1024,65 @@ struct ApiCtx<'a> {
     session: &'a str,
     turn: &'a str,
     cancel: &'a AtomicBool,
+    /// 电脑操作（None = 未开启）
+    desk: Option<DeskCfg>,
 }
 
 impl ApiCtx<'_> {
+    /// 需要确认的电脑操作：弹权限窗等用户选择；true = 允许
+    fn confirm(&self, name: &str, args: &Value) -> Result<bool, String> {
+        if ALWAYS_ALLOW.lock().unwrap().iter().any(|n| n == name) { return Ok(true); }
+        // 使驾窗口可能被最小化了：先还原，用户才看得到弹窗
+        crate::desktop::restore_host();
+        let id = format!("{PERM_PREFIX}{}", uuid::Uuid::new_v4());
+        let (tx, rx) = std::sync::mpsc::channel();
+        pending_perms().lock().unwrap().insert(id.clone(), tx);
+        let _ = self.app.emit(crate::acp::EVT_PERMISSION, json!({
+            "requestId": id, "agentType": "assistant", "sessionId": self.session,
+            "params": {
+                "sessionId": self.session,
+                "toolCall": { "title": crate::desktop::title(name, args), "kind": crate::desktop::kind(name), "rawInput": args },
+                "options": [
+                    { "optionId": "allow_once", "name": "允许", "kind": "allow_once" },
+                    { "optionId": "allow_always", "name": "本次启动期间始终允许此类操作", "kind": "allow_always" },
+                    { "optionId": "reject_once", "name": "拒绝", "kind": "reject_once" }
+                ]
+            }
+        }));
+        let started = std::time::Instant::now();
+        let answer = loop {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(a) => break Some(a),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
+                Err(_) if self.cancel.load(Ordering::SeqCst) || started.elapsed() > Duration::from_secs(600) => break None,
+                Err(_) => {}
+            }
+        };
+        if answer.is_none() {
+            pending_perms().lock().unwrap().remove(&id);
+            let _ = self.app.emit(crate::acp::EVT_REQUESTS_CANCELLED, json!({ "requestIds": [id] }));
+            if self.cancel.load(Ordering::SeqCst) { return Err(ASSISTANT_CANCELLED.into()); }
+            return Ok(false);
+        }
+        match answer.as_deref() {
+            Some("allow_always") => { ALWAYS_ALLOW.lock().unwrap().push(name.to_string()); Ok(true) }
+            Some("allow_once") => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
+    /// 执行一个电脑操作工具：返回 (给模型的文字, 图片 data URL)
+    fn desktop(&self, d: &DeskCfg, vision: bool, name: &str, args: &Value) -> Result<(String, Option<String>), String> {
+        if d.confirm && crate::desktop::needs_confirm(name) && !self.confirm(name, args)? {
+            return Ok(("用户拒绝了这个操作。不要重复尝试同一操作；需要的话说明原因或问用户。".into(), None));
+        }
+        let opts = crate::desktop::Opts { workdir: crate::desktop::home_dir(), host_pid: std::process::id(), hide: d.hide, vision };
+        match crate::desktop::call(name, args, &opts) {
+            Ok(o) => Ok((o.text, o.image)),
+            Err(e) => Ok((format!("错误：{e}"), None)),
+        }
+    }
+
     /// 收到完整的 say 调用：立刻发给前端显示 / 朗读
     fn take_call(&self, c: &mut ToolCall, subs: &mut Vec<Subtitle>) {
         if c.done || c.name != "say" { return; }
@@ -1036,16 +1167,32 @@ fn api_chat(ctx: &ApiCtx, mut messages: Vec<Value>, mut tools: Option<Value>, ta
     let mut content = String::new();
     let mut subs: Vec<Subtitle> = Vec::new();
     let partial = |subs: &[Subtitle], content: &str| format!("{ASSISTANT_CANCELLED}{}{content}", encode_subtitles(subs));
-    // 带 MCP 工具时允许多轮（查项目 → 读上下文 → 回答）；只有 say 时最多 3 轮
+    // 带 MCP 工具时允许多轮（查项目 → 读上下文 → 回答）；操作电脑（截图 → 点击 → 再截图…）轮数更多；只有 say 时最多 3 轮
     let has_mcp = tools.as_ref().and_then(Value::as_array).is_some_and(|a| a.len() > 1);
-    let max_rounds = if has_mcp { MAX_TOOL_ROUNDS } else { 3 };
+    let max_rounds = if ctx.desk.is_some() { MAX_DESKTOP_ROUNDS } else if has_mcp { MAX_TOOL_ROUNDS } else { 3 };
+    let mut vision = ctx.desk.as_ref().is_some_and(|d| d.vision) && !no_vision().lock().unwrap().contains(&tools_key(ctx.api));
     let mut round = 0;
+    let res = (|| -> Result<String, String> {
     while round < max_rounds {
         let last = round + 1 == max_rounds;
         let start = content.len();
+        prune_images(&mut messages, MAX_IMAGES);
         let calls = match ctx.round(&messages, tools.as_ref(), last && round > 0, &mut content, &mut subs) {
             Ok(c) => c,
             Err(e) if e.starts_with(ASSISTANT_CANCELLED) => return Err(partial(&subs, &content)),
+            // 带图请求被拒：多半是模型不支持图片输入，去掉图片重试，本接口以后不再发图
+            Err(e) if has_images(&messages) && content.len() == start && vision_rejected(&e) => {
+                log::warn!("[assistant] 接口拒绝了图片输入，改为不发图：{e}");
+                no_vision().lock().unwrap().insert(tools_key(ctx.api));
+                vision = false;
+                prune_images(&mut messages, 0);
+                for m in messages.iter_mut().filter(|m| m["role"] == "tool") {
+                    if m["content"].as_str().is_some_and(|t| t.starts_with("已截图")) {
+                        m["content"] = json!("截图失败：当前模型不支持图片输入，看不到屏幕。请改用窗口列表、快捷键或命令，做不到就告诉用户。");
+                    }
+                }
+                continue;
+            }
             Err(e) if round == 0 && tools.is_some() && subs.is_empty() && content.is_empty() && tools_rejected(&e) => {
                 log::warn!("[assistant] 接口不支持工具调用，字幕改用标记：{e}");
                 no_tools().lock().unwrap().insert(tools_key(ctx.api));
@@ -1064,18 +1211,36 @@ fn api_chat(ctx: &ApiCtx, mut messages: Vec<Value>, mut tools: Option<Value>, ta
         let text = content[start..].to_string();
         let tc: Vec<Value> = calls.iter().map(|c| json!({ "id": c.id, "type": "function", "function": { "name": c.name, "arguments": c.args } })).collect();
         messages.push(json!({ "role": "assistant", "content": if text.trim().is_empty() { Value::Null } else { json!(text) }, "tool_calls": tc }));
+        let mut images: Vec<Value> = Vec::new();
         for c in &calls {
             if ctx.cancel.load(Ordering::SeqCst) { return Err(partial(&subs, &content)); }
             let r = if c.name == "say" {
                 (if c.done { "已显示" } else { "参数无效，需要 text" }).to_string()
             } else {
                 let args: Value = serde_json::from_str(c.args.trim()).unwrap_or_else(|_| json!({}));
-                match crate::mcp::assistant_call(ctx.app, &c.name, &args) {
-                    Ok(t) => cap_chars(&t, MAX_TOOL_RESULT),
-                    Err(e) => format!("错误：{}", cap_chars(&e, 2000)),
+                match ctx.desk.as_ref().filter(|_| crate::desktop::is_desktop(&c.name)) {
+                    Some(d) => match ctx.desktop(d, vision, &c.name, &args) {
+                        Ok((t, img)) => {
+                            if let Some(url) = img {
+                                images.push(json!({ "type": "text", "text": format!("（{} 的图片）", c.name) }));
+                                images.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+                            }
+                            cap_chars(&t, MAX_TOOL_RESULT)
+                        }
+                        Err(e) if e.starts_with(ASSISTANT_CANCELLED) => return Err(partial(&subs, &content)),
+                        Err(e) => format!("错误：{}", cap_chars(&e, 2000)),
+                    },
+                    None => match crate::mcp::assistant_call(ctx.app, &c.name, &args) {
+                        Ok(t) => cap_chars(&t, MAX_TOOL_RESULT),
+                        Err(e) => format!("错误：{}", cap_chars(&e, 2000)),
+                    },
                 }
             };
             messages.push(json!({ "role": "tool", "tool_call_id": c.id, "content": r }));
+        }
+        // 工具消息只能是文字：截图 / 图片紧跟着作为一条用户消息附上（OpenAI image_url）
+        if !images.is_empty() {
+            messages.push(json!({ "role": "user", "content": images }));
         }
         // 工具前后的两段正文之间空一行
         if uses_mcp && !content.trim().is_empty() && !content.ends_with('\n') {
@@ -1084,6 +1249,9 @@ fn api_chat(ctx: &ApiCtx, mut messages: Vec<Value>, mut tools: Option<Value>, ta
         }
     }
     Ok(format!("{}{content}", encode_subtitles(&subs)))
+    })();
+    if ctx.desk.as_ref().is_some_and(|d| d.hide) { crate::desktop::restore_host(); }
+    res
 }
 
 /// 执行一轮：组装提示词 → 发给 ACP / API → 返回原始回复文本（含指令标记）。
@@ -1116,6 +1284,10 @@ async fn run_turn(
             if cfg.mcp_tools {
                 if let (Some(arr), Value::Array(more)) = (t.as_array_mut(), crate::mcp::assistant_function_tools()) { arr.extend(more); }
             }
+            if desktop_on(cfg, sub) {
+                let vision = cfg.vision && !no_vision().lock().unwrap().contains(&tools_key(&cfg.api));
+                if let Some(arr) = t.as_array_mut() { arr.extend(crate::desktop::tool_specs(true, true, vision)); }
+            }
             (Some(t), Some(build_sys(SubMode::Tag)))
         } else {
             (None, None)
@@ -1133,8 +1305,9 @@ async fn run_turn(
         let app2 = app.clone();
         let sid = st.session_id.clone();
         let tid = turn_id.to_string();
+        let desk = (desktop_on(cfg, sub) && tools.is_some()).then(|| DeskCfg { confirm: cfg.desktop_confirm, hide: cfg.desktop_hide, vision: cfg.vision });
         return tokio::task::spawn_blocking(move || {
-            let ctx = ApiCtx { app: &app2, api: &api, session: &sid, turn: &tid, cancel: &cancel };
+            let ctx = ApiCtx { app: &app2, api: &api, session: &sid, turn: &tid, cancel: &cancel, desk };
             api_chat(&ctx, messages, tools, tag_sys)
         })
             .await
@@ -1627,6 +1800,18 @@ fn wake_block(db: &Db) -> String {
     s
 }
 
+/// 电脑操作只在 API 模式的工具调用下可用
+fn desktop_on(cfg: &AssistantConfig, sub: SubMode) -> bool {
+    cfg.provider == "api" && cfg.desktop_tools && sub == SubMode::Tool
+}
+
+const DESKTOP_RULE: &str = "- 你可以操作用户的电脑（Windows）：run_command 执行终端命令；desktop_find_apps 找已安装的程序、desktop_open 打开程序 / 文件 / 网址；\
+desktop_windows 看窗口、desktop_focus_window 切换窗口；desktop_screenshot 截图看屏幕、desktop_read_image 看图片；desktop_mouse 点击 / 滚动 / 拖动，desktop_keyboard 输入文字和按键。\
+做法：能用命令或快捷键完成的优先用（如播放 / 暂停、下一首用 desktop_keyboard 的 media_play_pause / media_next，网易云音乐等播放器都认）；\
+要点界面时先截图，按截图里的像素坐标点击，操作后再截图确认，最多重试两三次，不行就告诉用户卡在哪；刚打开的程序要等几秒（截图 delay_ms）。\
+只做用户要求的事：删除文件、改系统设置、付款、发消息给别人等有风险的操作先问用户；执行命令 / 点击前可能会弹窗请用户确认，被拒绝就不要再试同一操作。\
+动手时用字幕简短说一声在做什么，做完说结果。\n";
+
 const MCP_RULE: &str = "- 你接入了使驾本地 MCP（服务名 shidrive），可以直接调用其中的工具：\
 assistant_schedule_create / assistant_schedule_list / assistant_schedule_cancel 给自己设、查、取消定时（到点使驾会唤醒你，你按当时写给自己的话行动）；\
 shidrive_overview 查看有哪些项目、共享上下文（拿到 context_id / project_name）；context_* 读写项目共享上下文；workflow_* 查看、创建、修改、运行工作流。\
@@ -2085,6 +2270,31 @@ mod tests {
         let t = say_tool(Some("ja"));
         assert_eq!(t[0]["function"]["parameters"]["required"], json!(["text", "speech"]));
         assert!(say_tool(None)[0]["function"]["parameters"]["properties"].get("speech").is_none());
+    }
+
+    #[test]
+    fn desktop_prompt_and_images() {
+        let p = Persona::default();
+        let on = AssistantConfig { provider: "api".into(), desktop_tools: true, ..Default::default() };
+        assert!(system_prompt(&p, &[], &on, SubMode::Tool).contains("desktop_screenshot"));
+        // 只在 API 工具调用下开放
+        assert!(!system_prompt(&p, &[], &on, SubMode::Tag).contains("desktop_screenshot"));
+        let acp = AssistantConfig { desktop_tools: true, ..Default::default() };
+        assert!(!system_prompt(&p, &[], &acp, SubMode::Tool).contains("desktop_screenshot"));
+        let blind = AssistantConfig { vision: false, ..on.clone() };
+        assert!(system_prompt(&p, &[], &blind, SubMode::Tool).contains("没有开启读图"));
+        let img = |n: u32| json!({ "role": "user", "content": [{ "type": "text", "text": "x" }, { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{n}") } }] });
+        let mut ms = vec![img(1), json!({ "role": "tool", "content": "t" }), img(2), img(3)];
+        assert!(has_images(&ms));
+        prune_images(&mut ms, 2);
+        assert_eq!(ms[0]["content"][1]["type"], "text");
+        assert_eq!(ms[2]["content"][1]["type"], "image_url");
+        assert_eq!(ms[3]["content"][1]["type"], "image_url");
+        prune_images(&mut ms, 0);
+        assert!(!has_images(&ms));
+        assert!(vision_rejected("接口返回 HTTP 400：image_url is not supported"));
+        assert!(!vision_rejected("请求接口失败：timeout"));
+        assert!(resolve_permission("assistant:nope", "allow_once").is_err());
     }
 
     #[test]

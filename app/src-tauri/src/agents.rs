@@ -157,6 +157,12 @@ pub struct ShidriveAgentConfig {
     pub max_steps: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f64>,
+    /// 电脑操作工具（打开程序 / 窗口 / 截图 / 鼠标键盘）
+    #[serde(default)]
+    pub desktop_tools: bool,
+    /// 模型支持读图；None = 是
+    #[serde(default)]
+    pub vision: Option<bool>,
 }
 
 pub const SHIDRIVE_AGENT_KEY: &str = "shidrive_agent.config";
@@ -174,6 +180,9 @@ impl ShidriveAgentConfig {
         e.insert("SHIDRIVE_AGENT_MODELS".into(), crate::acp_agent::split_models(&self.models).join(","));
         if let Some(n) = self.max_steps.filter(|n| *n > 0) { e.insert("SHIDRIVE_AGENT_MAX_STEPS".into(), n.to_string()); }
         if let Some(t) = self.temperature { e.insert("SHIDRIVE_AGENT_TEMPERATURE".into(), t.to_string()); }
+        e.insert("SHIDRIVE_AGENT_DESKTOP".into(), if self.desktop_tools { "1" } else { "0" }.into());
+        e.insert("SHIDRIVE_AGENT_VISION".into(), if self.vision.unwrap_or(true) { "1" } else { "0" }.into());
+        e.insert("SHIDRIVE_HOST_PID".into(), std::process::id().to_string());
         e
     }
 }

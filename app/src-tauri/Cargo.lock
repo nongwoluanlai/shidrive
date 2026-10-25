@@ -3600,6 +3600,7 @@ dependencies = [
  "chrono",
  "env_logger",
  "futures",
+ "image",
  "log",
  "memchr",
  "open",

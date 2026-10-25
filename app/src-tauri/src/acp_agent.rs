@@ -58,6 +58,12 @@ pub(crate) struct Config {
     pub context_chars: usize,
     pub temperature: Option<f64>,
     pub home: PathBuf,
+    /// 电脑操作工具（打开程序 / 窗口 / 截图 / 鼠标键盘）
+    pub desktop: bool,
+    /// 模型支持读图（截图、desktop_read_image 以 OpenAI image_url 发送）
+    pub vision: bool,
+    /// 使驾主程序进程号：操作电脑时把它的窗口最小化
+    pub host_pid: u32,
 }
 
 impl Config {
@@ -78,6 +84,9 @@ impl Config {
             context_chars: var("SHIDRIVE_AGENT_CONTEXT_CHARS").and_then(|v| v.parse().ok()).filter(|n| *n >= 8000).unwrap_or(360_000),
             temperature: var("SHIDRIVE_AGENT_TEMPERATURE").and_then(|v| v.parse().ok()),
             home,
+            desktop: var("SHIDRIVE_AGENT_DESKTOP").is_some_and(|v| v == "1"),
+            vision: var("SHIDRIVE_AGENT_VISION").map_or(true, |v| v != "0"),
+            host_pid: var("SHIDRIVE_HOST_PID").and_then(|v| v.parse().ok()).unwrap_or(0),
         }
     }
     fn configured(&self) -> bool {
@@ -746,19 +755,38 @@ fn run_turn(sh: &Arc<Shared>, live: &Arc<Live>, turn_start: usize, cancel: &Atom
             let model = if d.model.is_empty() { sh.cfg.model.clone() } else { d.model.clone() };
             (if d.mode.is_empty() { "ask".to_string() } else { d.mode.clone() }, model, d.messages.clone(), d.cwd.clone())
         };
-        let tools = tool_specs(&mode, live);
+        let tools = tool_specs(&mode, live, &sh.cfg);
         let has_ctx = live.mcp_tools.iter().any(|t| t.tool.starts_with("context_"));
         let (api_msgs, api_start) = api_messages(&history, turn_start);
         let (msgs, dropped) = fit_budget(api_msgs, api_start, sh.cfg.context_chars);
         let mut sys = system_prompt(&cwd, &mode, has_ctx);
+        if sh.cfg.desktop {
+            sys.push_str("\n- 你还可以操作用户的电脑（Windows）：desktop_find_apps 找程序、desktop_open 打开程序 / 文件 / 网址，desktop_windows / desktop_focus_window 查看和切换窗口，\
+desktop_screenshot 截图看屏幕，desktop_mouse 按截图里的像素坐标点击 / 滚动 / 拖动，desktop_keyboard 输入文字和按键（含 media_play_pause 等媒体键）。\
+需要看界面结果时先截图，操作后再截图确认；能用命令或快捷键完成的优先用。只做用户要求的事，有风险的操作先问用户。");
+            if !vision_on(&sh.cfg) { sys.push_str("当前模型不能看图（截图不可用），界面操作只能靠窗口列表、快捷键和命令。"); }
+        }
         if dropped { sys.push_str("\n\n（注意：更早的对话因上下文长度已省略。）"); }
         let mut all = vec![json!({ "role": "system", "content": sys })];
         all.extend(msgs);
         let (all_len, tools_len) = (all.len(), tools.len());
+        let has_img = all.iter().any(|m| m["content"].as_array().is_some_and(|a| a.iter().any(|p| p["type"] == "image_url")));
         let mut body = json!({ "model": model, "messages": all, "stream": true, "tools": tools });
         if let Some(t) = sh.cfg.temperature { body["temperature"] = json!(t); }
         let sid = live.data.lock().unwrap().id.clone();
-        let reply = chat(sh, &sid, &body, cancel)?;
+        let reply = match chat(sh, &sid, &body, cancel) {
+            Ok(r) => r,
+            // 带图请求被拒：多半是模型不支持图片输入，之后不再发图，重试这一步
+            Err(e) if has_img && ["HTTP 400", "HTTP 413", "HTTP 415", "HTTP 422"].iter().any(|c| e.contains(c)) && !NO_VISION.load(Ordering::SeqCst) => {
+                alog(format!("接口拒绝了图片输入，改为不发图：{}", cap(&e, 300)));
+                NO_VISION.store(true, Ordering::SeqCst);
+                continue;
+            }
+            Err(e) => {
+                crate::desktop::restore_host();
+                return Err(e);
+            }
+        };
         alog(format!("会话 {sid} 第 {} 步：模型 {model}，消息 {} 条，工具 {} 个 → finish={}，正文 {} 字，思考 {} 字，工具调用 [{}]",
             step + 1, all_len, tools_len, if reply.finish.is_empty() { "-" } else { reply.finish.as_str() },
             reply.content.chars().count(), reply.reasoning.chars().count(),
@@ -788,8 +816,9 @@ fn run_turn(sh: &Arc<Shared>, live: &Arc<Live>, turn_start: usize, cancel: &Atom
             d.updated_at = now_iso();
             let _ = save_session(&sh.cfg, &d);
         }
-        if cancelled { return Ok("cancelled"); }
+        if cancelled { crate::desktop::restore_host(); return Ok("cancelled"); }
         if tool_calls.is_empty() {
+            crate::desktop::restore_host();
             return Ok(if reply.finish == "length" { "max_tokens" } else { "end_turn" });
         }
         let root = canonical_cwd(&cwd).map_err(|e| e.1)?;
@@ -801,11 +830,22 @@ fn run_turn(sh: &Arc<Shared>, live: &Arc<Live>, turn_start: usize, cancel: &Atom
                 run_tool_call(sh, live, &sid, &cfg, &mode, tc, cancel)
             };
             let mut d = live.data.lock().unwrap();
+            let has_image = msg.get("_image").is_some();
             d.messages.push(msg);
+            // 截图很占上下文 / 会话文件：只留最近 2 张
+            if has_image {
+                let mut seen = 0;
+                for m in d.messages.iter_mut().rev() {
+                    if m.get("_image").is_none() { continue; }
+                    seen += 1;
+                    if seen > 2 { if let Some(o) = m.as_object_mut() { o.remove("_image"); } }
+                }
+            }
             d.updated_at = now_iso();
             let _ = save_session(&sh.cfg, &d);
         }
     }
+    crate::desktop::restore_host();
     Ok("max_turn_requests")
 }
 
@@ -848,6 +888,11 @@ fn api_messages(history: &[Value], turn_start: usize) -> (Vec<Value>, usize) {
             out.push(json!({ "role": "tool", "tool_call_id": id, "content": "（未执行：上一次回复中断）" }));
         }
     };
+    // 工具消息只能是文字：截图 / 图片在这组工具结果之后作为一条用户消息附上（OpenAI image_url）
+    let mut imgs: Vec<Value> = Vec::new();
+    let flush_imgs = |out: &mut Vec<Value>, imgs: &mut Vec<Value>| {
+        if !imgs.is_empty() { out.push(json!({ "role": "user", "content": std::mem::take(imgs) })); }
+    };
     for (i, m) in history.iter().enumerate() {
         let role = m["role"].as_str().unwrap_or_default();
         if role == "tool" {
@@ -856,6 +901,7 @@ fn api_messages(history: &[Value], turn_start: usize) -> (Vec<Value>, usize) {
             pending.remove(pos);
         } else {
             close_pending(&mut out, &mut pending);
+            flush_imgs(&mut out, &mut imgs);
         }
         if i >= turn_start && new_start.is_none() { new_start = Some(out.len()); }
         let has_tools = m["tool_calls"].as_array().is_some_and(|a| !a.is_empty());
@@ -880,9 +926,16 @@ fn api_messages(history: &[Value], turn_start: usize) -> (Vec<Value>, usize) {
             }
         }
         out.push(Value::Object(o));
+        if role == "tool" && !NO_VISION.load(Ordering::SeqCst) {
+            if let Some(url) = m["_image"].as_str() {
+                imgs.push(json!({ "type": "text", "text": format!("（{} 的图片）", m["_title"].as_str().unwrap_or("工具")) }));
+                imgs.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+            }
+        }
     }
     // 末尾仍缺结果的调用（本轮正在执行的调用不会出现在这里：执行完才发下一次请求）
     close_pending(&mut out, &mut pending);
+    flush_imgs(&mut out, &mut imgs);
     let start = new_start.unwrap_or(out.len());
     (out, start)
 }
@@ -1093,7 +1146,11 @@ fn fn_spec(name: &str, desc: &str, required: &[&str], props: Value) -> Value {
 
 const READ_TOOLS: &[&str] = &["read_file", "list_dir", "search"];
 
-fn tool_specs(mode: &str, live: &Live) -> Vec<Value> {
+/// 接口拒绝过图片输入：本进程内不再发图
+static NO_VISION: AtomicBool = AtomicBool::new(false);
+fn vision_on(cfg: &Config) -> bool { cfg.desktop && cfg.vision && !NO_VISION.load(Ordering::SeqCst) }
+
+fn tool_specs(mode: &str, live: &Live, cfg: &Config) -> Vec<Value> {
     let mut v = vec![
         fn_spec("read_file", "读取文本文件（自动识别 UTF-8/UTF-16 BOM）。大文件用 offset/limit 分段读取。", &["path"], json!({
             "path": { "type": "string", "description": "相对工作目录或绝对路径" },
@@ -1131,6 +1188,9 @@ fn tool_specs(mode: &str, live: &Live) -> Vec<Value> {
                 "timeout": { "type": "integer", "description": "秒，默认 120，最大 1800" } })),
         ]);
     }
+    if cfg.desktop {
+        v.extend(crate::desktop::tool_specs(false, mode != "read", vision_on(cfg)));
+    }
     v.extend(live.mcp_tools.iter().map(|t| t.spec.clone()));
     v
 }
@@ -1143,6 +1203,7 @@ fn tool_kind(name: &str) -> &'static str {
         "move_path" | "copy_path" => "move",
         "delete_path" => "delete",
         "run_command" => "execute",
+        n if crate::desktop::is_desktop(n) => crate::desktop::kind(n),
         _ => "other",
     }
 }
@@ -1160,6 +1221,7 @@ fn tool_title(name: &str, a: &Value) -> String {
         "copy_path" => format!("复制 {} → {}", s("src"), s("dst")),
         "delete_path" => format!("删除 {}", s("path")),
         "run_command" => format!("运行 {}", cap(&s("command"), 80)),
+        n if crate::desktop::is_desktop(n) => crate::desktop::title(n, a),
         other => match other.strip_prefix("mcp__").and_then(|r| r.split_once("__")) {
             Some((srv, t)) => format!("{srv}: {t}"),
             None => other.to_string(),
@@ -1203,7 +1265,8 @@ fn run_tool_call(sh: &Arc<Shared>, live: &Live, sid: &str, cfg: &Cfg, mode: &str
         return finish("failed", e.clone(), vec![text_content(&e)]);
     }
     let is_mcp = tc.name.starts_with("mcp__");
-    let builtin_write = !is_mcp && !READ_TOOLS.contains(&tc.name.as_str());
+    let is_desk = crate::desktop::is_desktop(&tc.name) && tc.name != "run_command";
+    let builtin_write = !is_mcp && !READ_TOOLS.contains(&tc.name.as_str()) && !(is_desk && crate::desktop::is_read(&tc.name));
     if mode == "read" && builtin_write {
         let e = "当前为只读模式，无法修改文件或执行命令。请告诉用户切换到「询问」或「自动」模式。".to_string();
         return finish("failed", e.clone(), vec![text_content(&e)]);
@@ -1219,6 +1282,8 @@ fn run_tool_call(sh: &Arc<Shared>, live: &Live, sid: &str, cfg: &Cfg, mode: &str
                 { "optionId": "reject_once", "name": "拒绝", "kind": "reject_once" }
             ]
         });
+        // 操作电脑时使驾窗口可能被最小化了：先还原，用户才看得到确认框
+        crate::desktop::restore_host();
         let outcome = sh.client_request("session/request_permission", params, cancel);
         let chosen = match &outcome {
             Ok(r) if r["outcome"]["outcome"] == "selected" => r["outcome"]["optionId"].as_str().unwrap_or_default().to_string(),
@@ -1237,10 +1302,25 @@ fn run_tool_call(sh: &Arc<Shared>, live: &Live, sid: &str, cfg: &Cfg, mode: &str
         }
     }
     sh.update(sid, json!({ "sessionUpdate": "tool_call_update", "toolCallId": tc.id, "status": "in_progress" }));
+    let mut image: Option<String> = None;
     let res = if is_mcp {
         match live.mcp_tools.iter().find(|t| t.api_name == tc.name) {
             Some(t) => live.mcp[t.client].call(&t.tool, &args).map(|s| (s, None)),
             None => Err(format!("未知工具：{}", tc.name)),
+        }
+    } else if is_desk {
+        if !sh.cfg.desktop {
+            Err("电脑操作未开启（设置 → Agent 管理 → ShiDrive）".to_string())
+        } else {
+            let mut a = args.clone();
+            // 读图也受工作目录限制
+            let ok = if tc.name == "desktop_read_image" {
+                coding_mcp::safe_path(cfg, a["path"].as_str().unwrap_or_default()).map(|p| { a["path"] = json!(p.to_string_lossy()); })
+            } else { Ok(()) };
+            ok.and_then(|_| {
+                let opts = crate::desktop::Opts { workdir: cfg.root.clone(), host_pid: sh.cfg.host_pid, hide: true, vision: vision_on(&sh.cfg) };
+                crate::desktop::call(&tc.name, &a, &opts).map(|o| { image = o.image; (o.text, None) })
+            })
         }
     } else {
         exec_builtin(cfg, &tc.name, &args)
@@ -1253,7 +1333,9 @@ fn run_tool_call(sh: &Arc<Shared>, live: &Live, sid: &str, cfg: &Cfg, mode: &str
             } else {
                 content.push(text_content(&text));
             }
-            finish("completed", text, content)
+            let mut m = finish("completed", text, content);
+            if let Some(img) = image { m["_image"] = json!(img); }
+            m
         }
         Err(e) => {
             let msg = format!("错误：{}", disp(&e));
@@ -1561,6 +1643,7 @@ mod tests {
         let cfg = Config {
             base_url: base.into(), api_key: "k".into(), model: "m1".into(), models: vec!["m2".into()],
             max_steps: 10, context_chars: 360_000, temperature: None, home: home.to_path_buf(),
+            desktop: false, vision: true, host_pid: 0,
         };
         (Arc::new(Shared::new(cfg, out)), rx)
     }

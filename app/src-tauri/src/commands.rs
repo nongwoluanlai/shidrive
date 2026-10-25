@@ -1224,6 +1224,7 @@ pub async fn shidrive_agent_config_get(db: DbState<'_>) -> Result<Value, String>
     Ok(serde_json::json!({
         "base_url": c.base_url, "model": c.model, "models": c.models,
         "max_steps": c.max_steps, "temperature": c.temperature,
+        "desktop_tools": c.desktop_tools, "vision": c.vision.unwrap_or(true),
         "api_key_set": !c.api_key.trim().is_empty(), "configured": c.configured(),
     }))
 }

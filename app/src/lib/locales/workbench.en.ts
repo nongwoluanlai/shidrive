@@ -539,6 +539,8 @@ export const workbenchEn: Record<string, string> = {
   "接口地址（OpenAI 兼容，如 https://api.openai.com/v1）": "API endpoint (OpenAI-compatible, e.g. https://api.openai.com/v1)",
   "获取模型 / 测试连接": "Fetch models / Test connection",
   "可切换的其他模型（逗号分隔，可选；会话中可在模型下拉里切换）": "Other models to switch between (comma-separated, optional; switch from the model menu in a session)",
+  "电脑操作：查找 / 打开程序、切换窗口、截图看屏幕、鼠标点击、键盘输入（询问模式下点击和输入前会确认；仅 Windows）": "Computer control: find / open apps, switch windows, take screenshots, click, type (asks first in Ask mode; Windows only)",
+  "模型支持读图（截图按 OpenAI 格式以 base64 发送；接口不支持时自动改为不发图）": "Model accepts images (screenshots sent as OpenAI base64 image_url; turned off automatically if the API rejects them)",
   "单轮最大工具步数（可选，默认 60）": "Max tool steps per turn (optional, default 60)",
   "保存后立即生效（会重置当前连接）。模式：询问（改文件 / 执行命令前确认）、自动、只读，可在会话页切换。": "Takes effect immediately after saving (the current connection is reset). Modes: Ask (confirm before editing files / running commands), Auto, Read-only — switch them in the chat view.",
   "请先填写接口地址": "Enter the API endpoint first",

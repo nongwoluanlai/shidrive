@@ -1,6 +1,13 @@
 // 全局助手（设置页 + 气泡）英文文案
 export const assistantEn: Record<string, string> = {
   "全局助手": "Global assistant",
+  "模型支持读图（截图 / 图片按 OpenAI 格式以 base64 发送；接口不支持时会自动改为不发图）": "Model accepts images (screenshots / pictures sent as OpenAI base64 image_url; turned off automatically if the API rejects them)",
+  "允许操作电脑：运行终端命令、查找并打开程序、切换窗口、截图看屏幕、鼠标点击、键盘输入": "Allow computer control: run terminal commands, find and open apps, switch windows, take screenshots, click the mouse, type on the keyboard",
+  "执行命令、打开程序、鼠标键盘操作前先弹窗确认（可选「本次启动期间始终允许」）": "Ask before running commands, opening apps or using mouse / keyboard (\"always allow until restart\" available)",
+  "操作电脑时把使驾窗口最小化，免得挡住目标（这一轮结束后自动还原）": "Minimize ShiDrive while operating the computer so it doesn't cover the target (restored after the turn)",
+  "已关闭确认：助手可以直接执行任意命令和点击，请只在信任当前模型时使用。": "Confirmation is off: the assistant can run any command and click directly. Use only with a model you trust.",
+  "需要模型支持工具调用（function calling）；看屏幕、点界面还需要支持读图。只在 Windows 上可用。": "Requires a model with function calling; seeing the screen and clicking UI also needs image input. Windows only.",
+  "本次启动期间始终允许此类操作": "Always allow this until restart",
   "和{name}说点什么（{keys}）": "Say something to {name} ({keys})",
   "朗读中…": "Speaking…",
   "收起气泡": "Hide bubble",

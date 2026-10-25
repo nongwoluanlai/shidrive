@@ -1172,6 +1172,10 @@ impl AgentManager {
     }
 
     pub async fn respond_permission(&self, request_id: &str, option_id: String) -> Result<(), String> {
+        // 全局助手（API 模式）的电脑操作确认
+        if request_id.starts_with(crate::assistant::PERM_PREFIX) {
+            return crate::assistant::resolve_permission(request_id, &option_id);
+        }
         let agent_type = request_id.split(':').next().unwrap_or_default().to_string();
         let conns = self.conns.read().await;
         if let Some(conn) = conns.get(&agent_type) {

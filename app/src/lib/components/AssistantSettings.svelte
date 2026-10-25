@@ -218,6 +218,16 @@
           <span class="pend">{t("留空使用接口默认值")}</span>
         </div>
         <p class="note">{t("支持 OpenAI、DeepSeek、通义、Moonshot、本地 Ollama / LM Studio 等兼容 /chat/completions 的服务。密钥只保存在本机。")}</p>
+        <label class="check"><input type="checkbox" bind:checked={draft.vision} /> {t("模型支持读图（截图 / 图片按 OpenAI 格式以 base64 发送；接口不支持时会自动改为不发图）")}</label>
+        <label class="check"><input type="checkbox" bind:checked={draft.desktop_tools} /> {t("允许操作电脑：运行终端命令、查找并打开程序、切换窗口、截图看屏幕、鼠标点击、键盘输入")}</label>
+        {#if draft.desktop_tools}
+          <div class="indent">
+            <label class="check"><input type="checkbox" bind:checked={draft.desktop_confirm} /> {t("执行命令、打开程序、鼠标键盘操作前先弹窗确认（可选「本次启动期间始终允许」）")}</label>
+            <label class="check"><input type="checkbox" bind:checked={draft.desktop_hide} /> {t("操作电脑时把使驾窗口最小化，免得挡住目标（这一轮结束后自动还原）")}</label>
+            {#if !draft.desktop_confirm}<p class="warn-note">{t("已关闭确认：助手可以直接执行任意命令和点击，请只在信任当前模型时使用。")}</p>{/if}
+            <p class="note">{t("需要模型支持工具调用（function calling）；看屏幕、点界面还需要支持读图。只在 Windows 上可用。")}</p>
+          </div>
+        {/if}
       {/if}
     </div>
 
@@ -343,6 +353,8 @@
   code { font-family: var(--mono); font-size: .86em; user-select: text; word-break: break-all; }
   .mono { font-family: var(--mono); }
   .note { font-size: .82em; color: var(--text-faint); line-height: 1.5; margin: 0; }
+  .indent { display: flex; flex-direction: column; gap: 6px; padding-left: 22px; }
+  .warn-note { font-size: .82em; color: var(--warn, #d97706); line-height: 1.5; margin: 0; }
   .pend { font-size: .82em; color: var(--text-faint); }
   .dim { color: var(--text-faint); font-size: .86em; }
   .clamp { display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-line; margin-top: 4px; }

@@ -196,7 +196,7 @@
 
   // ---- 内置 ShiDrive Agent：OpenAI 兼容接口配置 ----
   let sdView = $state<ShidriveAgentConfigView | null>(null);
-  let sdDraft = $state<{ base_url: string; model: string; models: string; max_steps: string }>({ base_url: "", model: "", models: "", max_steps: "" });
+  let sdDraft = $state<{ base_url: string; model: string; models: string; max_steps: string; desktop_tools: boolean; vision: boolean }>({ base_url: "", model: "", models: "", max_steps: "", desktop_tools: false, vision: true });
   let sdKey = $state("");
   let sdShowKey = $state(false);
   let sdModels = $state<string[]>([]);
@@ -208,7 +208,7 @@
       .shidriveAgentConfigGet()
       .then((v) => {
         sdView = v;
-        sdDraft = { base_url: v.base_url, model: v.model, models: v.models, max_steps: v.max_steps ? String(v.max_steps) : "" };
+        sdDraft = { base_url: v.base_url, model: v.model, models: v.models, max_steps: v.max_steps ? String(v.max_steps) : "", desktop_tools: !!v.desktop_tools, vision: v.vision !== false };
       })
       .catch((e) => toast("error", String(e)));
   });
@@ -239,11 +239,13 @@
         models: sdDraft.models,
         max_steps: steps,
         temperature: sdView?.temperature ?? null,
+        desktop_tools: sdDraft.desktop_tools,
+        vision: sdDraft.vision,
       };
       await api.shidriveAgentConfigSet(config, clearKey ? "" : sdKey.trim() || null);
       sdKey = "";
       sdView = await api.shidriveAgentConfigGet();
-      sdDraft = { base_url: sdView.base_url, model: sdView.model, models: sdView.models, max_steps: sdView.max_steps ? String(sdView.max_steps) : "" };
+      sdDraft = { base_url: sdView.base_url, model: sdView.model, models: sdView.models, max_steps: sdView.max_steps ? String(sdView.max_steps) : "", desktop_tools: !!sdView.desktop_tools, vision: sdView.vision !== false };
       toast("ok", sdView.configured ? t("已保存，ShiDrive Agent 可以使用了") : t("已保存（还需填写接口地址与模型）"));
       await loadRegistry();
     } catch (e) {
@@ -524,6 +526,8 @@
                 <div class="field"><label for="sd-steps">{t("单轮最大工具步数（可选，默认 60）")}</label>
                   <input id="sd-steps" class="mono" inputmode="numeric" bind:value={sdDraft.max_steps} placeholder="60" />
                 </div>
+                <label class="sd-check"><input type="checkbox" bind:checked={sdDraft.desktop_tools} /> {t("电脑操作：查找 / 打开程序、切换窗口、截图看屏幕、鼠标点击、键盘输入（询问模式下点击和输入前会确认；仅 Windows）")}</label>
+                {#if sdDraft.desktop_tools}<label class="sd-check"><input type="checkbox" bind:checked={sdDraft.vision} /> {t("模型支持读图（截图按 OpenAI 格式以 base64 发送；接口不支持时自动改为不发图）")}</label>{/if}
                 <div class="rowbtns">
                   <button class="btn sm primary" disabled={!!sdBusy} onclick={() => sdSave()}>{sdBusy === "save" ? t("保存中…") : t("保存")}</button>
                   <span class="pend">{t("保存后立即生效（会重置当前连接）。模式：询问（改文件 / 执行命令前确认）、自动、只读，可在会话页切换。")}</span>
@@ -612,6 +616,7 @@
 </div>
 
 <style>
+  .sd-check { display: flex; align-items: flex-start; gap: 6px; font-size: .9em; margin: 4px 0; line-height: 1.45; }
   .agents-admin {
     display: flex;
     flex-direction: column;

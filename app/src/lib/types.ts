@@ -10,6 +10,10 @@ export interface ShidriveAgentConfig {
   models: string;
   max_steps: number | null;
   temperature: number | null;
+  /** 电脑操作工具（打开程序 / 窗口 / 截图 / 鼠标键盘） */
+  desktop_tools: boolean;
+  /** 模型支持读图 */
+  vision: boolean;
 }
 export interface ShidriveAgentConfigView extends ShidriveAgentConfig {
   api_key_set: boolean;
@@ -474,6 +478,12 @@ export interface AssistantConfig {
   care_voice: boolean;
   /** 给助手开放使驾本地 MCP（上下文 / 工作流 / 自己的定时等全部工具） */
   mcp_tools: boolean;
+  /** 电脑操作（仅 API 模式）：终端、打开程序、窗口、截图 / 读图、鼠标键盘 */
+  desktop_tools: boolean;
+  desktop_confirm: boolean;
+  desktop_hide: boolean;
+  /** 模型支持读图（OpenAI image_url base64） */
+  vision: boolean;
 }
 export interface AssistantConfigView {
   config: AssistantConfig;

@@ -39,6 +39,8 @@ log = "0.4"
 regex = "1"
 memchr = "2"
 env_logger = "0.11"
+# 截图缩放 / PNG 编码（desktop.rs）：已是 tauri image-png 的传递依赖，不增加下载
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
 
 # 原生文件夹选择器（Windows 下仅依赖 Tauri 已引入的 windows-sys / raw-window-handle）
 [target.'cfg(windows)'.dependencies]

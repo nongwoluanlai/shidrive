@@ -53,7 +53,7 @@
   <div class="modal-backdrop">
     <div class="modal perm">
       <header>
-        <span>{kindIcon(req.params?.toolCall?.kind)} {t("权限请求 —")} {app.agents.find((a) => a.id === req.agentType)?.name ?? req.agentType}</span>
+        <span>{kindIcon(req.params?.toolCall?.kind)} {t("权限请求 —")} {req.agentType === "assistant" ? t("全局助手") : (app.agents.find((a) => a.id === req.agentType)?.name ?? req.agentType)}</span>
       </header>
       <div class="body">
         <p class="title">{req.params?.toolCall?.title ?? t("Agent 请求执行操作")}</p>
