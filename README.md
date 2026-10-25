@@ -4,19 +4,19 @@
 
 > **One Context. Any Harness.** —— 让 Harness 并驾齐驱。
 <div align="center">
-<img width="256" height="256" alt="icon" src="https://github.com/user-attachments/assets/4a3ff479-de89-49f7-b942-6d3b22f524e4" />
-<div>
+  <img width="256" height="256" alt="icon" src="https://github.com/user-attachments/assets/4a3ff479-de89-49f7-b942-6d3b22f524e4" />
+</div>
 使驾（ShiDrive）是一款基于 **Tauri 2** 的本地 AI 开发工作台：把项目、工作上下文、AI Agent 会话与工作流放在同一驾驶席上统一管理。它不是又一个 AI 编码工具，而是让你"驾驶"多个 ACP Agent（Codex / ZCode / Claude / Cline / Cursor / Qoder …）完成日常开发工作——同一份上下文，驱动任意 Harness。
 
 ## 功能一览
 - **项目与上下文**：项目分组、多工作上下文；上下文可绑定多个 Agent 会话，切换即恢复。
-<img width="2250" height="1303" alt="image" src="https://github.com/user-attachments/assets/686f9065-44f2-4aa2-af07-db07f9938223" />
+<img width="2560" height="1386" alt="image" src="https://github.com/user-attachments/assets/f2cfb059-742b-42a0-996e-36dee58bcade" />
 - **AI 会话（ACP）**：新建 / 绑定历史会话、流式回复、工具调用时间线、权限请求对话框、模型与模式切换、Ctrl+F 正文搜索、会话标题编辑；会话状态（对话中 / 已完成 / 已中断）集中管理。
 - **内置 ShiDrive Agent**：无需安装适配器，在「设置 → Agent 管理 → ShiDrive」填写 OpenAI 兼容接口（地址 / API Key / 模型）即可使用；可读写文件、执行命令、调用共享上下文工具，支持会话保存 / 恢复 / 列表，模式可选 询问（改文件 / 执行命令前确认）、自动、只读。
 - **多 Agent 注册表**：内置 Codex、ZCode、Claude、Cline、Codebuddy、Cursor、MiniMax、OpenCode、Qoder、Grok 十种 ACP 工具。启用顺序即会话页标签顺序；npm 类适配器在设置页一键安装（支持 HTTP 代理、npmmirror 镜像回退、`--omit=optional` 跳过大体积平台二进制）。
-<img width="892" height="793" alt="image" src="https://github.com/user-attachments/assets/b9bd3ffe-df63-4654-9694-c6974f1cf61b" />
+<img width="1011" height="787" alt="image" src="https://github.com/user-attachments/assets/b5249324-4595-415e-8d09-658de5c2b41f" />
 - **图形化工作流**：画布拖拽 / 自由连线 / 双击编辑；开始、注释、气泡提醒、环境变量、命令（cmd/powershell/python）、Agent 调度、全局助手（把一件事交给助手处理）、延时等节点；并行分支、定时与手动触发、运行日志、复制粘贴、自动保存。
-<img width="1272" height="1298" alt="image" src="https://github.com/user-attachments/assets/812ee760-deea-4384-92f8-3cab691a1eed" />
+<img width="2240" height="1109" alt="image" src="https://github.com/user-attachments/assets/85b93d3b-504f-437a-abff-b3dcbf4a9fcb" />
 
 - **共享上下文 MCP**：本地 HTTP MCP 服务（默认 `127.0.0.1:8345`），把项目上下文以 git 式提交模型开放给 Agent——`context_get/update/history/search` + 工作流六工具，带版本冲突检测与字节限额。
 - **Coding MCP（独立模式）**：`shidrive.exe --coding-mcp` 以独立进程暴露文件与命令工具（路径越界防护、Token/Basic 认证、执行开关）。
@@ -26,7 +26,6 @@
 - **语音**：双击 Ctrl / 唤醒词（默认「Christina」，离线检测）唤起，支持多轮语音对话；识别用本地 SenseVoice（离线）或百度短语音识别；朗读用本地 MeloTTS / Kokoro、系统语音或**角色语音包**——日语（如牧濑红莉栖 · Amadeus）、中文（如大肥鱼 · 温柔中文，多说话人 VITS）皆可，字幕仍显示界面语言；还能以模型说话人或已有语音包为底**调出变调预设音色**（engine=preset）；可选「读完整篇回复」（跳过代码 / 表格 / 链接）。语音运行环境与模型都在设置里按需下载，不装进系统。
 - **皮肤**：内置「命运石之门」「地狱乐」两套，更多皮肤（含动态人物）从皮肤商店获取；皮肤包（`skin.json` + 图片，zip）可拖入导入，支持人物立绘、动态特效、时间线插画、不透明度调节，并可声明绑定的角色语音包。制作方法见 [皮肤开发指南](docs/skin-guide.md)。
 
-<img width="2048" height="1107" alt="image" src="https://github.com/user-attachments/assets/f3d268eb-03c3-436e-b077-8b00bdb4f7af" />
 <img width="2560" height="1396" alt="image" src="https://github.com/user-attachments/assets/09db5237-c2db-4078-8d7c-09d3ab6251b0" />
 <img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/15fb9b11-24a4-479e-a09a-c152f67fbc04" />
 
