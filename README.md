@@ -23,7 +23,9 @@
 - **全局助手**：独立于项目会话的长期对话伙伴，左下角（或皮肤人物旁）气泡；大脑可选已安装的 ACP Agent 或 OpenAI 兼容 API；记住你的偏好（长期记忆），人设与说话风格跟随皮肤角色；你不忙时她会偶尔主动关怀（深夜、久坐、饭点、未完成待办…，可设最短间隔，每天最多 6 次）；可开放使驾 MCP 全部工具（读写项目上下文、管理 / 运行工作流）并带助手专用工具：给自己设定时（「明天 9 点提醒我」或悄悄记下你的生日），到点由工作流唤醒她，定时放在工作流「无项目」里可查看 / 删除；标题栏附带轻量**待办**面板。
 - **语音**：双击 Ctrl / 唤醒词（默认「Christina」，离线检测）唤起，支持多轮语音对话；识别用本地 SenseVoice（离线）或百度短语音识别；朗读用本地 MeloTTS / Kokoro、系统语音或**角色语音包**——日语（如牧濑红莉栖 · Amadeus）、中文（如大肥鱼 · 温柔中文，多说话人 VITS）皆可，字幕仍显示界面语言；还能以模型说话人或已有语音包为底**调出变调预设音色**（engine=preset）；可选「读完整篇回复」（跳过代码 / 表格 / 链接）。语音运行环境与模型都在设置里按需下载，不装进系统。
 - **皮肤**：内置「命运石之门」「地狱乐」两套，更多皮肤（含动态人物）从皮肤商店获取；皮肤包（`skin.json` + 图片，zip）可拖入导入，支持人物立绘、动态特效、时间线插画、不透明度调节，并可声明绑定的角色语音包。制作方法见 [皮肤开发指南](docs/skin-guide.md)。
-<img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/1221c69e-a69b-4fab-ba0d-126868d88cc0" />
+
+<img width="2048" height="1107" alt="image" src="https://github.com/user-attachments/assets/f3d268eb-03c3-436e-b077-8b00bdb4f7af" />
+<img width="2560" height="1396" alt="image" src="https://github.com/user-attachments/assets/09db5237-c2db-4078-8d7c-09d3ab6251b0" />
 <img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/15fb9b11-24a4-479e-a09a-c152f67fbc04" />
 
 - **全局搜索**：文件树里 `Alt+F` 打开，文件名快速打开 + 内容搜索。
