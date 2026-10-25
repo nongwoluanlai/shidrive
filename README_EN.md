@@ -5,7 +5,7 @@
 > **One Context. Any Harness.**
 <div align="center">
 <img width="256" height="256" alt="icon" src="https://github.com/user-attachments/assets/4a3ff479-de89-49f7-b942-6d3b22f524e4" />
-<div>
+</div>
 ShiDrive (使驾, "driving seat") is a local-first AI development workbench built on **Tauri 2**. It puts projects, working contexts, AI agent sessions and workflows behind a single dashboard — not another AI coding tool, but the driver's seat you use to *drive* ACP agents (Codex / ZCode / Claude / Cline / Cursor / Qoder …). One context, any harness.
 
 ## Features
