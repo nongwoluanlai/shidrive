@@ -24,7 +24,8 @@ ShiDrive (使驾, "driving seat") is a local-first AI development workbench buil
 - **Web access**: a built-in lightweight web server (default port 5165); with your own reverse tunnel or LAN you can pick projects/contexts, chat with agents, run workflows and browse files from another device's browser (guest-code login with rate limiting).
 - **Desktop integration**: custom title bar and dialogs, dark/light themes; ShiDrive's own non-focus-stealing notification popups; closing the window keeps ShiDrive in the tray (right-click to reopen or quit), optional launch-on-startup; single instance — launching it again (e.g. clicking the pinned taskbar icon) just brings the running main window to the front.
 - **Zero environment setup**: Node (≥22) is auto-detected, or downloaded as a portable runtime into the user data directory with one click (never touches the system install); adapters, the voice runtime and models install on demand, everything proxy / mirror capable.
-
+<img width="2048" height="1107" alt="image" src="https://github.com/user-attachments/assets/f3d268eb-03c3-436e-b077-8b00bdb4f7af" />
+<img width="2560" height="1396" alt="image" src="https://github.com/user-attachments/assets/09db5237-c2db-4078-8d7c-09d3ab6251b0" />
 ## Architecture
 
 ```
