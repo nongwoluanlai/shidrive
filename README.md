@@ -21,7 +21,7 @@
 - **外部编程接入**：Passcode / OAuth 双接入；OAuth 请求由桌面端全局审批，复用「开放目录与上下文」中的当前权限，支持多项目访问、令牌吊销和标准 MCP 自动发现；详见 [OAuth 合并说明](docs/oauth-global-permissions.md)。
 - **文件树与编辑器**：目录树、系统剪贴板互操作、终端/资源管理器打开、内置编辑器。
 - **全局助手**：独立于项目会话的长期对话伙伴，左下角（或皮肤人物旁）气泡；大脑可选已安装的 ACP Agent 或 OpenAI 兼容 API；记住你的偏好（长期记忆），人设与说话风格跟随皮肤角色；你不忙时她会偶尔主动关怀（深夜、久坐、饭点、未完成待办…，可设最短间隔，每天最多 6 次）；可开放使驾 MCP 全部工具（读写项目上下文、管理 / 运行工作流）并带助手专用工具：给自己设定时（「明天 9 点提醒我」或悄悄记下你的生日），到点由工作流唤醒她，定时放在工作流「无项目」里可查看 / 删除；标题栏附带轻量**待办**面板。
-- **语音**：双击 Ctrl / 唤醒词（默认「Christina」，离线检测）唤起，支持多轮语音对话；识别用本地 SenseVoice（离线）或百度短语音识别；朗读用本地 MeloTTS / Kokoro、系统语音或**角色语音包**（如牧濑红莉栖 · Amadeus 日语，字幕仍显示界面语言）。语音运行环境与模型都在设置里按需下载，不装进系统。
+- **语音**：双击 Ctrl / 唤醒词（默认「Christina」，离线检测）唤起，支持多轮语音对话；识别用本地 SenseVoice（离线）或百度短语音识别；朗读用本地 MeloTTS / Kokoro、系统语音或**角色语音包**——日语（如牧濑红莉栖 · Amadeus）、中文（如大肥鱼 · 温柔中文，多说话人 VITS）皆可，字幕仍显示界面语言；还能以模型说话人或已有语音包为底**调出变调预设音色**（engine=preset）；可选「读完整篇回复」（跳过代码 / 表格 / 链接）。语音运行环境与模型都在设置里按需下载，不装进系统。
 - **皮肤**：内置「命运石之门」「地狱乐」两套，更多皮肤（含动态人物）从皮肤商店获取；皮肤包（`skin.json` + 图片，zip）可拖入导入，支持人物立绘、动态特效、时间线插画、不透明度调节，并可声明绑定的角色语音包。制作方法见 [皮肤开发指南](docs/skin-guide.md)。
 <img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/1221c69e-a69b-4fab-ba0d-126868d88cc0" />
 <img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/15fb9b11-24a4-479e-a09a-c152f67fbc04" />
@@ -86,9 +86,10 @@ pnpm tauri build --no-bundle   # 仅产出 target/release/shidrive.exe
 | 应用本体 + 内置皮肤 | [Releases](https://github.com/nongwoluanlai/shidrive/releases) 的安装包 / 便携版 zip | 下载新版本覆盖即可，用户数据（`%APPDATA%\com.shidrive.desktop`）保留 |
 | 社区皮肤 | 官网 [皮肤商店](https://shidrive.nwll.top/skinstore) 下载 zip → 「设置 → 外观主题」导入（或直接拖入） | 在皮肤列表删除旧版后导入新版 zip（同 id 不会被静默覆盖）；也欢迎在商店上传分享 |
 | 语音运行环境与通用模型（SenseVoice / MeloTTS / Kokoro / 唤醒词） | 「设置 → 全局助手 → 语音」一键下载（来自 sherpa-onnx 官方发布，可填 GitHub 下载加速前缀） | 随应用版本更新；删除后重新下载即可 |
-| 角色语音包（如牧濑红莉栖 · Amadeus） | 官网 [资源下载](https://shidrive.nwll.top/resources) 或 Releases 的 `voice-packs` 资源 → 「语音 → 导入语音包（.zip）」 | 导入新版 zip 时选择覆盖 |
+| 角色语音包（牧濑红莉栖 · Amadeus 日语，大肥鱼 · 温柔中文等） | 官网 [资源下载](https://shidrive.nwll.top/resources) 或 Releases 的 `voice-packs` 资源 → 「语音 → 导入语音包（.zip）」 | 导入新版 zip 时选择覆盖 |
 
 - 语音包格式：zip 内含 `model.onnx`、`tokens.json`、`voice.json`（`id` / 名称 / 语言 / 引擎 / 适用皮肤 `skins` / 角色名 / 许可证 / 来源）。切到 `skins` 中的皮肤时自动使用对应语音包。
+- 语音包引擎：`espnet-vits-onnx`（日语单说话人）、`sherpa-vits`（中文多说话人，可指定说话人）、`preset`（预设音色：以本地模型说话人或另一语音包 `base=pack:<id>` 为底变调生成，无需额外模型）。自制语音包可用 `app/scripts/voice/export_sherpa_vits_pack.py` 导出。
 - 资源清单：官网提供 `https://shidrive.nwll.top/api/resources.json`（皮肤 + 语音包的版本、大小、sha256、下载地址），便于校验与后续的应用内更新检查。
 - 第三方模型 / 角色语音遵循各自许可证（Amadeus 语音包为 CC-BY-4.0，来源见包内 `voice.json` 与 README）。
 
