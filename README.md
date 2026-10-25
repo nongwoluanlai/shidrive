@@ -3,7 +3,9 @@
 [English](README_EN.md) | 中文
 
 > **One Context. Any Harness.** —— 让 Harness 并驾齐驱。
-
+<div align="center">
+<img width="256" height="256" alt="icon" src="https://github.com/user-attachments/assets/4a3ff479-de89-49f7-b942-6d3b22f524e4" />
+<div>
 使驾（ShiDrive）是一款基于 **Tauri 2** 的本地 AI 开发工作台：把项目、工作上下文、AI Agent 会话与工作流放在同一驾驶席上统一管理。它不是又一个 AI 编码工具，而是让你"驾驶"多个 ACP Agent（Codex / ZCode / Claude / Cline / Cursor / Qoder …）完成日常开发工作——同一份上下文，驱动任意 Harness。
 
 ## 功能一览
