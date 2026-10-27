@@ -166,6 +166,8 @@
     </div>
     <p class="note">{t("一个独立于项目会话的长期助手：可闲聊、提问，会记住你的偏好。人设与说话风格跟随左下角的皮肤角色。点击人物打开输入框，双击 Ctrl 语音输入。")}</p>
 
+    <label class="check"><input type="checkbox" bind:checked={draft.pet_mode} /> {t("桌宠模式：唤醒时使驾不在前台，就在屏幕右下角浮出人物交互，提问会附上当前屏幕截图（托盘菜单「桌宠助手」也可唤出）")}</label>
+
     <div class="sec">
       <h3>{t("大脑")}</h3>
       <div class="row">
@@ -223,7 +225,7 @@
         {#if draft.desktop_tools}
           <div class="indent">
             <label class="check"><input type="checkbox" bind:checked={draft.desktop_confirm} /> {t("执行命令、打开程序、鼠标键盘操作前先弹窗确认（可选「本次启动期间始终允许」）")}</label>
-            <label class="check"><input type="checkbox" bind:checked={draft.desktop_hide} /> {t("操作电脑时把使驾窗口最小化，免得挡住目标（这一轮结束后自动还原）")}</label>
+            <label class="check"><input type="checkbox" bind:checked={draft.desktop_hide} /> {t("截图时把使驾窗口 / 桌宠人物临时隐藏（截完立即恢复）；键鼠操作时使驾在前台会先最小化")}</label>
             {#if !draft.desktop_confirm}<p class="warn-note">{t("已关闭确认：助手可以直接执行任意命令和点击，请只在信任当前模型时使用。")}</p>{/if}
             <p class="note">{t("需要模型支持工具调用（function calling）；看屏幕、点界面还需要支持读图。只在 Windows 上可用。")}</p>
           </div>

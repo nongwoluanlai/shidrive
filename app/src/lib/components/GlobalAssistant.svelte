@@ -17,6 +17,7 @@
   import { ga, enabled, persona, initAssistant, send, cancel, resetSession, hideBubble, showBubble, loadMemories, summarize, visibleText, isThinking, openComposer, memoNote, clearMessages, settingsRequest, conv, subText } from "../assistant/store.svelte";
   import { startConversation, endConversation } from "../assistant/conv.svelte";
   import { initCare } from "../assistant/care.svelte";
+  import { initPet, petWanted, summonPet } from "../assistant/pet.svelte";
 
   const p = $derived(persona());
   const style = $derived(p.style);
@@ -306,6 +307,13 @@
     const cfg = vc.view?.config;
     if (!cfg || !enabled()) return;
     if (cfg.wake_chime) chime(cfg.volume);
+    // 使驾不在前台：右下角浮出桌宠接住（可直接问屏幕上的内容），不把主窗口拽到前台
+    if (petWanted()) {
+      const quip = wakeQuip(p.name, word, app.locale);
+      if (quip && !busy) showBubble(quip);
+      setTimeout(() => void summonPet(true).catch(() => void api.voiceWakeRaise().catch(() => {})), cfg.wake_chime ? 260 : 0);
+      return;
+    }
     if (document.visibilityState !== "visible" || !document.hasFocus()) void api.voiceWakeRaise().catch(() => {});
     const quip = wakeQuip(p.name, word, app.locale);
     if (quip && !busy) showBubble(quip);
@@ -397,6 +405,7 @@
   onMount(() => {
     void initAssistant();
     const offCare = initCare();
+    const offPet = initPet();
     const off = onSkinEvent((ev) => { if (ev === "character.click" && enabled()) { onChip(); focusAfterClick(); } });
     const onResize = () => measure();
     addEventListener("resize", onResize);
@@ -425,6 +434,7 @@
     return () => {
       off();
       offCare();
+      offPet();
       endConversation();
       removeEventListener("resize", onResize);
       removeEventListener("keydown", onKeyDown, true);

@@ -280,7 +280,7 @@ pub async fn acp_prompt(
 }
 
 #[tauri::command]
-pub async fn acp_cancel(agents: AgentsState<'_>, context_id: String, agent_type: String) -> Result<(), String> {
+pub async fn acp_cancel(agents: AgentsState<'_>, context_id: String, agent_type: String) -> Result<bool, String> {
     agents.cancel(&context_id, &agent_type).await
 }
 

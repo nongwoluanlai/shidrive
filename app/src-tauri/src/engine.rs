@@ -686,6 +686,8 @@ fn shell_command(kind: &str, command: &str, python_path: Option<&str>) -> tokio:
         "python" => {
             let mut cmd = tokio::process::Command::new(python_path.filter(|p| !p.is_empty()).unwrap_or("python"));
             cmd.arg("-c").arg(command);
+            // 管道输出默认按本地代码页编码，GBK 之外的字符（emoji 等）会直接报 UnicodeEncodeError
+            if std::env::var_os("PYTHONIOENCODING").is_none() { cmd.env("PYTHONIOENCODING", "utf-8"); }
             cmd
         }
         "powershell" => {
@@ -706,6 +708,48 @@ fn shell_command(kind: &str, command: &str, python_path: Option<&str>) -> tokio:
     }
 }
 
+/// 子进程输出解码：逐行判断——合法 UTF-8 原样用（node / git / 设了 UTF-8 的程序），
+/// 否则按系统控制台代码页解码（中文 Windows 下 cmd 内置命令、PowerShell、多数旧程序输出 GBK），
+/// 两种输出混在一起也能各自正确显示。
+pub fn decode_output(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) { return s.to_string(); }
+    let mut out = String::with_capacity(bytes.len());
+    for (i, line) in bytes.split(|&b| b == b'\n').enumerate() {
+        if i > 0 { out.push('\n'); }
+        match std::str::from_utf8(line) {
+            Ok(s) => out.push_str(s),
+            // 只是末尾被截断在半个字符上：仍是 UTF-8，别按代码页解成乱码
+            Err(e) if e.error_len().is_none() => out.push_str(&String::from_utf8_lossy(line)),
+            Err(_) => out.push_str(&decode_codepage(line).unwrap_or_else(|| String::from_utf8_lossy(line).into_owned())),
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+fn decode_codepage(bytes: &[u8]) -> Option<String> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetOEMCP() -> u32;
+        fn GetACP() -> u32;
+        fn MultiByteToWideChar(cp: u32, flags: u32, src: *const u8, n: i32, dst: *mut u16, cap: i32) -> i32;
+    }
+    if bytes.is_empty() || bytes.len() > i32::MAX as usize { return None; }
+    let try_cp = |cp: u32| -> Option<String> {
+        // MB_ERR_INVALID_CHARS：不是这个代码页的字节就失败，换下一个
+        let n = unsafe { MultiByteToWideChar(cp, 0x8, bytes.as_ptr(), bytes.len() as i32, std::ptr::null_mut(), 0) };
+        if n <= 0 { return None; }
+        let mut buf = vec![0u16; n as usize];
+        let n = unsafe { MultiByteToWideChar(cp, 0x8, bytes.as_ptr(), bytes.len() as i32, buf.as_mut_ptr(), n) };
+        (n > 0).then(|| String::from_utf16_lossy(&buf[..n as usize]))
+    };
+    let (oem, ansi) = unsafe { (GetOEMCP(), GetACP()) };
+    try_cp(oem).or_else(|| if ansi != oem { try_cp(ansi) } else { None })
+}
+
+#[cfg(not(windows))]
+fn decode_codepage(_bytes: &[u8]) -> Option<String> { None }
+
 // Bound both retained output and individual streamed lines. Read bytes rather
 // than UTF-8 lines: a single legacy-codepage byte must not stop draining a pipe.
 const MAX_CAPTURE_BYTES: usize = 80_000;
@@ -721,7 +765,7 @@ struct PipeCapture {
 impl PipeCapture {
     fn emit_line(&mut self, stderr: bool, log: &impl Fn(&str)) {
         if self.lines < if stderr { 100 } else { 200 } {
-            let text = String::from_utf8_lossy(&self.line);
+            let text = decode_output(&self.line);
             let text = text.trim_end_matches('\r');
             if stderr { log(&format!("  [stderr] {text}")); } else { log(text); }
         }
@@ -747,7 +791,7 @@ impl PipeCapture {
 
     fn finish(mut self, stderr: bool, log: &impl Fn(&str)) -> String {
         if !self.line.is_empty() { self.emit_line(stderr, log); }
-        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
+        let mut text = decode_output(&self.bytes);
         if self.truncated { text.push_str("\n…（输出过长，已截断）"); }
         text
     }
@@ -877,7 +921,7 @@ fn truncate_env(s: &str) -> String {
     }
 }
 
-/// Replace `{{env.NAME}}` and `{{date:FORMAT}}` templates.
+/// Replace `{{env.NAME}}` (alias `{{var.NAME}}`, which the editor hints use) and `{{date:FORMAT}}` templates.
 fn substitute(text: &str, env: &BTreeMap<String, String>) -> String {
     let mut out = text.to_string();
     for _ in 0..5 {
@@ -901,9 +945,11 @@ fn substitute(text: &str, env: &BTreeMap<String, String>) -> String {
         out.replace_range(start..start + end_rel + 2, &rendered);
     }
     for (k, v) in env {
-        let needle = format!("{{{{env.{k}}}}}");
-        if out.contains(&needle) {
-            out = out.replace(&needle, v);
+        for prefix in ["env", "var"] {
+            let needle = format!("{{{{{prefix}.{k}}}}}");
+            if out.contains(&needle) {
+                out = out.replace(&needle, v);
+            }
         }
     }
     out
@@ -1071,6 +1117,24 @@ mod tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn var_alias_substitutes_like_env() {
+        let env = BTreeMap::from([("token".to_string(), "abc".to_string())]);
+        assert_eq!(substitute("--t {{var.token}} {{env.token}} {{var.none}}", &env), "--t abc abc {{var.none}}");
+    }
+
+    #[test]
+    fn mixed_utf8_and_codepage_lines_decode() {
+        assert_eq!(decode_output("纯 UTF-8 行\n第二行".as_bytes()), "纯 UTF-8 行\n第二行");
+        // GBK「中文」= D6 D0 CE C4
+        let mut mixed = "utf8：你好\n".as_bytes().to_vec();
+        mixed.extend_from_slice(&[0xD6, 0xD0, 0xCE, 0xC4]);
+        let text = decode_output(&mixed);
+        assert!(text.starts_with("utf8：你好\n"));
+        if cfg!(windows) && text.ends_with("中文") { return; }
+        assert!(!text.is_empty());
     }
 
     #[test]

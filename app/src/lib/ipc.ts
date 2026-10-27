@@ -96,7 +96,7 @@ export const api = {
   acpDeepseekNew: (context: Context) => invoke<string>("acp_deepseek_new", { context }),
   acpPrompt: (context: Context, agent_type: string, text: string, images?: { data: string; mime: string }[], requestId?: string) =>
     invoke<{ stopReason?: string }>("acp_prompt", { context, agentType: agent_type, text, images: images ?? [], requestId }),
-  acpCancel: (context_id: string, agent_type: string) => invoke<void>("acp_cancel", { contextId: context_id, agentType: agent_type }),
+  acpCancel: (context_id: string, agent_type: string) => invoke<boolean>("acp_cancel", { contextId: context_id, agentType: agent_type }),
   acpSetMode: (context_id: string, agent_type: string, mode_id: string) =>
     invoke<void>("acp_set_mode", { contextId: context_id, agentType: agent_type, modeId: mode_id }),
   acpSetConfigOption: (context_id: string, agent_type: string, option_id: string, value: unknown, expectedSessionId?: string) =>
@@ -242,8 +242,11 @@ export const api = {
   assistantConfigGet: () => invoke<AssistantConfigView>("assistant_config_get"),
   /** apiKey: undefined/null = 保留已保存的密钥；"" = 清除 */
   assistantConfigSet: (config: AssistantConfig, apiKey?: string | null) => invoke<AssistantConfigView>("assistant_config_set", { config, apiKey: apiKey ?? null }),
-  assistantSend: (text: string, persona: AssistantPersona, appState: string | null, turnId: string, speech: SpeechHint | null = null) =>
-    invoke<AssistantTurnResult>("assistant_send", { text, persona, appState, turnId, speech }),
+  assistantSend: (text: string, persona: AssistantPersona, appState: string | null, turnId: string, speech: SpeechHint | null = null, screen = false) =>
+    invoke<AssistantTurnResult>("assistant_send", { text, persona, appState, turnId, speech, screen }),
+  petShow: (focus = false) => invoke<void>("pet_show", { focus }),
+  petHide: () => invoke<void>("pet_hide"),
+  petOpenMain: () => invoke<void>("pet_open_main"),
   assistantGreet: (persona: AssistantPersona, appState: string | null, turnId: string, reason: "new" | "resume", speech: SpeechHint | null = null) =>
     invoke<AssistantTurnResult>("assistant_greet", { persona, appState, turnId, reason, speech }),
   assistantCare: (persona: AssistantPersona, appState: string | null, turnId: string, context: string, speech: SpeechHint | null = null) =>

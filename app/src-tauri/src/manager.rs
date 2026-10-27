@@ -127,6 +127,22 @@ mod audit_tests {
     }
 }
 
+/// How long a cancelled turn may wait for the adapter's prompt reply before it is force-ended.
+const CANCEL_GRACE: Duration = Duration::from_secs(12);
+
+/// 强制结束时回合的错误文本（manager 据此重启适配器）
+const FORCED_END: &str = "适配器未响应取消请求，已强制结束本轮（适配器将重启）";
+
+/// 取消请求发出后，适配器 CANCEL_GRACE 内仍不结束回合就强制结束
+fn arm_force_abort(conn: Arc<AcpConnection>, sid: String, turn_id: String) {
+    tokio::spawn(async move {
+        tokio::time::sleep(CANCEL_GRACE).await;
+        if conn.force_abort_turn(&sid, &turn_id) {
+            log::warn!("[{}] 适配器 {CANCEL_GRACE:?} 内未响应取消，强制结束回合 {turn_id}", conn.agent_type);
+        }
+    });
+}
+
 /// Cancelling the future must cancel the session it actually prompted (including temp sessions).
 struct ActiveTurn {
     app: AppHandle,
@@ -194,6 +210,8 @@ pub struct AgentManager {
     prompt_locks: std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// 本次运行中已附加过完整会话说明的会话（agent:sid），之后只附加简短提示。
     primed: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// 回合准备阶段（加载会话等，尚无 buffer）收到的停止请求（context:agent），回合一开始就取消
+    pending_cancels: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl AgentManager {
@@ -208,7 +226,7 @@ impl AgentManager {
                 }
             }
         }
-        Self { app, db, tools, conns: RwLock::new(HashMap::new()), overrides: RwLock::new(overrides), connection_locks: std::sync::Mutex::new(HashMap::new()), bind_locks: std::sync::Mutex::new(HashMap::new()), prompt_locks: std::sync::Mutex::new(HashMap::new()), primed: std::sync::Mutex::new(Default::default()) }
+        Self { app, db, tools, conns: RwLock::new(HashMap::new()), overrides: RwLock::new(overrides), connection_locks: std::sync::Mutex::new(HashMap::new()), bind_locks: std::sync::Mutex::new(HashMap::new()), prompt_locks: std::sync::Mutex::new(HashMap::new()), primed: std::sync::Mutex::new(Default::default()), pending_cancels: std::sync::Mutex::new(Default::default()) }
     }
 
     fn prompt_lock(&self, conn: &AcpConnection, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -931,6 +949,8 @@ impl AgentManager {
     ) -> Result<Value, String> {
         let binding_lock = self.bind_lock(&context.id, agent_type);
         let binding_guard = if matches!(&target, SessionTarget::Binding) { Some(binding_lock.lock().await) } else { None };
+        let cancel_key = format!("{}:{agent_type}", context.id);
+        if binding_guard.is_some() { self.pending_cancels.lock().unwrap().remove(&cancel_key); }
         let mut conn = self.ensure_connected(agent_type).await?;
         let cwd = self.project_root_for(context);
         let sid = match target {
@@ -987,8 +1007,13 @@ impl AgentManager {
         };
         // Register before releasing the binding guard so rebind/unbind cannot
         // redirect the UI or cancel button while this session is running.
+        let cancel_now = binding_guard.is_some() && self.pending_cancels.lock().unwrap().remove(&cancel_key);
         drop(binding_guard);
         turn.status("running");
+        if cancel_now {
+            conn.cancel_session(&sid);
+            arm_force_abort(conn.clone(), sid.clone(), turn_id.clone());
+        }
         let mut blocks = Vec::new();
         if !text.is_empty() { blocks.push(ContentBlock::Text(TextContent::new(text))); }
         for img in images { blocks.push(ContentBlock::Image(ImageContent::new(img.data.clone(), img.mime.clone()))); }
@@ -1002,20 +1027,33 @@ impl AgentManager {
         // Dropping a workflow future is not an ACP cancellation acknowledgement.
         // Keep the SID lock/buffer alive until the peer replies (or disconnects),
         // otherwise the next prompt could steal late chunks from the canceled one.
+        let abort = conn.turn_abort_signal(&sid, &turn_id).unwrap_or_default();
         let task = tokio::spawn(async move {
             let _session = session_guard;
             let request = conn.prompt_session(&sid, blocks);
             tokio::pin!(request);
             let mut was_cancelled = false;
+            // Some adapters (e.g. pi) never answer session/cancel; the abort signal
+            // (UI stop timeout) and the grace timer keep the turn from hanging forever.
             let mut result = tokio::select! {
                 biased;
                 result = &mut request => result,
+                _ = abort.notified() => {
+                    was_cancelled = true;
+                    Err(FORCED_END.to_string())
+                }
                 _ = cancel_rx => {
                     was_cancelled = true;
                     conn.cancel_turn(&sid, &turn_id);
-                    request.await
+                    tokio::select! {
+                        biased;
+                        result = &mut request => result,
+                        _ = abort.notified() => Err(FORCED_END.to_string()),
+                        _ = tokio::time::sleep(CANCEL_GRACE) => Err(FORCED_END.to_string()),
+                    }
                 }
             };
+            let forced = matches!(&result, Err(e) if e == FORCED_END);
             let interrupted = was_cancelled || matches!(&result, Ok(v) if v.get("stopReason").and_then(Value::as_str) == Some("cancelled"));
             if let Err(e) = &result { log::warn!("[{}] 回合失败：{}", turn.agent_type, e.chars().take(600).collect::<String>()); }
             turn.status(if result.is_err() || interrupted { "interrupted" } else { "completed" });
@@ -1027,6 +1065,9 @@ impl AgentManager {
             }
             turn.completed = true;
             drop(turn);
+            // 适配器无视取消：它可能还在往这个会话吐旧回合的内容，下一轮会被串进来；
+            // 直接重启适配器进程（下次使用时自动重连）
+            if forced { conn.shutdown(); }
             result
         });
         let joined = task.await;
@@ -1072,7 +1113,7 @@ impl AgentManager {
     }
 
     /// 向助手会话发一轮提示词，等待回合结束，返回整轮回复文本。
-    pub async fn assistant_prompt(&self, agent_type: &str, sid: &str, cwd: &str, text: &str, turn_id: &str, mcp: bool) -> Result<String, String> {
+    pub async fn assistant_prompt(&self, agent_type: &str, sid: &str, cwd: &str, text: &str, turn_id: &str, mcp: bool, image_png: Option<&str>) -> Result<String, String> {
         let conn = self.ensure_connected(agent_type).await?;
         let lock = self.prompt_lock(&conn, sid);
         let _session = lock.lock_owned().await;
@@ -1091,10 +1132,35 @@ impl AgentManager {
             }
         }
         let mut guard = TurnGuard { conn: conn.clone(), sid: sid.to_string(), turn: turn_id.to_string(), done: false };
-        let result = conn.prompt_session(sid, vec![ContentBlock::Text(TextContent::new(text))]).await;
+        let mut blocks = Vec::new();
+        let mut text = text.to_string();
+        if let Some(png) = image_png {
+            if prompt_images_supported(&conn.agent_info.lock().unwrap()) {
+                blocks.push(ContentBlock::Image(ImageContent::new(png.to_string(), "image/png".to_string())));
+            } else {
+                let paths = save_prompt_images(&[crate::models::PromptImage { data: png.to_string(), mime: "image/png".into() }]);
+                if let Some(p) = paths.first() {
+                    text.push_str(&format!("
+
+[屏幕截图已保存为本地文件：{p}，请用读取图片的工具打开查看]"));
+                }
+            }
+        }
+        blocks.insert(0, ContentBlock::Text(TextContent::new(text)));
+        let abort = conn.turn_abort_signal(sid, turn_id).unwrap_or_default();
+        let result = tokio::select! {
+            biased;
+            r = conn.prompt_session(sid, blocks) => r,
+            _ = abort.notified() => Err(FORCED_END.to_string()),
+        };
+        let forced = matches!(&result, Err(e) if e == FORCED_END);
         let (out, _, _) = conn.end_turn(sid, turn_id);
         guard.done = true;
         drop(guard);
+        if forced {
+            conn.shutdown();
+            return Err(format!("{ASSISTANT_CANCELLED}{out}"));
+        }
         let res = result?;
         if res.get("stopReason").and_then(Value::as_str) == Some("cancelled") {
             return Err(format!("{ASSISTANT_CANCELLED}{out}"));
@@ -1103,8 +1169,11 @@ impl AgentManager {
     }
 
     pub async fn assistant_cancel(&self, agent_type: &str, sid: &str, turn_id: &str) {
-        if let Some(conn) = self.conns.read().await.get(agent_type) {
-            conn.cancel_turn(sid, turn_id);
+        if let Some(conn) = self.conns.read().await.get(agent_type).cloned() {
+            if conn.turn_abort_signal(sid, turn_id).is_some() {
+                conn.cancel_turn(sid, turn_id);
+                arm_force_abort(conn, sid.to_string(), turn_id.to_string());
+            }
         }
     }
 
@@ -1116,15 +1185,28 @@ impl AgentManager {
         self.prompt_with_request_id(context, agent_type, SessionTarget::Binding, text, images, request_id, "chat").await
     }
 
-    pub async fn cancel(&self, context_id: &str, agent_type: &str) -> Result<(), String> {
-        if let Some(sid) = self.db.get_binding(context_id, agent_type)?.and_then(|b| b.session_id) {
-            if let Some(conn) = self.conns.read().await.get(agent_type) {
-                if conn.has_active_turn(&sid) {
-                    conn.cancel_session(&sid);
-                }
+    /// Returns false when the backend has no turn running for this binding, so the
+    /// UI can clear a stale "running" state instead of waiting forever.
+    pub async fn cancel(&self, context_id: &str, agent_type: &str) -> Result<bool, String> {
+        let binding = self.db.get_binding(context_id, agent_type)?;
+        let sid = binding.as_ref().and_then(|b| b.session_id.clone());
+        let conn = self.conns.read().await.get(agent_type).cloned();
+        if let (Some(sid), Some(conn)) = (sid.as_deref(), conn) {
+            if let Some(turn_id) = conn.active_turn_id(sid) {
+                conn.cancel_session(sid);
+                arm_force_abort(conn, sid.to_string(), turn_id);
+                return Ok(true);
             }
         }
-        Ok(())
+        // 回合还在准备（持有绑定锁、尚未 begin_turn）：记下停止请求，回合一开始就取消
+        if self.bind_lock(context_id, agent_type).try_lock().is_err() {
+            self.pending_cancels.lock().unwrap().insert(format!("{context_id}:{agent_type}"));
+            return Ok(true);
+        }
+        if binding.as_ref().is_some_and(|b| b.status == "running") {
+            let _ = self.db.set_binding_status(context_id, agent_type, "interrupted", false);
+        }
+        Ok(false)
     }
 
     pub async fn set_mode(&self, context_id: &str, agent_type: &str, mode_id: &str) -> Result<(), String> {

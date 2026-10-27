@@ -1,0 +1,80 @@
+/* 桌宠窗口：整窗透明，只有人物、气泡和输入条可见 */
+:root {
+  --font: "Segoe UI", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  --bg-panel: #141722;
+  --bg-elev: #1b1f2e;
+  --border: #2c3248;
+  --text: #e7eaf3;
+  --text-dim: #9ba3b8;
+  --accent: #4da3ff;
+  --accent-contrast: #0a1020;
+  --danger: #e5686f;
+  --radius: 10px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; background: transparent !important; }
+body { font: 13px/1.5 var(--font); color: var(--text); user-select: none; }
+#pet { height: 100%; }
+
+.pet { position: relative; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; }
+
+/* 人物：沿用主窗口的 .skin-character-stage，改为铺满小窗中部（右下对齐） */
+.stage-wrap { position: absolute; left: 0; right: 0; bottom: 64px; top: 120px; pointer-events: none; }
+body[data-skin-character="true"] .skin-character-stage {
+  position: absolute !important;
+  left: 0; right: 0; top: 0; bottom: 0;
+  width: auto !important; height: auto !important;
+  pointer-events: none;
+}
+.skin-character { background-position: center bottom !important; }
+.skin-scene-static { left: 0 !important; right: 0; margin: 0 auto; object-position: center bottom !important; }
+
+.avatar {
+  position: absolute; right: 24px; bottom: 6px; width: 88px; height: 88px; border-radius: 50%;
+  border: 1px solid var(--border); background: var(--bg-panel); cursor: pointer; pointer-events: auto;
+  box-shadow: 0 6px 20px #0007; display: grid; place-items: center;
+}
+.avatar img { width: 56px; height: 56px; }
+
+.bubble {
+  position: absolute; left: 10px; right: 10px; top: 8px; max-height: 210px; overflow: auto;
+  background: color-mix(in srgb, var(--bg-panel) 94%, transparent); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 8px 11px; box-shadow: 0 8px 24px #0008; z-index: 2;
+  user-select: text;
+}
+.bubble.err { border-color: var(--danger); }
+.who { font-size: 11px; color: var(--accent); margin-bottom: 2px; }
+.md { word-break: break-word; }
+.md p + p { margin-top: 6px; }
+.md pre, .md code { font-family: Consolas, monospace; font-size: 12px; }
+.md pre { background: #0006; padding: 6px; border-radius: 6px; overflow: auto; }
+.md a { color: var(--accent); }
+.error { color: var(--danger); font-size: 12px; margin-top: 4px; }
+.dots { display: inline-flex; gap: 4px; }
+.dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim); animation: blink 1.2s infinite; }
+.dots i:nth-child(2) { animation-delay: .2s; }
+.dots i:nth-child(3) { animation-delay: .4s; }
+@keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+
+.dock { position: relative; z-index: 3; padding: 0 8px 8px; }
+.bar {
+  display: flex; align-items: center; gap: 4px; padding: 5px;
+  background: color-mix(in srgb, var(--bg-panel) 96%, transparent); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: 0 6px 20px #0008;
+}
+.drag { cursor: grab; color: var(--text-dim); padding: 0 3px; font-size: 12px; letter-spacing: -2px; }
+.b {
+  border: 1px solid transparent; background: var(--bg-elev); color: var(--text); border-radius: 7px;
+  height: 28px; min-width: 28px; padding: 0 8px; cursor: pointer; font: inherit; white-space: nowrap;
+}
+.b:hover:not(:disabled) { border-color: var(--accent); }
+.b:disabled { opacity: .45; cursor: default; }
+.b:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.b.grow { flex: 1; text-align: left; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; }
+.b.primary { background: var(--accent); color: var(--accent-contrast); }
+.b.mic.rec { background: var(--danger); color: #fff; box-shadow: 0 0 0 calc(var(--lv, 0) * 6px) #e5686f55; }
+textarea {
+  flex: 1; resize: none; height: 28px; max-height: 80px; border: 1px solid var(--border); border-radius: 7px;
+  background: var(--bg-elev); color: var(--text); font: inherit; padding: 4px 7px; user-select: text;
+}
+.hint { margin-top: 3px; font-size: 11px; color: var(--text-dim); text-align: center; text-shadow: 0 1px 3px #000; }

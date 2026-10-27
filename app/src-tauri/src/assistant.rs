@@ -110,8 +110,10 @@ pub struct AssistantConfig {
     pub desktop_tools: bool,
     /// 执行命令 / 打开程序 / 鼠标键盘前先弹窗确认
     pub desktop_confirm: bool,
-    /// 操作电脑时把使驾窗口最小化（免得挡住目标），回合结束后还原
+    /// 截图时临时隐藏使驾窗口与桌宠人物（截完立即恢复），免得挡住画面
     pub desktop_hide: bool,
+    /// 唤醒时使驾不在前台：在屏幕右下角浮出桌宠人物交互（提问可附上当前屏幕）
+    pub pet_mode: bool,
     /// 模型支持读图：截图 / 图片按 OpenAI image_url（base64）发给模型
     pub vision: bool,
 }
@@ -139,8 +141,9 @@ impl Default for AssistantConfig {
             care_voice: true,
             mcp_tools: true,
             desktop_tools: false,
-            desktop_confirm: true,
+            desktop_confirm: false,
             desktop_hide: true,
+            pet_mode: true,
             vision: true,
         }
     }
@@ -830,6 +833,12 @@ pub fn strip_speech_tags(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// 桌宠截屏提问附带的说明（图片本身另附）
+fn screen_note(fg: &str) -> String {
+    let fg = if fg.is_empty() { String::new() } else { format!("，用户当时在看的窗口：{fg}") };
+    format!("[用户从桌面助手发起提问，附上了当前屏幕截图{fg}。问题里的「这个 / 这里 / 屏幕上」指截图里的内容；截图中不含使驾自己的窗口]")
+}
+
 /// 一轮要发出的内容
 enum Turn<'a> {
     /// 用户消息
@@ -1259,7 +1268,7 @@ fn api_chat(ctx: &ApiCtx, mut messages: Vec<Value>, mut tools: Option<Value>, ta
 async fn run_turn(
     app: &AppHandle, db: &Arc<Db>, agents: &AgentManager, rt: &AssistantRuntime,
     cfg: &AssistantConfig, persona: &Persona, app_state: Option<&str>, turn: Turn<'_>,
-    turn_id: &str, cancel: Arc<AtomicBool>, speech: Option<&SpeechHint>, subtitles: bool,
+    turn_id: &str, cancel: Arc<AtomicBool>, speech: Option<&SpeechHint>, subtitles: bool, screen: Option<&str>,
 ) -> Result<String, String> {
     let mems = list_memories(db)?;
     let name = persona.display_name().to_string();
@@ -1300,7 +1309,17 @@ async fn run_turn(
             let role = if m.role == "user" { "user" } else { "assistant" };
             messages.push(json!({ "role": role, "content": m.content }));
         }
-        messages.push(json!({ "role": "user", "content": body }));
+        let vision_ok = cfg.vision && !no_vision().lock().unwrap().contains(&tools_key(&cfg.api));
+        match screen {
+            Some(png) if vision_ok => messages.push(json!({ "role": "user", "content": [
+                { "type": "text", "text": body },
+                { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{png}") } }
+            ] })),
+            Some(_) => messages.push(json!({ "role": "user", "content": format!("{body}
+
+（截图未发送：当前模型未开启读图。如果看不到就直接告诉用户，并提示可在设置里开启「模型支持读图」）") })),
+            None => messages.push(json!({ "role": "user", "content": body })),
+        }
         let api = cfg.api.clone();
         let app2 = app.clone();
         let sid = st.session_id.clone();
@@ -1353,7 +1372,7 @@ async fn run_turn(
         Turn::User(t) => { text.push_str("[用户消息]\n"); text.push_str(t); }
         Turn::Event(e) => text.push_str(e),
     }
-    let r = agents.assistant_prompt(&cfg.agent_type, &sid, &cwd, &text, turn_id, cfg.mcp_tools).await;
+    let r = agents.assistant_prompt(&cfg.agent_type, &sid, &cwd, &text, turn_id, cfg.mcp_tools, screen).await;
     // 只要请求已送达（成功或被停止）就视为设定已注入
     if r.is_ok() || r.as_ref().err().is_some_and(|e| e.starts_with(ASSISTANT_CANCELLED)) {
         let mut st = load_state(db);
@@ -1892,7 +1911,7 @@ pub async fn assistant_wake(
         let cfg = load_config(&db);
         check_enabled(&cfg)?;
         let (_g, cancel) = acquire(&rt, &turn_id)?;
-        let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(ev), &turn_id, cancel, speech.as_ref(), true).await;
+        let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(ev), &turn_id, cancel, speech.as_ref(), true, None).await;
         finish_reply_ext(&db, &cfg, raw, false, true)
     }
     .await;
@@ -1964,6 +1983,7 @@ pub async fn assistant_config_set(db: DbState<'_>, rt: RtState<'_>, config: Assi
 pub async fn assistant_send(
     app: AppHandle, db: DbState<'_>, agents: AgentsState<'_>, rt: RtState<'_>,
     text: String, persona: Persona, app_state: Option<String>, turn_id: String, speech: Option<SpeechHint>,
+    screen: Option<bool>,
 ) -> Result<TurnResult, String> {
     let cfg = load_config(&db);
     check_enabled(&cfg)?;
@@ -1972,7 +1992,24 @@ pub async fn assistant_send(
     let (_g, cancel) = acquire(&rt, &turn_id)?;
     let db = db.inner().clone();
     insert_message(&db, "user", &text, &cfg.provider, &[])?;
-    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::User(&text), &turn_id, cancel, speech.as_ref(), true).await;
+    // 桌宠提问：附上当前屏幕（截图时临时隐藏使驾自己的窗口）
+    let shot = if screen == Some(true) {
+        match tokio::task::spawn_blocking(|| crate::desktop::snapshot(std::process::id())).await {
+            Ok(Ok((png, fg))) => {
+                let fg = if fg.is_empty() { crate::pet::summon_foreground() } else { fg };
+                Some((png, fg))
+            }
+            Ok(Err(e)) => { log::warn!("[assistant] 截屏失败：{e}"); None }
+            Err(e) => { log::warn!("[assistant] 截屏任务异常：{e}"); None }
+        }
+    } else { None };
+    let asked = match &shot {
+        Some((_, fg)) => format!("{}
+
+{text}", screen_note(fg)),
+        None => text.clone(),
+    };
+    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::User(&asked), &turn_id, cancel, speech.as_ref(), true, shot.as_ref().map(|(p, _)| p.as_str())).await;
     mark_greeted(&db, &raw);
     finish_reply(&db, &cfg, raw, false)
 }
@@ -1993,7 +2030,7 @@ pub async fn assistant_greet(
     if !persona.greeting.trim().is_empty() {
         ev.push_str(&format!("\n参考开场白风格（不必照抄）：{}", persona.greeting.trim()));
     }
-    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(ev), &turn_id, cancel, speech.as_ref(), true).await;
+    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(ev), &turn_id, cancel, speech.as_ref(), true, None).await;
     mark_greeted(&db, &raw);
     finish_reply(&db, &cfg, raw, true)
 }
@@ -2021,7 +2058,7 @@ pub async fn assistant_care(
     check_enabled(&cfg)?;
     let (_g, cancel) = acquire(&rt, &turn_id)?;
     let db = db.inner().clone();
-    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(care_event(&context)), &turn_id, cancel, speech.as_ref(), true).await;
+    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, app_state.as_deref(), Turn::Event(care_event(&context)), &turn_id, cancel, speech.as_ref(), true, None).await;
     finish_reply_ext(&db, &cfg, raw, false, true)
 }
 
@@ -2126,7 +2163,7 @@ pub async fn assistant_memory_summarize(
             recap_block(&hist, persona.display_name())
         )
     };
-    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, None, Turn::Event(task), &turn_id, cancel, None, false).await
+    let raw = run_turn(&app, &db, &agents, &rt, &cfg, &persona, None, Turn::Event(task), &turn_id, cancel, None, false, None).await
         .map_err(|e| if e.starts_with(ASSISTANT_CANCELLED) { "已停止".to_string() } else { e })?;
     let items = parse_bullets(&raw);
     if mode == "consolidate" {

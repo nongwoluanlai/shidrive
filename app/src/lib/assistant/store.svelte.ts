@@ -35,6 +35,9 @@ export const ga = $state({
 
 export const enabled = () => !!ga.view?.config.enabled;
 
+/** 桌宠：唤醒时使驾不在前台，人物浮在屏幕右下角；此时提问附上当前屏幕截图 */
+export const pet = $state({ active: false });
+
 /** 连续语音对话（唤醒 / 主动关怀后）：说完自动接着听，助手判断何时结束 */
 export const conv = $state({
   active: false,
@@ -441,14 +444,15 @@ async function refreshView() {
   ga.view = await api.assistantConfigGet().catch(() => ga.view);
 }
 
-export async function send(text: string): Promise<AssistantTurnResult | null> {
+/** screen：附上当前屏幕截图（只由桌宠发起的提问传 true） */
+export async function send(text: string, screen = false): Promise<AssistantTurnResult | null> {
   const body = text.trim();
   if (!body || !enabled()) return null;
   const pending: AssistantMessage = { id: `local-${Date.now()}`, role: "user", content: body, provider: ga.view!.config.provider, created_at: new Date().toISOString(), interrupted: false, greeting: false };
   emitSkinEvent("message.send");
   const r = await runTurn("send", async (turnId) => {
     ga.messages = [...ga.messages, pending];
-    return api.assistantSend(body, toWire(persona(), app.locale), appState(), turnId, hint());
+    return api.assistantSend(body, toWire(persona(), app.locale), appState(), turnId, hint(), screen && pet.active && !!ga.view?.config.pet_mode);
   });
   // 用库里的记录替换本地占位（拿到真实 id）
   if (!ga.busy) ga.messages = await api.assistantMessages(200).catch(() => ga.messages);

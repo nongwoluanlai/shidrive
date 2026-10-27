@@ -577,9 +577,13 @@
               </div>
             {:else if r.npm && r.adapter_ready}
               <div class="cfg-line">
+                <button class="btn sm" disabled={busy === r.id} title={t("更新到 npm 最新版（修复旧版适配器的兼容问题）")} onclick={() => install(r)}>
+                  {busy === r.id ? t("处理中…") : t("更新适配器")}
+                </button>
                 <button class="btn sm" disabled={busy === r.id} onclick={() => uninstall(r)}>
                   {busy === r.id ? t("卸载中…") : t("卸载适配器")}
                 </button>
+                {#if r.adapter_version}<span class="badge">v{r.adapter_version}</span>{/if}
                 <span class="pend">{t("卸载后需重新安装才能连接")}</span>
               </div>
             {/if}

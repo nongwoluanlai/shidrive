@@ -829,6 +829,11 @@ impl Db {
         })
     }
 
+    /// No turn survives a restart: a "running" left by a crash/kill would block the UI forever.
+    pub fn reset_running_bindings(&self) -> Result<usize, String> {
+        self.with(|c| Ok(c.execute("UPDATE agent_bindings SET status='interrupted' WHERE status='running'", [])?))
+    }
+
     /// `touch`: 是否刷新 updated_at。会话「更新时间」只在发送消息 / 回复结束时变化，
     /// 打开、查看、重新绑定同一会话、改标题 / 模型都不算。
     pub fn set_binding_status(&self, context_id: &str, agent_type: &str, status: &str, touch: bool) -> Result<(), String> {

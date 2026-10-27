@@ -25,7 +25,7 @@ impl Output {
 pub struct Opts {
     /// run_command 默认工作目录
     pub workdir: PathBuf,
-    /// 宿主（使驾主程序）进程号：操作电脑前把它的窗口最小化，免得挡住目标；0 = 不处理
+    /// 宿主（使驾主程序）进程号：截图时临时隐藏它的窗口（主窗口 / 桌宠），免得挡住画面；0 = 不处理
     pub host_pid: u32,
     pub hide: bool,
     /// 模型能看图（否则截图 / 读图直接报错，不浪费一轮）
@@ -141,8 +141,28 @@ pub fn call(name: &str, a: &Value, o: &Opts) -> Result<Output, String> {
         _ => {
             if name == "desktop_screenshot" && !o.vision { return Err("当前模型没有开启读图（OpenAI 图片输入），无法查看截图".into()); }
             if !cfg!(windows) { return Err("这个操作目前只支持 Windows".into()); }
-            if name != "desktop_windows" { hide_host(o); }
-            win::call(name, a)
+            // 只在截图时临时隐藏使驾自己的窗口（主窗口 / 桌宠人物），截完立即恢复
+            if name == "desktop_screenshot" && o.hide && o.host_pid != 0 {
+                let hidden = win::hide_process_windows(o.host_pid);
+                if !hidden.is_empty() { std::thread::sleep(Duration::from_millis(250)); }
+                let r = win::call(name, a);
+                win::show_windows(&hidden);
+                return r;
+            }
+            // 键鼠 / 打开 / 切窗口：使驾主窗口正在前台时先最小化，免得点到、输入到使驾自己；
+            // 鼠标落点在桌宠等使驾小窗上时，临时隐藏那个小窗
+            if o.hide && o.host_pid != 0 && name != "desktop_windows" {
+                if win::minimize_if_foreground(o.host_pid) > 0 { std::thread::sleep(Duration::from_millis(400)); }
+            }
+            let covered = if name == "desktop_mouse" && o.hide && o.host_pid != 0 {
+                match (a.get("x").and_then(Value::as_f64), a.get("y").and_then(Value::as_f64)) {
+                    (Some(x), Some(y)) => { let (sx, sy) = to_screen(x, y); win::hide_own_at(o.host_pid, sx, sy) }
+                    _ => Vec::new(),
+                }
+            } else { Vec::new() };
+            let r = win::call(name, a);
+            win::show_windows(&covered);
+            r
         }
     }
 }
@@ -292,19 +312,25 @@ fn encode_png(img: image::RgbImage, max: u32) -> Result<(Vec<u8>, u32, u32), Str
 
 // ---------------------------------------------------------------- 宿主窗口
 
-/// 被我们最小化的宿主窗口（操作结束后还原）
+/// 被我们最小化的宿主窗口（旧流程遗留；现在只在截图时临时隐藏，截完即恢复）
 static HIDDEN: Mutex<Vec<isize>> = Mutex::new(Vec::new());
-
-fn hide_host(o: &Opts) {
-    if !o.hide || o.host_pid == 0 { return; }
-    let n = win::minimize_process_windows(o.host_pid);
-    if n > 0 { std::thread::sleep(Duration::from_millis(400)); }
-}
 
 /// 还原被最小化的宿主窗口（需要用户确认前、回合结束时调用）
 pub fn restore_host() {
     let list: Vec<isize> = std::mem::take(&mut *HIDDEN.lock().unwrap_or_else(|p| p.into_inner()));
     win::restore_windows(&list);
+}
+
+/// 截取主屏幕（先临时隐藏 `host_pid` 的窗口）：返回 (PNG base64, 前台窗口描述)。
+/// 同时记为「最近一张截图」，之后 desktop_mouse 的坐标按这张图换算。
+/// 当前前台窗口（不是使驾自己时）的「标题（进程）」描述
+pub fn foreground_window(host_pid: u32) -> String {
+    if cfg!(windows) { win::foreground_desc(host_pid) } else { String::new() }
+}
+
+pub fn snapshot(host_pid: u32) -> Result<(String, String), String> {
+    if !cfg!(windows) { return Err("截屏目前只支持 Windows".into()); }
+    win::snapshot(host_pid)
 }
 
 // ---------------------------------------------------------------- 坐标换算
@@ -526,9 +552,15 @@ mod win {
         unsafe { GetForegroundWindow() == w.h }
     }
 
-    pub fn minimize_process_windows(pid: u32) -> usize {
+    /// 使驾主窗口（有任务栏按钮的普通顶层窗口）在前台时把它最小化（记入 HIDDEN，回合结束 / 弹确认前还原）。
+    /// 桌宠等无任务栏小窗在前台不算：那时用户本来就在别的程序上操作。
+    pub fn minimize_if_foreground(pid: u32) -> usize {
+        let fg = unsafe { GetForegroundWindow() };
+        if fg == 0 { return 0; }
+        let list = windows();
+        if !list.iter().any(|w| w.h == fg && w.pid == pid) { return 0; }
         let mut n = 0;
-        for w in windows() {
+        for w in list {
             if w.pid != pid || w.min { continue; }
             unsafe { ShowWindowAsync(w.h, 6) }; // SW_MINIMIZE
             HIDDEN.lock().unwrap_or_else(|p| p.into_inner()).push(w.h);
@@ -537,8 +569,85 @@ mod win {
         n
     }
 
+    /// 临时隐藏本进程中覆盖屏幕点 (x, y) 的可见窗口（桌宠 / 通知），返回隐藏的句柄
+    pub fn hide_own_at(pid: u32, x: i32, y: i32) -> Vec<isize> {
+        let mut hs: Vec<isize> = Vec::new();
+        unsafe { EnumWindows(collect, &mut hs as *mut Vec<isize> as isize) };
+        let mut out = Vec::new();
+        for h in hs {
+            unsafe {
+                if IsWindowVisible(h) == 0 || IsIconic(h) != 0 { continue; }
+                let mut p = 0u32;
+                GetWindowThreadProcessId(h, &mut p);
+                if p != pid { continue; }
+                let mut r = Rect::default();
+                GetWindowRect(h, &mut r);
+                if x < r.l || x >= r.r || y < r.t || y >= r.b { continue; }
+                ShowWindow(h, 0);
+                out.push(h);
+            }
+        }
+        if !out.is_empty() { std::thread::sleep(Duration::from_millis(120)); }
+        out
+    }
+
     pub fn restore_windows(list: &[isize]) {
-        for &h in list { unsafe { ShowWindowAsync(h, 9) }; } // SW_RESTORE
+        for &h in list { unsafe { ShowWindowAsync(h, 4) }; } // SW_SHOWNOACTIVATE：还原但不抢前台
+    }
+
+    /// 截图前临时隐藏本进程所有可见、未最小化的顶层窗口（含无任务栏的桌宠 / 通知窗口）
+    pub fn hide_process_windows(pid: u32) -> Vec<isize> {
+        let mut hs: Vec<isize> = Vec::new();
+        unsafe { EnumWindows(collect, &mut hs as *mut Vec<isize> as isize) };
+        let mut out = Vec::new();
+        for h in hs {
+            unsafe {
+                if IsWindowVisible(h) == 0 || IsIconic(h) != 0 { continue; }
+                let mut p = 0u32;
+                GetWindowThreadProcessId(h, &mut p);
+                if p != pid { continue; }
+                ShowWindow(h, 0); // SW_HIDE
+                out.push(h);
+            }
+        }
+        out
+    }
+
+    pub fn show_windows(list: &[isize]) {
+        for &h in list { unsafe { ShowWindowAsync(h, 8) }; } // SW_SHOWNA：原样显示、不抢焦点
+    }
+
+    pub fn foreground_desc(own: u32) -> String {
+        unsafe {
+            let h = GetForegroundWindow();
+            if h == 0 { return String::new(); }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(h, &mut pid);
+            if pid == own { return String::new(); }
+            let mut buf = [0u16; 512];
+            let n = GetWindowTextW(h, buf.as_mut_ptr(), buf.len() as i32);
+            let title = if n > 0 { String::from_utf16_lossy(&buf[..n as usize]) } else { String::new() };
+            let exe = exe_name(pid);
+            match (title.is_empty(), exe.is_empty()) {
+                (false, false) => format!("「{title}」（{exe}）"),
+                (false, true) => format!("「{title}」"),
+                (true, false) => exe,
+                _ => String::new(),
+            }
+        }
+    }
+
+    pub fn snapshot(pid: u32) -> Result<(String, String), String> {
+        dpi_aware();
+        let desc = foreground_desc(pid);
+        let hidden = hide_process_windows(pid);
+        if !hidden.is_empty() { std::thread::sleep(Duration::from_millis(250)); }
+        let (w, h) = unsafe { (GetSystemMetrics(0), GetSystemMetrics(1)) };
+        let r = capture(0, 0, w, h).and_then(|img| encode_png(img, 1600));
+        show_windows(&hidden);
+        let (png, pw, _) = r?;
+        *LAST.lock().unwrap_or_else(|p| p.into_inner()) = Some(Geo { ox: 0, oy: 0, scale: pw as f64 / w.max(1) as f64 });
+        Ok((b64(&png), desc))
     }
 
     fn capture(x: i32, y: i32, w: i32, h: i32) -> Result<image::RgbImage, String> {
@@ -721,8 +830,13 @@ mod win {
 mod win {
     use super::*;
     pub fn call(_name: &str, _a: &Value) -> Result<Output, String> { Err("这个操作目前只支持 Windows".into()) }
-    pub fn minimize_process_windows(_pid: u32) -> usize { 0 }
     pub fn restore_windows(_list: &[isize]) {}
+    pub fn minimize_if_foreground(_pid: u32) -> usize { 0 }
+    pub fn hide_own_at(_pid: u32, _x: i32, _y: i32) -> Vec<isize> { Vec::new() }
+    pub fn hide_process_windows(_pid: u32) -> Vec<isize> { Vec::new() }
+    pub fn show_windows(_list: &[isize]) {}
+    pub fn snapshot(_pid: u32) -> Result<(String, String), String> { Err("截屏目前只支持 Windows".into()) }
+    pub fn foreground_desc(_own: u32) -> String { String::new() }
 }
 
 #[cfg(test)]

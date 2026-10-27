@@ -1061,8 +1061,8 @@ pub(crate) fn run_exec(command: &str, dir: &Path, timeout: u64, max_chars: usize
     }
     let (stdout_raw, stdout_dropped) = out_handle.join().unwrap_or((Vec::new(), 0));
     let (stderr_raw, stderr_dropped) = err_handle.join().unwrap_or((Vec::new(), 0));
-    let stdout_txt = String::from_utf8_lossy(&stdout_raw);
-    let stderr_txt = String::from_utf8_lossy(&stderr_raw);
+    let stdout_txt = crate::engine::decode_output(&stdout_raw);
+    let stderr_txt = crate::engine::decode_output(&stderr_raw);
     let trunc_note = |dropped: u64| if dropped > 0 { format!("（另有 {dropped} 字节超限丢弃）") } else { String::new() };
     let cut = |s: &str| -> String {
         if s.chars().count() > max_chars {

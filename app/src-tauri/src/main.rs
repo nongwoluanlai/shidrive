@@ -26,6 +26,7 @@ mod node_rt;
 mod setup;
 mod skins;
 mod toast;
+mod pet;
 mod web;
 
 use std::sync::Arc;
@@ -217,8 +218,9 @@ fn main() {
             }
             // 托盘常驻：左键恢复主窗，右键菜单 打开主页面 / 退出
             let open = MenuItem::with_id(app, "open", "打开主页面", true, None::<&str>)?;
+            let pet = MenuItem::with_id(app, "pet", "桌宠助手", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let menu = Menu::with_items(app, &[&open, &pet, &quit])?;
             // 托盘用独立的 32px 原生渲染图标：默认图标是 128px，被系统缩到
             // 16/20px 会产生锯齿；32px 原生绘制在小尺寸下边缘干净得多
             let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
@@ -229,6 +231,7 @@ fn main() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => show_main_window(app),
+                    "pet" => { use tauri::Emitter; let _ = app.emit("pet://summon", ()); }
                     "quit" => graceful_exit(app),
                     _ => {}
                 })
@@ -251,6 +254,7 @@ fn main() {
             std::fs::create_dir_all(&data_dir).ok();
             let db_path = data_dir.join("shidrive.db");
             let db = Arc::new(db::Db::open(&db_path).map_err(|e| format!("打开数据库失败: {e}"))?);
+            if let Ok(n) = db.reset_running_bindings() { if n > 0 { log::info!("重置 {n} 个上次未正常结束的会话状态"); } }
 
             crate::glog::init(app.handle().clone());
             crate::glog::info("app", format!("ShiDrive v{} 已启动", env!("CARGO_PKG_VERSION")));
@@ -285,6 +289,12 @@ fn main() {
             // 关闭即隐藏到托盘，保持后台运行（MCP / 定时工作流不中断）
             // 仅主窗口：通知弹窗（toast-*）按正常流程销毁
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // 桌宠被 Alt+F4 关掉：只隐藏，并通知主窗口（否则主窗口以为桌宠还开着）
+                if window.label() == crate::pet::LABEL {
+                    api.prevent_close();
+                    crate::pet::hide(window.app_handle());
+                    return;
+                }
                 if window.label() != "main" {
                     return;
                 }
@@ -293,6 +303,10 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            pet::pet_show,
+            pet::pet_hide,
+            pet::pet_open_main,
+            pet::pet_regions,
             commands::projects_list,
             commands::projects_create,
             commands::projects_update,

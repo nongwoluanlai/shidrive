@@ -2,7 +2,7 @@
   import Icon from "./Icon.svelte";
   import { tick, untrack } from "svelte";
   import { prepareImage, MAX_IMAGES } from "../images";
-  import { app, chatKey, currentContext, finishTurn, setChatRows, pushLocal, toast, clearChat, sharedContextPrompt, switchAgent, loadChatLocal, saveCfgPref, fullAccessDefault, touchChat, nextId, adoptBinding, invalidateBindingRead, addDraftImage, clearDraftImages } from "../state.svelte";
+  import { app, chatKey, currentContext, finishTurn, setChatRows, pushLocal, toast, clearChat, sharedContextPrompt, switchAgent, loadChatLocal, saveCfgPref, clearCfgPref, fullAccessDefault, touchChat, nextId, adoptBinding, invalidateBindingRead, addDraftImage, clearDraftImages } from "../state.svelte";
 import { confirmDialog, promptDialog } from "../dialog.svelte";
   import { api } from "../ipc";
   import { emitSkinEvent } from "../skin-fx/bus";
@@ -880,8 +880,14 @@ import type { DisplayItem } from "../state.svelte";
   async function stop() {
     if (!ctx) return;
     try {
-      await api.acpCancel(ctx.id, app.agent);
-      toast("info", t("已发送取消请求"));
+      const running = await api.acpCancel(ctx.id, app.agent);
+      if (running) {
+        toast("info", t("已发送取消请求"));
+      } else {
+        // 后端已无进行中的回合（适配器断开/重启后残留的状态）：直接复位界面
+        finishTurn(app.agent, ctx.id);
+        toast("info", t("会话已不在运行，已复位状态"));
+      }
     } catch (e) {
       toast("error", String(e));
     }
@@ -1056,11 +1062,15 @@ import type { DisplayItem } from "../state.svelte";
     const agent = app.agent, cfgKey = key, contextId = ctx?.id, sid = sessionId;
     if (sessionBusy || loadingHere) return;
     if (cfgItems.find((x) => x.id === id)?.placeholder) return;
+    // 失败时回滚用：必须在写入新偏好之前取旧值
+    const prevPref = app.cfgPref[`${agent}:${id}`];
     // 记住用户选择：跨会话/重启生效（session-ready 后自动回放）
     saveCfgPref(agent, id, value);
     // 回传适配器原始值（dsh 的复合数组值不能压成逗号串）
-    const raw = cfgItems.find((x) => x.id === id)?.options.find((o) => o.value === value)?.raw;
+    const item = cfgItems.find((x) => x.id === id);
+    const raw = item?.options.find((o) => o.value === value)?.raw;
     const send = raw !== undefined ? raw : value;
+    const prevValue = item?.value;
     // 更新本地显示（无论是否已有会话）
     if (id === "model" && sessionInfo?.response?.models) sessionInfo.response.models.currentModelId = value;
     if (sessionInfo?.response?.configOptions) {
@@ -1080,7 +1090,18 @@ import type { DisplayItem } from "../state.svelte";
       .then(() => toast("ok", t("已应用")))
       .catch((e) => {
         const msg = String(e);
-        if (msg.includes("-32602") || msg.includes("Invalid params")) {
+        // 适配器拒绝了切换：界面与记忆回滚到原值，避免显示一个实际没生效的选项
+        const live = app.sessionInfo[cfgKey];
+        if (prevValue !== undefined && live?.response && app.chatSession[cfgKey] === sid) {
+          if (id === "model" && live.response.models) live.response.models.currentModelId = prevValue;
+          const opt = live.response.configOptions?.find((o) => o.id === id);
+          if (opt) opt.currentValue = prevValue;
+        }
+        if (prevPref !== undefined) saveCfgPref(agent, id, prevPref);
+        else clearCfgPref(agent, id);
+        if (agent === "zcode" && id === "model" && msg.includes("switch failed")) {
+          toast("error", t("切换模型失败：当前 ZCode 适配器版本较旧，恢复的历史会话无法切换到第三方模型。请到「设置 → Agent 管理 → ZCode」点「更新适配器」后重新连接。"));
+        } else if (msg.includes("-32602") || msg.includes("Invalid params")) {
           // 会话真实列表与界面不一致（caps 缓存过期/会话列表变化）：
           // 清掉缓存，重连后拿适配器真实列表
           delete app.agentCaps[agent];

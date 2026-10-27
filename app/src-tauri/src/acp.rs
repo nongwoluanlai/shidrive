@@ -91,6 +91,8 @@ struct TurnBuffer {
     text: String,
     thought: String,
     tools: Vec<Value>,
+    /// Wakes the prompt owner when the adapter never answers a cancellation.
+    abort: Arc<tokio::sync::Notify>,
 }
 
 pub struct AcpConnection {
@@ -972,6 +974,23 @@ impl AcpConnection {
 
     pub fn has_active_turn(&self, session_id: &str) -> bool {
         self.buffers.lock().unwrap().contains_key(session_id)
+    }
+
+    pub fn active_turn_id(&self, session_id: &str) -> Option<String> {
+        self.buffers.lock().unwrap().get(session_id).map(|b| b.turn_id.clone())
+    }
+
+    /// Notified when the turn must stop waiting for the adapter's prompt reply.
+    pub fn turn_abort_signal(&self, session_id: &str, turn_id: &str) -> Option<Arc<tokio::sync::Notify>> {
+        self.buffers.lock().unwrap().get(session_id).filter(|b| b.turn_id == turn_id).map(|b| b.abort.clone())
+    }
+
+    /// Give up on an adapter that ignored session/cancel; returns false if the turn already ended.
+    pub fn force_abort_turn(&self, session_id: &str, turn_id: &str) -> bool {
+        match self.buffers.lock().unwrap().get(session_id).filter(|b| b.turn_id == turn_id) {
+            Some(b) => { b.abort.notify_one(); true }
+            None => false,
+        }
     }
 
     /// The manager holds the (connection, session) lock. Refuse overwrite even if a

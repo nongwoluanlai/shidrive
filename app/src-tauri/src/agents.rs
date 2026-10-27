@@ -567,6 +567,16 @@ fn adapter_script_in(nm: &std::path::Path, npm_pkg: &str) -> Option<PathBuf> {
     }
 }
 
+/// 已安装的 npm 适配器版本（package.json 的 version），用于界面提示旧版可更新。
+/// 与 adapter_script 取同一个根（脚本实际存在的那份安装）。
+pub fn adapter_version(tools: &Tools, npm_pkg: &str) -> Option<String> {
+    acp_roots(tools).iter().filter(|root| adapter_script_in(root, npm_pkg).is_some()).find_map(|root| {
+        let raw = std::fs::read_to_string(root.join(npm_pkg).join("package.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        v.get("version")?.as_str().map(str::to_owned)
+    })
+}
+
 /// DeepSeek 只启动独立目录中经 ACP 建会话验证的版本，避免旧版
 /// .tools/acp 中的残缺 dsh 抢占新安装。手动命令覆盖仍由 manager 单独处理。
 pub fn adapter_script(tools: &Tools, npm_pkg: &str) -> Option<PathBuf> {
@@ -853,6 +863,9 @@ pub struct AgentEnvStatus {
     /// 适配器脚本是否就绪（npm 已装 / 二进制命令可解析）
     pub adapter_ready: bool,
     pub adapter_path: String,
+    /// npm 适配器已安装版本
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_version: Option<String>,
     /// 手动覆盖的命令（settings agent.<id>）
     pub manual_command: String,
     pub node_ready: bool,
@@ -943,6 +956,7 @@ pub fn registry_status(db: &Arc<Db>, tools: &Tools) -> Vec<AgentEnvStatus> {
                 npm: sp.npm.clone(),
                 help: sp.help.clone(),
                 enabled: enabled.iter().any(|e| e == &sp.id),
+                adapter_version: if adapter_ready && sp.id != "deepseek" { sp.npm.as_deref().and_then(|p| adapter_version(tools, p)) } else { None },
                 adapter_ready,
                 adapter_path,
                 manual_command: manual,

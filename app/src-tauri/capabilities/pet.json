@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "pet",
+  "description": "桌宠助手窗口（pet）：核心 IPC + 拖动窗口",
+  "windows": ["pet"],
+  "permissions": ["core:default", "core:window:allow-start-dragging"]
+}

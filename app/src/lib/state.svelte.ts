@@ -434,6 +434,10 @@ export function saveCfgPref(agent: string, cfgId: string, value: string) {
   app.cfgPref[`${agent}:${cfgId}`] = value;
   void api.settingsSet(CFG_PREF_KEY, JSON.stringify(app.cfgPref)).catch(() => {});
 }
+export function clearCfgPref(agent: string, cfgId: string) {
+  delete app.cfgPref[`${agent}:${cfgId}`];
+  void api.settingsSet(CFG_PREF_KEY, JSON.stringify(app.cfgPref)).catch(() => {});
+}
 /** 该配置项的"完全访问"类选项值（各适配器叫法不同，取交集语义）。 */
 const FULL_ACCESS_VALUES = new Set(["danger-full-access", "agent-full-access", "yolo", "bypasspermissions"]);
 /** 按 cfgId 匹配偏好的完全访问值（找不到返回 undefined 表示不适用）。 */

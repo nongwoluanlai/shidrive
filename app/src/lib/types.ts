@@ -28,6 +28,7 @@ export interface AgentEnvStatusItem {
   enabled: boolean;
   adapter_ready: boolean;
   adapter_path: string;
+  adapter_version?: string | null;
   manual_command: string;
   node_ready: boolean;
   node_path: string;
@@ -481,7 +482,10 @@ export interface AssistantConfig {
   /** 电脑操作（仅 API 模式）：终端、打开程序、窗口、截图 / 读图、鼠标键盘 */
   desktop_tools: boolean;
   desktop_confirm: boolean;
+  /** 截图时临时隐藏使驾窗口与桌宠人物 */
   desktop_hide: boolean;
+  /** 唤醒时使驾不在前台：右下角浮出桌宠人物 */
+  pet_mode: boolean;
   /** 模型支持读图（OpenAI image_url base64） */
   vision: boolean;
 }

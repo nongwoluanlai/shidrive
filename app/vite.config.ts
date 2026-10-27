@@ -20,12 +20,13 @@ export default defineConfig({
     minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
     // 多入口：index.html = 桌面端；web.html = 网站接入（由 Rust 内置 Web 服务从打包资源中提供）；
-    // toast.html = 使驾自有通知弹窗（toast-* 窗口）
+    // toast.html = 使驾自有通知弹窗（toast-* 窗口）；pet.html = 桌宠助手（pet 窗口）
     rollupOptions: {
       input: {
         main: fileURLToPath(new URL("./index.html", import.meta.url)),
         web: fileURLToPath(new URL("./web.html", import.meta.url)),
         toast: fileURLToPath(new URL("./toast.html", import.meta.url)),
+        pet: fileURLToPath(new URL("./pet.html", import.meta.url)),
       },
     },
   },
