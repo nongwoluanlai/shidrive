@@ -5,8 +5,8 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { api } from "../ipc";
 import { app } from "../state.svelte";
 import { ga, pet, conv, enabled, persona, send, cancel, visibleText, subText, openComposer } from "./store.svelte";
-import { vc, inputEnabled, listenOnce, stopCapture, stopSpeaking } from "./voice.svelte";
-import { endConversation, startConversation } from "./conv.svelte";
+import { vc, inputEnabled, stopSpeaking } from "./voice.svelte";
+import { endConversation } from "./conv.svelte";
 
 export interface PetState {
   skin: string;
@@ -29,7 +29,6 @@ export interface PetState {
 export type PetCmd =
   | { kind: "ready" }
   | { kind: "send"; text: string }
-  | { kind: "mic" }
   | { kind: "stop" }
   | { kind: "close" }
   | { kind: "open-main" }
@@ -55,6 +54,8 @@ export async function showPet(focus = false) {
 
 export function hidePet() {
   if (!pet.active) return;
+  petReady = false;
+  listenAfterReady = false;
   pet.active = false;
   endConversation();
   void api.petHide().catch(() => {});
@@ -93,25 +94,19 @@ function push() {
   void emit("pet://state", s).catch(() => {});
 }
 
-async function mic() {
-  if (vc.recording) { stopCapture(true); return; }
-  if (vc.transcribing || !inputEnabled()) return;
-  try {
-    const text = (await listenOnce()).trim();
-    if (text) await send(text, true);
-  } catch (e) {
-    ga.bubble = { ...ga.bubble, visible: true, pages: [], index: 0, error: e instanceof Error ? e.message : String(e), rev: ga.bubble.rev + 1 };
-  }
-}
-
+let petReady = false;
 function onCmd(c: PetCmd) {
   switch (c.kind) {
-    case "ready": last = ""; push(); break;
+    case "ready":
+      petReady = true;
+      last = "";
+      push();
+      if (listenAfterReady) { listenAfterReady = false; void emit("pet://listen", null).catch(() => {}); }
+      break;
     case "send": if (c.text.trim() && !ga.busy) { if (conv.active) endConversation(); void send(c.text, true); } break;
-    case "mic": void mic(); break;
     case "stop": endConversation(); stopSpeaking(); void cancel(); break;
     case "close": hidePet(); break;
-    case "hidden": pet.active = false; endConversation(); break;
+    case "hidden": pet.active = false; petReady = false; listenAfterReady = false; endConversation(); break;
     case "open-main":
       pet.active = false;
       endConversation();
@@ -121,14 +116,17 @@ function onCmd(c: PetCmd) {
   }
 }
 
-/** 桌宠里唤醒（或托盘「桌宠助手」）：显示并开始听 / 打开输入 */
+/** 桌宠里唤醒（或托盘「桌宠助手」）：显示并让桌宠自己开始听（录音在桌宠窗口里，主窗口可藏着） */
+/** 桌宠页面就绪前到达的「开始听」（首次唤出窗口时页面还在加载，直接发会丢） */
+let listenAfterReady = false;
+
 export async function summonPet(fromWake: boolean) {
   await showPet(!fromWake || !inputEnabled());
-  if (!fromWake) return;
-  const cfg = vc.view?.config;
-  if (!inputEnabled() || cfg?.wake_action === "open") return;
-  if (cfg?.wake_multiturn) { void startConversation("wake"); return; }
-  void mic();
+  if (!fromWake || !inputEnabled()) return;
+  if (vc.view?.config.wake_action === "open") return;
+  // 连续对话循环在桌宠窗口里接续；主窗口的 conv 循环在隐藏窗口里录音会挂起，这里不再启动
+  listenAfterReady = true;
+  if (petReady) void emit("pet://listen", null).catch(() => {});
 }
 
 /** 主窗口挂载时调用一次；返回清理函数 */

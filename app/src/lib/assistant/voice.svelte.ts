@@ -538,6 +538,9 @@ export async function captureSpeech(maxSeconds: number, idleSeconds = 8): Promis
     throw new Error(`${t("无法使用麦克风")}：${e instanceof Error ? e.message : e}`);
   }
   const ac = new AudioContext();
+  // 隐藏窗口里新建的 AudioContext 常处于 suspended（onaudioprocess 永远不来）：先尝试恢复，
+  // 恢复不了靠下面的看门狗兜底，绝不能让录音悬死
+  if (ac.state === "suspended") await Promise.race([ac.resume().catch(() => {}), sleep(600)]);
   const source = ac.createMediaStreamSource(stream);
   const proc = ac.createScriptProcessor(4096, 1, 1);
   const mute = ac.createGain();
@@ -556,9 +559,12 @@ export async function captureSpeech(maxSeconds: number, idleSeconds = 8): Promis
   vc.level = 0;
   return new Promise<string | null>((resolve) => {
     let done = false;
+    // 看门狗：2.5 秒还没收到任何音频帧（上下文被挂起 / 采集失败）就放弃，不无限等
+    const watchdog = setTimeout(() => { if (frames === 0) finish(false); }, 2500);
     const finish = (keep: boolean) => {
       if (done) return;
       done = true;
+      clearTimeout(watchdog);
       stopHandle = null;
       proc.onaudioprocess = null;
       try { proc.disconnect(); source.disconnect(); mute.disconnect(); } catch { /* ignore */ }
@@ -574,6 +580,7 @@ export async function captureSpeech(maxSeconds: number, idleSeconds = 8): Promis
     stopHandle = finish;
     proc.onaudioprocess = (e) => {
       const d = new Float32Array(e.inputBuffer.getChannelData(0));
+      clearTimeout(watchdog);
       chunks.push(d);
       total += d.length;
       let sum = 0;

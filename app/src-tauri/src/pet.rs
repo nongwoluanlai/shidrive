@@ -52,7 +52,7 @@ pub fn summon_foreground() -> String {
 
 pub fn show(app: &AppHandle, focus: bool) -> Result<(), String> {
     let fg = crate::desktop::foreground_window(std::process::id());
-    if !fg.is_empty() { *SUMMON_FG.lock().unwrap_or_else(|p| p.into_inner()) = fg; }
+    if !fg.is_empty() { *SUMMON_FG.lock().unwrap_or_else(|p| p.into_inner()) = fg.clone(); }
     if let Some(w) = app.get_webview_window(LABEL) {
         let _ = w.show();
         let _ = w.set_always_on_top(true);
@@ -74,6 +74,8 @@ pub fn show(app: &AppHandle, focus: bool) -> Result<(), String> {
         }
         None => (40.0, 40.0),
     };
+    let fg_desc = fg.clone();
+    log::info!("[pet] 唤出桌宠窗口（focus={focus}，唤出时前台：{fg_desc}）");
     WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("pet.html".into()))
         .title("使驾助手")
         .inner_size(WIDTH, HEIGHT)
@@ -89,7 +91,8 @@ pub fn show(app: &AppHandle, focus: bool) -> Result<(), String> {
         .shadow(false)
         .additional_browser_args(crate::WEBVIEW_ARGS)
         .build()
-        .map_err(|e| format!("桌宠窗口创建失败: {e}"))?;
+        .map_err(|e| { log::warn!("[pet] 桌宠窗口创建失败: {e}"); format!("桌宠窗口创建失败: {e}") })?;
+    log::info!("[pet] 桌宠窗口已创建");
     watch_cursor(app.clone());
     Ok(())
 }
@@ -99,8 +102,9 @@ pub fn hide(app: &AppHandle) {
     let _ = app.emit("pet://hidden", ());
 }
 
+/// 必须是 async：同步命令在主线程执行，而在主线程里同步创建 WebView 会卡死事件循环
 #[tauri::command]
-pub fn pet_show(app: AppHandle, focus: Option<bool>) -> Result<(), String> { show(&app, focus.unwrap_or(false)) }
+pub async fn pet_show(app: AppHandle, focus: Option<bool>) -> Result<(), String> { show(&app, focus.unwrap_or(false)) }
 
 #[tauri::command]
 pub fn pet_hide(app: AppHandle) { hide(&app) }

@@ -720,7 +720,9 @@ const TAG_REMINDER_FULL: &str = "[输出格式] 要说给用户听的话逐句�
 const TAG_REMINDER: &str = "[输出格式] 先写 1~3 行 [[字幕: …]]（你说出口的简短台词），再写正文；简短闲聊可以只写字幕。";
 
 fn state_line(app_state: Option<&str>, cfg: &AssistantConfig) -> String {
-    let t = chrono::Local::now().format("%Y-%m-%d %H:%M %a").to_string();
+    const WEEK: [&str; 7] = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+    let now = chrono::Local::now();
+    let t = format!("{} {} {}", now.format("%Y-%m-%d"), WEEK[now.format("%u").to_string().parse::<usize>().map(|d| d % 7).unwrap_or(7)], now.format("%H:%M"));
     match app_state.map(str::trim).filter(|s| !s.is_empty() && cfg.share_app_state) {
         Some(st) => format!("[当前状态] 时间 {t} · {}", cap_chars(st, 400)),
         None => format!("[当前状态] 时间 {t}"),
@@ -2214,6 +2216,19 @@ pub async fn assistant_models(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn state_line_has_local_datetime_and_weekday() {
+        let mut cfg = AssistantConfig::default();
+        let line = state_line(Some("项目 X"), &cfg);
+        assert!(line.contains("[当前状态]"), "{line}");
+        assert!(line.contains("周"), "{line}");
+        assert!(line.contains("· 项目 X"), "{line}");
+        cfg.share_app_state = false;
+        let line2 = state_line(Some("项目 X"), &cfg);
+        assert!(!line2.contains("项目 X"), "{line2}");
+        assert!(line2.contains("周"), "{line2}");
+    }
+
     use super::*;
 
     fn db() -> Db { Db::open(std::path::Path::new(":memory:")).unwrap() }

@@ -12,6 +12,8 @@
   import { loadSkinMotion } from "../lib/skin-fx/motion.svelte";
   import { emitSkinEvent, onSkinEvent } from "../lib/skin-fx/bus";
   import SkinCharacter from "../lib/components/SkinCharacter.svelte";
+  // 麦克风在桌宠窗口里开（可见窗口的 AudioContext 才能运行；主窗口藏进托盘后录音会挂起）
+  import { vc, listenOnce, stopCapture, refreshVoice } from "../lib/assistant/voice.svelte";
   import type { PetCmd, PetState } from "../lib/assistant/pet.svelte";
   import logo from "../assets/logo.png";
 
@@ -25,7 +27,7 @@
   $effect(() => activateSkin(app.skin, () => { app.skin = ""; }));
 
   const status = $derived(
-    !st ? "" : st.recording ? t("正在听…") : st.transcribing ? t("识别中…") : st.thinking ? t("思考中…") : st.busy ? t("回复中…") : st.speaking ? t("朗读中…") : "",
+    !st ? "" : vc.recording ? t("正在听…") : vc.transcribing ? t("识别中…") : st.thinking ? t("思考中…") : st.busy ? t("回复中…") : st.speaking ? t("朗读中…") : "",
   );
   const showBubble = $derived(!!st && (!!st.text || !!st.error || st.thinking));
 
@@ -37,6 +39,45 @@
     if (!b && prevBusy) emitSkinEvent(st?.error ? "agent.error" : "agent.done");
     prevBusy = b;
   });
+
+  /** 自动接续：唤醒后的语音轮——听完发送、等回复说完再听，直到没听清或用户停止 */
+  let autoTalk = $state(false);
+  let autoGen = 0;
+  async function startListen(auto = false) {
+    if (vc.recording) { stopCapture(true); return; }
+    if (vc.transcribing || st?.busy) return;
+    if (auto) autoTalk = true;
+    const my = ++autoGen;
+    let text = "";
+    try {
+      text = (await listenOnce(auto ? 8 : 10)).trim();
+    } catch (e) {
+      autoTalk = false;
+      st = st ? { ...st, error: e instanceof Error ? e.message : String(e) } : st;
+      return;
+    }
+    if (my !== autoGen) return;
+    if (!text) { autoTalk = false; return; }
+    emitSkinEvent("message.send");
+    cmd({ kind: "send", text });
+  }
+  // 回复（和朗读）结束且处于自动接续：接着听下一轮
+  let wasBusy = false;
+  $effect(() => {
+    const busy = !!st?.busy || !!st?.speaking;
+    if (wasBusy && !busy && autoTalk && !vc.recording && !vc.transcribing) {
+      const id = setTimeout(() => { if (autoTalk && !st?.busy && !st?.speaking) void startListen(true); }, 400);
+      wasBusy = busy;
+      return () => clearTimeout(id);
+    }
+    wasBusy = busy;
+  });
+  function stopAll() {
+    autoTalk = false;
+    autoGen++;
+    if (vc.recording || vc.transcribing) stopCapture(true);
+    cmd({ kind: "stop" });
+  }
 
   function openInput() {
     composing = true;
@@ -89,7 +130,9 @@
     void loadSkinMotion();
     const regionTimer = setInterval(reportRegions, 300);
     void api.settingsGet("ui.skin").then((s) => { if (st === null) app.skin = s ?? ""; }).catch(() => {});
+    void refreshVoice();
     const offs = [
+      listen("pet://listen", () => { void tick().then(() => void startListen(true)); }),
       listen<PetState>("pet://state", (e) => {
         st = e.payload;
         if (app.skin !== e.payload.skin) app.skin = e.payload.skin;
@@ -135,10 +178,10 @@
         <button class="b grow" type="button" onclick={openInput}>{status || t("问问屏幕上的内容…")}</button>
       {/if}
       {#if st?.voiceIn}
-        <button class="b mic" class:rec={st.recording} type="button" style="--lv:{st.level}" disabled={st.transcribing || (st.busy && !st.recording)} title={t("语音输入")} aria-label={t("语音输入")} onclick={() => cmd({ kind: "mic" })}>🎙</button>
+        <button class="b mic" class:rec={vc.recording} type="button" style="--lv:{vc.level}" disabled={vc.transcribing || (st?.busy && !vc.recording)} title={t("语音输入")} aria-label={t("语音输入")} onclick={() => void startListen(false)}>🎙</button>
       {/if}
-      {#if st?.busy || st?.speaking || st?.conv}
-        <button class="b" type="button" title={t("停止")} aria-label={t("停止")} onclick={() => cmd({ kind: "stop" })}>■</button>
+      {#if st?.busy || st?.speaking || st?.conv || vc.recording || autoTalk}
+        <button class="b" type="button" title={t("停止")} aria-label={t("停止")} onclick={stopAll}>■</button>
       {/if}
       <button class="b" type="button" title={t("打开使驾")} aria-label={t("打开使驾")} onclick={() => cmd({ kind: "open-main" })}>⤢</button>
       <button class="b" type="button" title={t("收起")} aria-label={t("收起")} onclick={() => cmd({ kind: "close" })}>×</button>
