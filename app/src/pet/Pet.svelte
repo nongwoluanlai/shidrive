@@ -120,7 +120,9 @@
   // 只有气泡、输入条、人物区域接收鼠标，窗口其余透明部分点击穿透到下面的程序
   let lastRegions = "";
   function reportRegions() {
-    const els = [".bubble", ".dock .bar", ".avatar", ".skin-scene", ".skin-scene-static", ".skin-character"];
+    // 注意不要把 .skin-scene / .skin-character（人物舞台）算进来：它铺满整窗，
+    // 一旦算进可交互区就几乎永远不穿透了。人物不再可点（输入框右边的按钮等效）。
+    const els = [".bubble", ".dock .bar", ".dock .hint", ".avatar"];
     const rects: number[][] = [];
     for (const sel of els) {
       for (const el of document.querySelectorAll(sel)) {
