@@ -79,6 +79,14 @@
     cmd({ kind: "stop" });
   }
 
+  /** 输入框随内容长高（不出现滚动条，最多 4 行） */
+  function autosize() {
+    const el = inputEl;
+    if (!el) return;
+    el.style.height = "28px";
+    el.style.height = `${Math.min(80, Math.max(28, el.scrollHeight))}px`;
+  }
+
   function openInput() {
     composing = true;
     void tick().then(() => inputEl?.focus());
@@ -172,7 +180,7 @@
     <div class="bar">
       <span class="drag" data-tauri-drag-region title={t("拖动")}>⋮⋮</span>
       {#if composing}
-        <textarea bind:this={inputEl} bind:value={input} rows="1" placeholder={t("问问屏幕上的内容…")} onkeydown={onKey}></textarea>
+        <textarea bind:this={inputEl} bind:value={input} rows="1" placeholder={t("问问屏幕上的内容…")} onkeydown={onKey} oninput={autosize}></textarea>
         <button class="b primary" type="button" disabled={!input.trim() || st?.busy} onclick={submit}>{t("发送")}</button>
       {:else}
         <button class="b grow" type="button" onclick={openInput}>{status || t("问问屏幕上的内容…")}</button>

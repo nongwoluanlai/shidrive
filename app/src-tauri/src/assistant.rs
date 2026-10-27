@@ -717,7 +717,7 @@ fn layer_rule(sub: SubMode) -> String {
 
 /// ACP 每轮附带的格式提醒（设定只在首轮注入，长对话里容易忘）
 const TAG_REMINDER_FULL: &str = "[输出格式] 要说给用户听的话逐句全部写成 [[字幕: …]]（一句一行、不限条数、完整讲完），正文只放需要看的内容。";
-const TAG_REMINDER: &str = "[输出格式] 先写 1~3 行 [[字幕: …]]（你说出口的简短台词），再写正文；简短闲聊可以只写字幕。";
+const TAG_REMINDER: &str = "[输出格式] 用户只会听到、看到 [[字幕: …]]——它就是你的回复本体：把要说的要点按顺序拆成几条字幕（每条一句短句）讲完。正文只是留给用户备查的记录（类似日志，可省略）：放细节、代码、链接，不要在正文里复述字幕；简短闲聊只写字幕、不写正文。";
 
 fn state_line(app_state: Option<&str>, cfg: &AssistantConfig) -> String {
     const WEEK: [&str; 7] = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
@@ -805,7 +805,7 @@ fn subtitle_voice_rule(h: &SpeechHint, sub: SubMode) -> Option<String> {
 所以字幕只说一句开场或态度（不要概括正文），要讲的内容（笑话、故事、解释、步骤）直接在正文里完整讲完；正文用适合朗读的口语短句，\
 少用 Markdown 记号、列表、表格和表情符号，不要在正文里重复字幕{zh}。简短闲聊可以只写字幕。"));
     }
-    Some(format!("[语音输出已开启] 字幕会被朗读（正文不朗读）：字幕用自然口语的短句（每条不超过 20 字，英文不超过 12 个词），第一条尽快给出；字幕里不要放 Markdown、表情符号和代码{zh}。"))
+    Some(format!("[语音输出已开启] 只有字幕会被朗读，正文不会被朗读、用户也很少看：要以字幕为主要交流方式，把要说的内容拆成多条自然口语的短句（每条不超过 20 字，英文不超过 12 个词，第一条尽快给出），按顺序把要点讲完；字幕里不要放 Markdown、表情符号和代码。正文只是备查记录（像日志），没有就不写{zh}。"))
 }
 
 fn voice_rule(h: &SpeechHint) -> Option<String> {
@@ -1005,7 +1005,7 @@ fn say_tool(speech_lang: Option<&str>) -> Value {
         "type": "function",
         "function": {
             "name": "say",
-            "description": "在桌面角色旁的气泡里显示一句字幕（开启语音时会朗读）。可以多次调用，每次一句。完整回答请直接写在回复正文里。",
+            "description": "在桌面角色旁的气泡里显示一句字幕（开启语音时会朗读）——这是用户实际看到 / 听到的内容。可以多次调用、每次一句，把要说的内容按顺序用字幕讲完；回复正文只是备查记录，不要在正文里复述字幕。",
             "parameters": { "type": "object", "properties": props, "required": required }
         }
     }])
@@ -2269,7 +2269,7 @@ mod tests {
         let full = speech_rule(Some(&SpeechHint { enabled: true, lang: "zh".into(), full: true, ..Default::default() }), SubMode::Tag).unwrap();
         assert!(full.contains("完整朗读") && full.contains("正文里完整讲完"));
         let part = speech_rule(Some(&SpeechHint { enabled: true, lang: "zh".into(), ..Default::default() }), SubMode::Tag).unwrap();
-        assert!(part.contains("正文不朗读") && !part.contains("完整朗读"));
+        assert!(part.contains("正文不会被朗读") && part.contains("主要交流方式") && !part.contains("完整朗读"));
         let ja_full = speech_rule(Some(&SpeechHint { enabled: true, lang: "ja".into(), layer: true, full: true, ..Default::default() }), SubMode::Tool).unwrap();
         assert!(ja_full.contains("逐句全部写成字幕") && ja_full.contains("speech 参数"));
         assert_eq!(extract_flags("好，那先这样。\n[[结束对话]]"), ("好，那先这样。".to_string(), true, false));

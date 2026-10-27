@@ -74,7 +74,8 @@ body[data-skin-character="true"] .skin-character-stage {
 .b.primary { background: var(--accent); color: var(--accent-contrast); }
 .b.mic.rec { background: var(--danger); color: #fff; box-shadow: 0 0 0 calc(var(--lv, 0) * 6px) #e5686f55; }
 textarea {
-  flex: 1; resize: none; height: 28px; max-height: 80px; border: 1px solid var(--border); border-radius: 7px;
+  flex: 1; resize: none; height: 28px; min-height: 28px; max-height: 80px; overflow: hidden;
+  border: 1px solid var(--border); border-radius: 7px;
   background: var(--bg-elev); color: var(--text); font: inherit; padding: 4px 7px; user-select: text;
 }
 .hint { margin-top: 3px; font-size: 11px; color: var(--text-dim); text-align: center; text-shadow: 0 1px 3px #000; }

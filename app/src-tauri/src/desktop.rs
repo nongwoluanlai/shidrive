@@ -101,7 +101,7 @@ pub fn tool_specs(run: bool, act: bool, vision: bool) -> Vec<Value> {
     v.push(spec("desktop_find_apps", "在开始菜单和桌面快捷方式里查找已安装的程序，返回名称与路径（交给 desktop_open 打开）。", &["query"], json!({
         "query": { "type": "string", "description": "程序名关键字，如 网易云 / chrome / 微信；留空列出全部" } })));
     if vision {
-        v.push(spec("desktop_screenshot", "截取屏幕（或某个窗口）给你看。返回的图片坐标就是 desktop_mouse 用的坐标。刚打开程序时用 delay_ms 等它加载。", &[], json!({
+        v.push(spec("desktop_screenshot", "截取屏幕（或某个窗口）给你看。返回文本里带图片尺寸：之后调用 desktop_mouse 时必须把 image_width / image_height 设为那张图的尺寸，坐标才能对准。刚打开程序时用 delay_ms 等它加载。", &[], json!({
             "window": { "type": "string", "description": "只截这个窗口（标题或进程名关键字，会先切到前台）；默认截主屏幕" },
             "screen": { "type": "string", "enum": ["primary", "all"], "description": "primary = 主屏幕（默认），all = 所有显示器" },
             "delay_ms": { "type": "integer", "description": "截图前等待毫秒数（0~10000）" },
@@ -115,8 +115,10 @@ pub fn tool_specs(run: bool, act: bool, vision: bool) -> Vec<Value> {
             "args": { "type": "string", "description": "命令行参数（可选）" } })));
         v.push(spec("desktop_focus_window", "把某个窗口切到前台（最小化的会还原），之后的键盘输入会发给它。", &["window"], json!({
             "window": { "type": "string", "description": "窗口标题或进程名关键字，如 网易云音乐 / cloudmusic" } })));
-        v.push(spec("desktop_mouse", "鼠标操作。x / y 是最近一张截图里的像素坐标（没截过图时按屏幕坐标）。操作后建议再截图确认结果。", &["action"], json!({
+        v.push(spec("desktop_mouse", "鼠标操作。x / y 是你在截图里看到的像素坐标；必须同时传 image_width / image_height（那张截图的像素尺寸，截图返回文本里有），工具按比例换算成真实屏幕坐标——不传或传错会点错位置。没截过图时才直接用屏幕坐标（此时传屏幕分辨率）。操作后建议再截图确认结果。", &["action", "image_width", "image_height"], json!({
             "action": { "type": "string", "enum": ["click", "double_click", "right_click", "middle_click", "move", "scroll", "drag"] },
+            "image_width": { "type": "integer", "description": "x / y 所在截图的像素宽度（截图返回文本里有）" },
+            "image_height": { "type": "integer", "description": "x / y 所在截图的像素高度" },
             "x": { "type": "number" }, "y": { "type": "number" },
             "to_x": { "type": "number", "description": "drag 的终点" }, "to_y": { "type": "number" },
             "amount": { "type": "integer", "description": "scroll 的格数：正数向上，负数向下（默认 -3）" } })));
@@ -336,15 +338,47 @@ pub fn snapshot(host_pid: u32) -> Result<(String, String), String> {
 // ---------------------------------------------------------------- 坐标换算
 
 #[derive(Clone, Copy)]
-struct Geo { ox: i32, oy: i32, scale: f64 }
-/// 最近一张截图：截图像素 → 屏幕坐标
+struct Geo { ox: i32, oy: i32, w: i32, h: i32, pw: u32 }
+/// 最近一张截图：(屏幕区域, 图片宽度) → 模型给的图内像素坐标换算回屏幕坐标
 static LAST: Mutex<Option<Geo>> = Mutex::new(None);
 
 fn to_screen(x: f64, y: f64) -> (i32, i32) {
     match *LAST.lock().unwrap_or_else(|p| p.into_inner()) {
-        Some(g) => (g.ox + (x / g.scale).round() as i32, g.oy + (y / g.scale).round() as i32),
+        Some(g) => {
+            let scale = g.pw as f64 / g.w.max(1) as f64;
+            (g.ox + (x / scale).round() as i32, g.oy + (y / scale).round() as i32)
+        }
         None => (x.round() as i32, y.round() as i32),
     }
+}
+
+/// 模型给的坐标按「她看到的图片尺寸」换算回屏幕坐标：x_screen = 区域原点 + x_img * 区域实际宽 / 图片宽。
+/// image_width/height 由调用方必填（desktop_mouse 的参数）；没给时退回 to_screen 的旧换算。
+fn pos_of(a: &Value, kx: &str, ky: &str) -> Option<(i32, i32)> {
+    let x = a.get(kx)?.as_f64()?;
+    let y = a.get(ky)?.as_f64()?;
+    let iw = a.get("image_width").and_then(Value::as_f64).filter(|v| *v > 0.0);
+    let ih = a.get("image_height").and_then(Value::as_f64).filter(|v| *v > 0.0);
+    if let (Some(iw), Some(ih)) = (iw, ih) {
+        let guard = LAST.lock().unwrap_or_else(|p| p.into_inner());
+        return Some(match guard.as_ref() {
+            Some(g) => (
+                (g.ox as f64 + x * g.w.max(1) as f64 / iw).round() as i32,
+                (g.oy as f64 + y * g.h.max(1) as f64 / ih).round() as i32,
+            ),
+            // 没截过图：按主屏幕换算
+            None => {
+                #[cfg(windows)]
+                {
+                    let (sw, sh) = win::primary_size();
+                    ((x * sw.max(1) as f64 / iw).round() as i32, (y * sh.max(1) as f64 / ih).round() as i32)
+                }
+                #[cfg(not(windows))]
+                { (x.round() as i32, y.round() as i32) }
+            }
+        });
+    }
+    Some(to_screen(x, y))
 }
 
 /// 组合键名 → (虚拟键码, 扩展键)
@@ -637,6 +671,8 @@ mod win {
         }
     }
 
+    pub fn primary_size() -> (i32, i32) { unsafe { (GetSystemMetrics(0), GetSystemMetrics(1)) } }
+
     pub fn snapshot(pid: u32) -> Result<(String, String), String> {
         dpi_aware();
         let desc = foreground_desc(pid);
@@ -646,7 +682,7 @@ mod win {
         let r = capture(0, 0, w, h).and_then(|img| encode_png(img, 1600));
         show_windows(&hidden);
         let (png, pw, _) = r?;
-        *LAST.lock().unwrap_or_else(|p| p.into_inner()) = Some(Geo { ox: 0, oy: 0, scale: pw as f64 / w.max(1) as f64 });
+        *LAST.lock().unwrap_or_else(|p| p.into_inner()) = Some(Geo { ox: 0, oy: 0, w, h, pw });
         Ok((b64(&png), desc))
     }
 
@@ -695,22 +731,21 @@ mod win {
         };
         let img = capture(x, y, w, h)?;
         let (png, pw, ph) = encode_png(img, max)?;
-        let scale = pw as f64 / w.max(1) as f64;
-        *LAST.lock().unwrap_or_else(|p| p.into_inner()) = Some(Geo { ox: x, oy: y, scale });
+        *LAST.lock().unwrap_or_else(|p| p.into_inner()) = Some(Geo { ox: x, oy: y, w, h, pw });
         Ok(Output {
-            text: format!("已截图：{what}，图片 {pw}x{ph}（屏幕区域 {w}x{h}，左上角 {x},{y}）。desktop_mouse 的 x / y 直接用这张图里的像素坐标。"),
+            text: format!("已截图：{what}，图片 {pw}x{ph}（屏幕区域 {w}x{h}，左上角 {x},{y}）。desktop_mouse 的 x / y 用这张图里的像素坐标，并把 image_width={pw} image_height={ph} 一起传入，工具会换算成真实屏幕坐标。"),
             image: Some(data_url("image/png", &png)),
         })
     }
 
     fn mouse_act(a: &Value) -> Result<Output, String> {
         let act = a.get("action").and_then(Value::as_str).unwrap_or("click");
-        let pos = |kx: &str, ky: &str| -> Option<(i32, i32)> {
-            Some(to_screen(a.get(kx).and_then(Value::as_f64)?, a.get(ky).and_then(Value::as_f64)?))
-        };
+        let pos = |kx: &str, ky: &str| -> Option<(i32, i32)> { pos_of(a, kx, ky) };
         let at = pos("x", "y");
         if let Some((x, y)) = at { unsafe { SetCursorPos(x, y) }; std::thread::sleep(Duration::from_millis(60)); }
-        else if act != "scroll" { return Err("缺少 x / y".into()); }
+        else if act != "scroll" {
+            return Err("缺少 x / y（还要带上你看的截图尺寸 image_width / image_height）".into());
+        }
         let click = |down: u32, up: u32, n: usize| {
             for _ in 0..n { send(&[mouse(down, 0), mouse(up, 0)]); std::thread::sleep(Duration::from_millis(70)); }
         };
@@ -875,10 +910,31 @@ mod tests {
 
     #[test]
     fn coords_and_images() {
-        *LAST.lock().unwrap() = Some(Geo { ox: 100, oy: 50, scale: 0.5 });
+        // 区域 (100,50) 1920x1080，截图宽 960（scale 0.5）
+        *LAST.lock().unwrap() = Some(Geo { ox: 100, oy: 50, w: 1920, h: 1080, pw: 960 });
         assert_eq!(to_screen(10.0, 20.0), (120, 90));
+        // 带图片尺寸的换算：模型看的是 960x540 的图，(480,270) = 区域中心 → (1060, 590)
+        assert_eq!(
+            pos_of(&json!({ "x": 480, "y": 270, "image_width": 960, "image_height": 540 }), "x", "y"),
+            Some((1060, 590))
+        );
+        // 图片尺寸与旧换算不一致时以图片尺寸为准（旧 scale 会给出 (1060,590) 之外的错值）
+        assert_eq!(
+            pos_of(&json!({ "x": 480, "y": 270, "image_width": 1280, "image_height": 720 }), "x", "y"),
+            Some((820, 455))
+        );
+        // 没给图片尺寸：退回旧换算
+        assert_eq!(pos_of(&json!({ "x": 10.0, "y": 20.0 }), "x", "y"), Some((120, 90)));
         *LAST.lock().unwrap() = None;
         assert_eq!(to_screen(10.4, 20.6), (10, 21));
+        // 没截过图 + 图片尺寸 = 主屏幕尺寸 → 坐标原样（按真实主屏幕分辨率算期望值）
+        {
+            let (sw, sh) = win::primary_size();
+            assert_eq!(
+                pos_of(&json!({ "x": 480.0, "y": 270.0, "image_width": 1920, "image_height": 1080 }), "x", "y"),
+                Some(((480.0 * sw.max(1) as f64 / 1920.0).round() as i32, (270.0 * sh.max(1) as f64 / 1080.0).round() as i32))
+            );
+        }
         assert_eq!(b64(b"hello"), "aGVsbG8=");
         assert_eq!(b64(b"hi!"), "aGkh");
         let img = image::RgbImage::from_pixel(3000, 1000, image::Rgb([10, 20, 30]));

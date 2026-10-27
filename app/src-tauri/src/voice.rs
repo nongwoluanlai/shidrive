@@ -103,7 +103,7 @@ impl Default for VoiceConfig {
             kokoro_speaker: 3,
             system_voice: String::new(),
             character_voice: true,
-            read_full: true,
+            read_full: false,
             bindings: BTreeMap::new(),
             rate: 1.0,
             volume: 1.0,
@@ -164,10 +164,18 @@ fn wake_words(s: &str) -> Vec<String> {
 }
 
 fn load_config(db: &Db) -> VoiceConfig {
-    db.get_setting(CFG_KEY).ok().flatten()
+    let mut cfg = db
+        .get_setting(CFG_KEY).ok().flatten()
         .and_then(|s| serde_json::from_str::<VoiceConfig>(&s).ok())
         .unwrap_or_default()
-        .normalized()
+        .normalized();
+    // 「完整朗读正文」从默认开改为默认关（读出来太长；字幕才是主要交互）。
+    // 一次性把存量配置里的 read_full 压下去；想要的话在语音设置里重新勾选。
+    if db.get_setting("voice.read_full_off_migrated").ok().flatten().as_deref() != Some("1") {
+        cfg.read_full = false;
+        let _ = db.set_setting("voice.read_full_off_migrated", "1");
+    }
+    cfg
 }
 
 // ---------------------------------------------------------------- catalog

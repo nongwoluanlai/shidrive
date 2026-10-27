@@ -19,6 +19,38 @@ static SUMMON_FG: Mutex<String> = Mutex::new(String::new());
 static REGIONS: Mutex<Vec<[f64; 4]>> = Mutex::new(Vec::new());
 static WATCHING: AtomicBool = AtomicBool::new(false);
 
+/// 穿透 / 恢复点击。Tauri 的 set_ignore_cursor_events 只给顶层窗口加
+/// WS_EX_TRANSPARENT，而鼠标命中的是 WebView2 的子窗口，所以必须连所有后代一起改。
+#[cfg(windows)]
+fn set_click_through(w: &tauri::WebviewWindow, ignore: bool) {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumChildWindows(h: isize, f: unsafe extern "system" fn(isize, isize) -> i32, l: isize) -> i32;
+        fn GetWindowLongW(h: isize, i: i32) -> i32;
+        fn SetWindowLongW(h: isize, i: i32, v: i32) -> i32;
+    }
+    unsafe extern "system" fn collect(h: isize, l: isize) -> i32 {
+        unsafe { (*(l as *mut Vec<isize>)).push(h); 1 }
+    }
+    let Ok(root) = w.hwnd() else { return };
+    let root = root.0 as isize;
+    let mut hs = vec![root];
+    unsafe { EnumChildWindows(root, collect, &mut hs as *mut Vec<isize> as isize) };
+    for h in hs {
+        unsafe {
+            let ex = GetWindowLongW(h, -20);
+            // WS_EX_LAYERED | WS_EX_TRANSPARENT
+            let new = if ignore { ex | 0x8_0020 } else { ex & !0x8_0020 };
+            if new != ex { SetWindowLongW(h, -20, new); }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn set_click_through(w: &tauri::WebviewWindow, ignore: bool) {
+    let _ = w.set_ignore_cursor_events(ignore);
+}
+
 /// 按鼠标位置切换穿透：在可交互区域上接收点击，否则穿透
 fn watch_cursor(app: AppHandle) {
     if WATCHING.swap(true, Ordering::SeqCst) { return; }
@@ -34,7 +66,7 @@ fn watch_cursor(app: AppHandle) {
                 .any(|r| x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]);
             if ignoring != Some(!over) {
                 ignoring = Some(!over);
-                let _ = w.set_ignore_cursor_events(!over);
+                set_click_through(&w, !over);
             }
         }
         WATCHING.store(false, Ordering::SeqCst);
