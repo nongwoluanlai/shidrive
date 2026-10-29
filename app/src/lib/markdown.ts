@@ -2,6 +2,7 @@ import { marked } from "marked";
 import DOMPurify from "dompurify";
 
 const escapeAttribute = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const escapeHtmlText = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 export function localLinkPath(value: string): string | null {
   if (!value || value.startsWith("#") || /^(?:https?|mailto|tel|data|javascript):/i.test(value)) return null;
@@ -19,6 +20,10 @@ marked.use({ gfm: true, breaks: true, renderer: {
     const hint = title ? ` title="${escapeAttribute(title)}"` : "";
     if (path) return `<a href="#" class="md-file" data-path="${escapeAttribute(path)}"${hint}>${label}</a>`;
     return `<a href="${escapeAttribute(href)}" rel="noopener noreferrer"${hint}>${label}</a>`;
+  },
+  // 正文里的 HTML / 脚本文本按原样展示（转义成文字），既不执行也不被净化器整段吞掉
+  html(token) {
+    return escapeHtmlText(typeof token === "string" ? token : token.text ?? "");
   },
 } });
 

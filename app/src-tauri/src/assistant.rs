@@ -586,6 +586,15 @@ fn vision_rejected(err: &str) -> bool {
     ["接口返回 http 400", "接口返回 http 413", "接口返回 http 415", "接口返回 http 422"].iter().any(|p| e.starts_with(p))
 }
 
+/// 模型没走标准 tool_calls、把工具调用写成了正文文本（DeepSeek 的 DSML 标记等）。
+/// 这种"调用"不会被执行；识别出来后应回一条纠正提示让它重试，而不是当普通正文结束本轮。
+fn looks_like_native_tool_text(t: &str) -> bool {
+    if t.is_empty() { return false; }
+    let markers = ["</|", "<||", "<| |", "DSML"];
+    let hits = markers.iter().filter(|m| t.contains(*m)).count();
+    hits >= 2 || (t.contains("DSML") && t.contains("invoke"))
+}
+
 /// 消息里的图片只保留最近 `keep` 张（截图很占上下文），其余换成文字说明；keep = 0 全部去掉
 fn prune_images(messages: &mut [Value], keep: usize) {
     let mut seen = 0;
@@ -1183,6 +1192,7 @@ fn api_chat(ctx: &ApiCtx, mut messages: Vec<Value>, mut tools: Option<Value>, ta
     let max_rounds = if ctx.desk.is_some() { MAX_DESKTOP_ROUNDS } else if has_mcp { MAX_TOOL_ROUNDS } else { 3 };
     let mut vision = ctx.desk.as_ref().is_some_and(|d| d.vision) && !no_vision().lock().unwrap().contains(&tools_key(ctx.api));
     let mut round = 0;
+    let mut native_retry = 0;
     let res = (|| -> Result<String, String> {
     while round < max_rounds {
         let last = round + 1 == max_rounds;
@@ -1214,7 +1224,19 @@ fn api_chat(ctx: &ApiCtx, mut messages: Vec<Value>, mut tools: Option<Value>, ta
             Err(e) => return Err(e),
         };
         round += 1;
-        if tools.is_none() || calls.is_empty() { break; }
+        if tools.is_some() && calls.is_empty() {
+            let junk = content[start..].trim();
+            if native_retry < 2 && looks_like_native_tool_text(junk) {
+                native_retry += 1;
+                log::warn!("[assistant] 模型把工具调用写成了正文文本（第 {native_retry} 次），要求重试");
+                messages.push(json!({ "role": "assistant", "content": junk }));
+                messages.push(json!({ "role": "user", "content":
+                    "[系统提示] 你刚才把工具调用当作正文文本输出了（DSML/尖括号标记），它不会被执行。请直接使用标准的工具调用（function calling / tool_calls）重新发起刚才想做的那个调用，参数用合法 JSON；不要道歉、不要解释，直接重新调用。" }));
+                continue;
+            }
+            break;
+        }
+        if tools.is_none() { break; }
         let uses_mcp = calls.iter().any(|c| c.name != "say");
         // 只说了字幕且写了正文：这轮完成
         if !uses_mcp && !content.trim().is_empty() { break; }
@@ -2216,6 +2238,25 @@ pub async fn assistant_models(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_tool_text_is_detected() {
+        let sample = "<||DSML|| calls>
+<| |DSML| | invoke
+name=\"desktop_screenshot\">
+<||DSML|| parameter name=\"delay_ms\"
+string=\"false\">400</||DSML||
+parameter>
+<DSMLparameter name=\"window\"
+string=\"true\">isaac-ng.exe</||DSML||
+parameter>
+</| |DSML| | invoke>
+</||DSML|| calls>";
+        assert!(looks_like_native_tool_text(sample));
+        assert!(!looks_like_native_tool_text("普通回复：a < b 且 c > d"));
+        assert!(!looks_like_native_tool_text(""));
+        assert!(!looks_like_native_tool_text("讲讲 <|的故事"));
+    }
+
     #[test]
     fn state_line_has_local_datetime_and_weekday() {
         let mut cfg = AssistantConfig::default();
