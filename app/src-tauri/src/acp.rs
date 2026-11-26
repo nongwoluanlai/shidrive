@@ -91,6 +91,10 @@ struct TurnBuffer {
     text: String,
     thought: String,
     tools: Vec<Value>,
+    /// 尚未到达终态（completed / failed）的工具调用 ID，用于心跳超时时判断是否已自然收尾
+    open_tools: HashSet<String>,
+    /// 最近一次收到 session/update 或交互事件的时间
+    last_activity: Option<std::time::Instant>,
     /// Wakes the prompt owner when the adapter never answers a cancellation.
     abort: Arc<tokio::sync::Notify>,
 }
@@ -389,6 +393,13 @@ impl AcpConnection {
         self.sdk.lock().unwrap().take();
         // Close both UI queues, including unscoped legacy elicitations.
         self.cancel_user_requests(None);
+        // 唤醒所有仍在等待的回合任务，避免适配器断开后遗留幽灵运行态
+        {
+            let buffers = self.buffers.lock().unwrap();
+            for buf in buffers.values() {
+                buf.abort.notify_one();
+            }
+        }
         // Windows：先按 PID 终止整棵进程树（适配器派生的 codex/node 孙进程
         // 不随直接子进程死亡）；start_kill 作为兜底
         #[cfg(windows)]
@@ -446,6 +457,10 @@ impl AcpConnection {
         );
         // Same lock for the gate, insertion, cancellation and emission: no
         // expired dialog can be published after its cancellation event.
+        // 必须先放开 requests 再碰 buffers：全文件的加锁顺序是 buffers -> requests，
+        // 反过来拿着 requests 去拿 buffers 会和 cancel / begin_turn / end_turn 死锁。
+        drop(requests);
+        self.touch_activity(session_id);
         let _ = self.app.emit(event, json!({
             "requestId": key, "agentType": self.agent_type, "sessionId": session_id, "params": params
         }));
@@ -517,6 +532,7 @@ impl AcpConnection {
         let route = {
             let mut buffers = self.buffers.lock().unwrap();
             if let Some(buf) = buffers.get_mut(&session_id) {
+                buf.last_activity = Some(std::time::Instant::now());
                 match utype.as_str() {
                     "agent_message_chunk" => {
                         if let Some(t) = chunk_text(&update) {
@@ -530,6 +546,16 @@ impl AcpConnection {
                     }
                     "tool_call" | "tool_call_update" => {
                         let tid = update.get("toolCallId");
+                        if let Some(tid_s) = tid.and_then(Value::as_str) {
+                            match update.get("status").and_then(Value::as_str) {
+                                Some("completed" | "failed" | "cancelled") => {
+                                    buf.open_tools.remove(tid_s);
+                                }
+                                _ => {
+                                    buf.open_tools.insert(tid_s.to_string());
+                                }
+                            }
+                        }
                         if let Some(existing) =
                             buf.tools.iter_mut().find(|t| t.get("toolCallId") == tid)
                         {
@@ -973,12 +999,77 @@ impl AcpConnection {
     }
 
     pub fn has_active_turn(&self, session_id: &str) -> bool {
-        self.buffers.lock().unwrap().contains_key(session_id)
+        self.is_alive() && self.buffers.lock().unwrap().contains_key(session_id)
     }
 
     pub fn active_turn_id(&self, session_id: &str) -> Option<String> {
+        if !self.is_alive() {
+            return None;
+        }
         self.buffers.lock().unwrap().get(session_id).map(|b| b.turn_id.clone())
     }
+
+    pub fn active_turn_matches(&self, session_id: &str, context_id: &str) -> Option<String> {
+        if !self.is_alive() {
+            return None;
+        }
+        self.buffers
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .filter(|b| b.context_id.as_deref() == Some(context_id))
+            .map(|b| b.turn_id.clone())
+    }
+
+    /// 检查底层适配器子进程是否仍在存活（Windows 上孙进程可能继承 stdout 导致不立刻 EOF）。
+    /// 一旦发现进程已退出，立即触发 on_closed 清理。
+    pub fn check_child_alive(&self) -> bool {
+        if !self.is_alive() {
+            return false;
+        }
+        let exited = {
+            let mut guard = self.child.lock().unwrap();
+            match guard.as_mut() {
+                Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+                None => true,
+            }
+        };
+        if exited {
+            log::warn!("[{}] 检测到适配器子进程已退出，执行连接清理", self.agent_type);
+            self.on_closed();
+            return false;
+        }
+        true
+    }
+
+    /// 刷新回合的活动时间（用户刚回答了权限 / 输入请求）：单拿 buffers，不与其它锁嵌套。
+    fn touch_activity(&self, session_id: &str) {
+        if let Some(buf) = self.buffers.lock().unwrap().get_mut(session_id) {
+            buf.last_activity = Some(std::time::Instant::now());
+        }
+    }
+
+    /// 返回 (静默时长, 是否有工具仍在执行, 是否看起来已自然结束, 是否正等待用户交互)。
+    ///
+    /// 有工具在跑时，静默只是"工具还没返回"（编译、测试、慢模型都可能好几分钟不出
+    /// session/update），不能按卡死处理，调用方应换用长得多的上限（TOOL_STALL_TIMEOUT）。
+    /// `looks_done` = 已有回复文本且没有未完成的工具：只有这种情况下超时才可视为正常完成。
+    pub fn turn_idle_status(&self, session_id: &str, turn_id: &str) -> Option<(Duration, bool, bool, bool)> {
+        let waiting_user = {
+            let reqs = self.requests.lock().unwrap();
+            // 连接级（无 sessionId）的输入请求也算在等用户
+            reqs.permissions.values().any(|r| r.session_id.is_empty() || r.session_id == session_id)
+                || reqs.elicitations.values().any(|r| r.session_id.is_empty() || r.session_id == session_id)
+        };
+        let buffers = self.buffers.lock().unwrap();
+        let buf = buffers.get(session_id).filter(|b| b.turn_id == turn_id)?;
+        let since = buf.last_activity.map(|t| t.elapsed()).unwrap_or_default();
+        let looks_done = !buf.text.trim().is_empty() && buf.open_tools.is_empty();
+        Some((since, !buf.open_tools.is_empty(), looks_done, waiting_user))
+    }
+
+    /// 工具执行中允许的最长静默（远大于普通阈值：真卡死的工具也要能被收掉）
+    pub const TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(1800);
 
     /// Notified when the turn must stop waiting for the adapter's prompt reply.
     pub fn turn_abort_signal(&self, session_id: &str, turn_id: &str) -> Option<Arc<tokio::sync::Notify>> {
@@ -1019,6 +1110,7 @@ impl AcpConnection {
                 context_id: Some(context_id.to_string()),
                 turn_id: turn_id.to_string(),
                 source: source.to_string(),
+                last_activity: Some(std::time::Instant::now()),
                 ..Default::default()
             },
         );
@@ -1081,29 +1173,30 @@ impl AcpConnection {
 
     /// Deliver the user's permission decision to the pending server request.
     pub fn resolve_permission(&self, request_id: &str, option_id: &str) -> Result<(), String> {
-        if let Some(tx) = self.requests.lock().unwrap().permissions.remove(request_id) {
-            tx.tx
-                .send(json!({ "outcome": "selected", "optionId": option_id }))
-                .map_err(|_| "权限请求已失效".to_string())
-        } else {
-            Err("权限请求已失效".into())
+        let removed = self.requests.lock().unwrap().permissions.remove(request_id);
+        match removed {
+            Some(tx) => {
+                // 用户回答后模型才开始干活：刷新活动时间，否则看门狗会把"刚批准"的回合当成卡死
+                self.touch_activity(&tx.session_id);
+                tx.tx
+                    .send(json!({ "outcome": "selected", "optionId": option_id }))
+                    .map_err(|_| "权限请求已失效".to_string())
+            }
+            None => Err("权限请求已失效".into()),
         }
     }
 
     /// Deliver the user's elicitation answer to the pending server request.
     pub fn resolve_elicitation(&self, request_id: &str, response: Value) -> Result<(), String> {
-        if let Some(tx) = self
-            .requests
-            .lock()
-            .unwrap()
-            .elicitations
-            .remove(request_id)
-        {
-            tx.tx
-                .send(response)
-                .map_err(|_| "输入请求已失效".to_string())
-        } else {
-            Err("输入请求已失效".into())
+        let removed = self.requests.lock().unwrap().elicitations.remove(request_id);
+        match removed {
+            Some(tx) => {
+                self.touch_activity(&tx.session_id);
+                tx.tx
+                    .send(response)
+                    .map_err(|_| "输入请求已失效".to_string())
+            }
+            None => Err("输入请求已失效".into()),
         }
     }
 

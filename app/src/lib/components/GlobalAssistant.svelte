@@ -296,7 +296,7 @@
   // ---------------- 唤醒词 ----------------
   $effect(() => {
     void wk.retry;
-    const want = enabled() && wakeReady() && (wk.visible || !!vc.view?.config.wake_background);
+    const want = !wk.locked && enabled() && wakeReady() && (wk.visible || !!vc.view?.config.wake_background);
     setWake(want, onWake);
   });
   $effect(() => () => setWake(false, onWake));

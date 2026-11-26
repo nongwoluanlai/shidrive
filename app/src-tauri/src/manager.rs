@@ -40,6 +40,34 @@ fn deepseek_new_error(error: &str) -> String {
 #[cfg(test)]
 mod audit_tests {
     use super::*;
+
+    #[test]
+    fn idle_watchdog_does_not_kill_live_turns() {
+        use IdleVerdict::*;
+        let normal = Duration::from_secs(180);
+        let tool = AcpConnection::TOOL_STALL_TIMEOUT;
+        let s = |n: u64| Duration::from_secs(n);
+
+        // 回复完、没有工具、长时间没动静 → 正常完成
+        assert_eq!(idle_verdict(s(200), false, true, false, normal, tool), FinishAsDone);
+        // 一直没出任何回复就卡住 → 中断
+        assert_eq!(idle_verdict(s(200), false, false, false, normal, tool), FinishAsInterrupted);
+        // 未到阈值 → 继续等
+        assert_eq!(idle_verdict(s(100), false, true, false, normal, tool), KeepWaiting);
+
+        // 关键回归 1：工具在执行（编译 / 测试 / 慢模型）几分钟没更新，不能被杀
+        assert_eq!(idle_verdict(s(200), true, false, false, normal, tool), KeepWaiting);
+        assert_eq!(idle_verdict(s(600), true, false, false, normal, tool), KeepWaiting);
+        assert_eq!(idle_verdict(s(1799), true, false, false, normal, tool), KeepWaiting);
+        // 工具真卡死（超过 30 分钟）→ 收掉，且必须算中断而不是完成
+        assert_eq!(idle_verdict(s(1801), true, false, false, normal, tool), FinishAsInterrupted);
+        // 有回复文本但工具还开着，超时也不能算完成
+        assert_eq!(idle_verdict(s(1801), true, true, false, normal, tool), FinishAsInterrupted);
+
+        // 关键回归 2：正在等用户回答权限 / 输入弹窗，多久都不算卡死
+        assert_eq!(idle_verdict(s(9000), false, false, true, normal, tool), KeepWaiting);
+        assert_eq!(idle_verdict(s(9000), true, false, true, normal, tool), KeepWaiting);
+    }
     #[test]
     fn env_only_override_resolves_without_autodiscovery() {
         let env = std::collections::BTreeMap::from([
@@ -130,6 +158,31 @@ mod audit_tests {
 /// How long a cancelled turn may wait for the adapter's prompt reply before it is force-ended.
 const CANCEL_GRACE: Duration = Duration::from_secs(12);
 
+/// 空闲看门狗的判定结果
+#[derive(Debug, PartialEq)]
+enum IdleVerdict {
+    /// 未超时，继续等
+    KeepWaiting,
+    /// 超时且看起来已自然结束（有回复、无未完成工具）：按「完成」收尾
+    FinishAsDone,
+    /// 超时但并未完成（工具还在跑 / 还没出回复）：按「中断」收尾
+    FinishAsInterrupted,
+}
+
+/// 回合连续 `idle` 没有 session/update 时是否收尾。
+///
+/// - 正在等用户回答（权限 / 输入弹窗）：永不超时
+/// - 有工具在执行：静默只说明工具还没返回（编译、测试、慢模型都可能几分钟没动静），
+///   只受长得多的 `tool_stall` 约束，且超时算中断而不是完成
+/// - 否则按普通阈值 `idle_timeout`
+fn idle_verdict(idle: Duration, tool_running: bool, looks_done: bool, waiting_user: bool, idle_timeout: Duration, tool_stall: Duration) -> IdleVerdict {
+    if waiting_user { return IdleVerdict::KeepWaiting; }
+    let limit = if tool_running { tool_stall } else { idle_timeout };
+    if idle < limit { return IdleVerdict::KeepWaiting; }
+    // 工具还开着就不可能是"已完成"，即便有回复文本
+    if looks_done && !tool_running { IdleVerdict::FinishAsDone } else { IdleVerdict::FinishAsInterrupted }
+}
+
 /// 强制结束时回合的错误文本（manager 据此重启适配器）
 const FORCED_END: &str = "适配器未响应取消请求，已强制结束本轮（适配器将重启）";
 
@@ -154,6 +207,7 @@ struct ActiveTurn {
     turn_id: String,
     source: &'static str,
     completed: bool,
+    _sleep: Option<crate::power::SleepGuard>,
 }
 
 impl Drop for ActiveTurn {
@@ -210,6 +264,9 @@ pub struct AgentManager {
     prompt_locks: std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// 本次运行中已附加过完整会话说明的会话（agent:sid），之后只附加简短提示。
     primed: std::sync::Mutex<std::collections::HashSet<String>>,
+/// 回合准备阶段（加载会话等，尚无 buffer）标记：仅此阶段内的 cancel 才登记 pending_cancels，
+    /// 避免上下文切换的 bind_session 持有 bind_lock 时被误判为「回合准备中」。
+    preparing_prompts: std::sync::Mutex<std::collections::HashSet<String>>,
     /// 回合准备阶段（加载会话等，尚无 buffer）收到的停止请求（context:agent），回合一开始就取消
     pending_cancels: std::sync::Mutex<std::collections::HashSet<String>>,
 }
@@ -226,7 +283,7 @@ impl AgentManager {
                 }
             }
         }
-        Self { app, db, tools, conns: RwLock::new(HashMap::new()), overrides: RwLock::new(overrides), connection_locks: std::sync::Mutex::new(HashMap::new()), bind_locks: std::sync::Mutex::new(HashMap::new()), prompt_locks: std::sync::Mutex::new(HashMap::new()), primed: std::sync::Mutex::new(Default::default()), pending_cancels: std::sync::Mutex::new(Default::default()) }
+        Self { app, db, tools, conns: RwLock::new(HashMap::new()), overrides: RwLock::new(overrides), connection_locks: std::sync::Mutex::new(HashMap::new()), bind_locks: std::sync::Mutex::new(HashMap::new()), prompt_locks: std::sync::Mutex::new(HashMap::new()), primed: std::sync::Mutex::new(Default::default()), preparing_prompts: std::sync::Mutex::new(Default::default()), pending_cancels: std::sync::Mutex::new(Default::default()) }
     }
 
     fn prompt_lock(&self, conn: &AcpConnection, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -614,10 +671,72 @@ impl AgentManager {
         self.disconnect_locked(agent_type).await;
     }
 
+    fn emit_reconciled_status(&self, context_id: &str, agent_type: &str, session_id: Option<&str>, status: &str) {
+        let _ = self.app.emit(
+            "acp://binding-status",
+            json!({
+                "contextId": context_id,
+                "agentType": agent_type,
+                "sessionId": session_id.unwrap_or(""),
+                "turnId": "__reconciled__",
+                "source": "chat",
+                "status": status,
+                "reconciled": true,
+            }),
+        );
+    }
+
+    fn reset_agent_running_bindings(&self, agent_type: &str, new_status: &str) {
+        if let Ok(rows) = self.db.reset_running_bindings_for_agent(agent_type, new_status) {
+            for (ctx_id, sid) in rows {
+                log::info!("[{agent_type}] 适配器断开/重启，收尾遗留运行态绑定 ctx={ctx_id} -> {new_status}");
+                self.emit_reconciled_status(&ctx_id, agent_type, sid.as_deref(), new_status);
+            }
+        }
+    }
+
+    /// 检查某条绑定是否真的有活跃回合在运行（含准备中）；若库里是 running 但底层已无活跃会话，
+    /// 立即将其重置为 interrupted 并广播事件，消除幽灵运行态。
+    pub async fn reconcile_binding_if_stale(&self, context_id: &str, agent_type: &str) -> Result<Option<AgentBinding>, String> {
+        let Some(mut b) = self.db.get_binding(context_id, agent_type)? else {
+            return Ok(None);
+        };
+        if b.status != "running" {
+            return Ok(Some(b));
+        }
+        let prep_key = format!("{context_id}:{agent_type}");
+        if self.preparing_prompts.lock().unwrap().contains(&prep_key) {
+            return Ok(Some(b));
+        }
+        let alive_turn = {
+            let conn = self.conns.read().await.get(agent_type).cloned();
+            match (conn, b.session_id.as_deref()) {
+                (Some(c), Some(sid)) => c.check_child_alive() && c.active_turn_matches(sid, context_id).is_some(),
+                _ => false,
+            }
+        };
+        if !alive_turn {
+            log::warn!("[{agent_type}] 检测到幽灵运行态绑定 ctx={context_id} sid={:?}，自动收尾为 interrupted", b.session_id);
+            let _ = self.db.set_binding_status(context_id, agent_type, "interrupted", false);
+            b.status = "interrupted".into();
+            self.emit_reconciled_status(context_id, agent_type, b.session_id.as_deref(), "interrupted");
+        }
+        Ok(Some(b))
+    }
+
+    /// 扫描所有处于 running 的绑定，把底层无活跃会话的条目统一收尾（供会话管理面板调用）。
+    pub async fn reconcile_all_stale_bindings(&self) {
+        let Ok(rows) = self.db.list_running_bindings() else { return };
+        for (ctx_id, agent_type, _) in rows {
+            let _ = self.reconcile_binding_if_stale(&ctx_id, &agent_type).await;
+        }
+    }
+
     async fn disconnect_locked(&self, agent_type: &str) {
         if let Some(c) = self.conns.write().await.remove(agent_type) {
             c.shutdown();
         }
+        self.reset_agent_running_bindings(agent_type, "interrupted");
         let _ = self.app.emit("acp://status", json!({ "agentType": agent_type, "state": "disconnected", "info": Value::Null }));
     }
 
@@ -627,7 +746,7 @@ impl AgentManager {
         {
             let conns = self.conns.read().await;
             if let Some(c) = conns.get(agent_type) {
-                if c.is_alive() {
+                if c.check_child_alive() {
                     return Ok(c.clone());
                 }
             }
@@ -635,6 +754,8 @@ impl AgentManager {
         if let Some(stale) = self.conns.write().await.remove(agent_type) {
             stale.shutdown();
         }
+        // 旧连接已失效/重建前，收尾该适配器上所有遗留的 running 绑定，防止重连后出现幽灵运行态
+        self.reset_agent_running_bindings(agent_type, "interrupted");
         let launch = self.launch_for(agent_type).await?;
         if agent_type == "zcode" && self.override_for(agent_type).await.command.trim().is_empty() {
             self.zcode_preflight(&launch).await?;
@@ -950,7 +1071,24 @@ impl AgentManager {
         let binding_lock = self.bind_lock(&context.id, agent_type);
         let binding_guard = if matches!(&target, SessionTarget::Binding) { Some(binding_lock.lock().await) } else { None };
         let cancel_key = format!("{}:{agent_type}", context.id);
-        if binding_guard.is_some() { self.pending_cancels.lock().unwrap().remove(&cancel_key); }
+        struct PreparingGuard<'a> {
+            set: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+            key: Option<String>,
+        }
+        impl Drop for PreparingGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(k) = self.key.take() {
+                    self.set.lock().unwrap().remove(&k);
+                }
+            }
+        }
+        let mut prep_guard = if binding_guard.is_some() {
+            self.pending_cancels.lock().unwrap().remove(&cancel_key);
+            self.preparing_prompts.lock().unwrap().insert(cancel_key.clone());
+            Some(PreparingGuard { set: &self.preparing_prompts, key: Some(cancel_key.clone()) })
+        } else {
+            None
+        };
         let mut conn = self.ensure_connected(agent_type).await?;
         let cwd = self.project_root_for(context);
         let sid = match target {
@@ -1000,14 +1138,17 @@ impl AgentManager {
         let turn_id = request_id.filter(|id| !id.is_empty()).map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         conn.begin_turn(&sid, &context.id, &turn_id, source)?;
+        let sleep_guard = tauri::Manager::try_state::<Arc<crate::power::SleepInhibitor>>(&self.app).map(|s| s.acquire());
         let mut turn = ActiveTurn {
             app: self.app.clone(), db: self.db.clone(), conn: conn.clone(),
             session_id: sid.clone(), context_id: context.id.clone(),
             agent_type: agent_type.to_string(), turn_id: turn_id.clone(), source, completed: false,
+            _sleep: sleep_guard,
         };
         // Register before releasing the binding guard so rebind/unbind cannot
         // redirect the UI or cancel button while this session is running.
         let cancel_now = binding_guard.is_some() && self.pending_cancels.lock().unwrap().remove(&cancel_key);
+        drop(prep_guard.take());
         drop(binding_guard);
         turn.status("running");
         if cancel_now {
@@ -1018,7 +1159,7 @@ impl AgentManager {
         if !text.is_empty() { blocks.push(ContentBlock::Text(TextContent::new(text))); }
         for img in images { blocks.push(ContentBlock::Image(ImageContent::new(img.data.clone(), img.mime.clone()))); }
         if blocks.is_empty() { blocks.push(ContentBlock::Text(TextContent::new(text))); }
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
         struct CancelOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
         impl Drop for CancelOnDrop {
             fn drop(&mut self) { if let Some(tx) = self.0.take() { let _ = tx.send(()); } }
@@ -1028,35 +1169,81 @@ impl AgentManager {
         // Keep the SID lock/buffer alive until the peer replies (or disconnects),
         // otherwise the next prompt could steal late chunks from the canceled one.
         let abort = conn.turn_abort_signal(&sid, &turn_id).unwrap_or_default();
+        let idle_timeout = if agent_type == "pi" {
+            std::time::Duration::from_secs(180)
+        } else {
+            std::time::Duration::from_secs(600)
+        };
         let task = tokio::spawn(async move {
             let _session = session_guard;
             let request = conn.prompt_session(&sid, blocks);
             tokio::pin!(request);
             let mut was_cancelled = false;
-            // Some adapters (e.g. pi) never answer session/cancel; the abort signal
-            // (UI stop timeout) and the grace timer keep the turn from hanging forever.
-            let mut result = tokio::select! {
-                biased;
-                result = &mut request => result,
-                _ = abort.notified() => {
-                    was_cancelled = true;
-                    Err(FORCED_END.to_string())
-                }
-                _ = cancel_rx => {
-                    was_cancelled = true;
-                    conn.cancel_turn(&sid, &turn_id);
-                    tokio::select! {
-                        biased;
-                        result = &mut request => result,
-                        _ = abort.notified() => Err(FORCED_END.to_string()),
-                        _ = tokio::time::sleep(CANCEL_GRACE) => Err(FORCED_END.to_string()),
+            let mut idle_completed = false;
+            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heartbeat.tick().await; // 跳过首次立即触发
+            // Some adapters (e.g. pi) never answer session/cancel or silently stall
+            // without returning session/prompt after multi-turn tools; the abort signal,
+            // child liveness check and idle watchdog keep the turn from hanging forever.
+            let mut result = loop {
+                tokio::select! {
+                    biased;
+                    result = &mut request => break result,
+                    _ = abort.notified() => {
+                        was_cancelled = true;
+                        break Err(FORCED_END.to_string());
+                    }
+                    _ = &mut cancel_rx => {
+                        was_cancelled = true;
+                        conn.cancel_turn(&sid, &turn_id);
+                        break tokio::select! {
+                            biased;
+                            result = &mut request => result,
+                            _ = abort.notified() => Err(FORCED_END.to_string()),
+                            _ = tokio::time::sleep(CANCEL_GRACE) => Err(FORCED_END.to_string()),
+                        };
+                    }
+                    _ = heartbeat.tick() => {
+                        if !conn.check_child_alive() {
+                            break Err("适配器进程已退出".to_string());
+                        }
+                        if let Some((idle, tool_running, looks_done, waiting_user)) = conn.turn_idle_status(&sid, &turn_id) {
+                            // 有工具在执行时不按普通阈值算卡死（编译 / 测试 / 慢模型都可能长时间没有更新），
+                            // 只用长得多的 TOOL_STALL_TIMEOUT 兜底；等用户回答时完全不计
+                            let verdict = idle_verdict(idle, tool_running, looks_done, waiting_user, idle_timeout, AcpConnection::TOOL_STALL_TIMEOUT);
+                            if verdict != IdleVerdict::KeepWaiting {
+                                log::warn!(
+                                    "[{}] 回合 {} 连续 {}s 无 session/update（工具执行中={}），自动收尾",
+                                    turn.agent_type, turn_id, idle.as_secs(), tool_running
+                                );
+                                crate::glog::warn(
+                                    "acp",
+                                    format!(
+                                        "{} 会话连续 {} 秒无响应，已自动结束运行态",
+                                        turn.agent_type,
+                                        idle.as_secs()
+                                    ),
+                                );
+                                // 只有"已有回复且没有工具在跑"才算正常完成；工具执行中超时是被卡住，记为中断
+                                idle_completed = verdict == IdleVerdict::FinishAsDone;
+                                break Err(FORCED_END.to_string());
+                            }
+                        }
                     }
                 }
             };
             let forced = matches!(&result, Err(e) if e == FORCED_END);
             let interrupted = was_cancelled || matches!(&result, Ok(v) if v.get("stopReason").and_then(Value::as_str) == Some("cancelled"));
             if let Err(e) = &result { log::warn!("[{}] 回合失败：{}", turn.agent_type, e.chars().take(600).collect::<String>()); }
-            turn.status(if result.is_err() || interrupted { "interrupted" } else { "completed" });
+            let final_status = if idle_completed {
+                "completed"
+            } else if result.is_err() || interrupted {
+                "interrupted"
+            } else {
+                "completed"
+            };
+            turn.status(final_status);
             let (text, _, _) = conn.end_turn(&sid, &turn_id);
             if source == "workflow" {
                 if let Ok(Value::Object(obj)) = &mut result {
@@ -1065,10 +1252,10 @@ impl AgentManager {
             }
             turn.completed = true;
             drop(turn);
-            // 适配器无视取消：它可能还在往这个会话吐旧回合的内容，下一轮会被串进来；
+            // 适配器无视取消或心跳超时失联：它可能还在往这个会话吐旧回合的内容，下一轮会被串进来；
             // 直接重启适配器进程（下次使用时自动重连）
             if forced { conn.shutdown(); }
-            result
+            if idle_completed { Ok(json!({ "stopReason": "end_turn" })) } else { result }
         });
         let joined = task.await;
         cancel.0.take();
@@ -1192,20 +1379,24 @@ impl AgentManager {
         let sid = binding.as_ref().and_then(|b| b.session_id.clone());
         let conn = self.conns.read().await.get(agent_type).cloned();
         if let (Some(sid), Some(conn)) = (sid.as_deref(), conn) {
-            if let Some(turn_id) = conn.active_turn_id(sid) {
-                conn.cancel_session(sid);
-                arm_force_abort(conn, sid.to_string(), turn_id);
-                return Ok(true);
+            if conn.check_child_alive() {
+                if let Some(turn_id) = conn.active_turn_matches(sid, context_id).or_else(|| conn.active_turn_id(sid)) {
+                    conn.cancel_session(sid);
+                    arm_force_abort(conn, sid.to_string(), turn_id);
+                    return Ok(true);
+                }
             }
         }
-        // 回合还在准备（持有绑定锁、尚未 begin_turn）：记下停止请求，回合一开始就取消
-        if self.bind_lock(context_id, agent_type).try_lock().is_err() {
-            self.pending_cancels.lock().unwrap().insert(format!("{context_id}:{agent_type}"));
+        let prep_key = format!("{context_id}:{agent_type}");
+        // 仅当确实有 prompt 处于准备阶段时才登记延迟取消（上下文切换的 bind_session 不计入）
+        if self.preparing_prompts.lock().unwrap().contains(&prep_key) {
+            self.pending_cancels.lock().unwrap().insert(prep_key);
             return Ok(true);
         }
         if binding.as_ref().is_some_and(|b| b.status == "running") {
             let _ = self.db.set_binding_status(context_id, agent_type, "interrupted", false);
         }
+        self.emit_reconciled_status(context_id, agent_type, sid.as_deref(), "interrupted");
         Ok(false)
     }
 

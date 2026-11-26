@@ -140,8 +140,8 @@ pub async fn context_commits_list(db: DbState<'_>, context_id: String, limit: Op
 // ---------- bindings & chat ----------
 
 #[tauri::command]
-pub async fn binding_get(db: DbState<'_>, context_id: String, agent_type: String) -> Result<Option<AgentBinding>, String> {
-    db.get_binding(&context_id, &agent_type).map_err(err)
+pub async fn binding_get(agents: AgentsState<'_>, context_id: String, agent_type: String) -> Result<Option<AgentBinding>, String> {
+    agents.reconcile_binding_if_stale(&context_id, &agent_type).await.map_err(err)
 }
 
 #[tauri::command]
@@ -340,7 +340,8 @@ pub async fn acp_session_bind(
 
 /// All agent bindings across projects (for the 会话管理 panel).
 #[tauri::command]
-pub async fn bindings_all(db: DbState<'_>) -> Result<Vec<BindingInfo>, String> {
+pub async fn bindings_all(agents: AgentsState<'_>, db: DbState<'_>) -> Result<Vec<BindingInfo>, String> {
+    agents.reconcile_all_stale_bindings().await;
     db.bindings_list_all().map_err(err)
 }
 
@@ -540,8 +541,14 @@ pub async fn settings_get(db: DbState<'_>, key: String) -> Result<Option<String>
 }
 
 #[tauri::command]
-pub async fn settings_set(db: DbState<'_>, key: String, value: String) -> Result<(), String> {
-    db.set_setting(&key, &value).map_err(err)
+pub async fn settings_set(app: tauri::AppHandle, db: DbState<'_>, key: String, value: String) -> Result<(), String> {
+    db.set_setting(&key, &value).map_err(err)?;
+    if key == crate::power::SETTING_PREVENT_SLEEP {
+        if let Some(sleep) = tauri::Manager::try_state::<std::sync::Arc<crate::power::SleepInhibitor>>(&app) {
+            sleep.set_enabled(value != "0");
+        }
+    }
+    Ok(())
 }
 
 /// Agent 注册表与环境状态（设置页）。
@@ -1026,12 +1033,17 @@ pub async fn data_import(db: DbState<'_>, path: String) -> Result<String, String
     Ok(format!("导入完成：{summary}"))
 }
 
-/// 全局搜索（Alt+F）：文件名快速打开 / 内容搜索。阻塞遍历放到线程池，新请求自动取消旧请求。
+/// 全局搜索（Alt+F）：文件名快速打开 / 内容搜索。阻塞遍历放到线程池，新请求自动取消旧请求；
+/// 内容搜索提供 searchId 时通过 `search://chunk` 边查边实时推给前端。
 #[tauri::command]
-pub async fn fs_search(opts: crate::search::SearchOpts) -> Result<crate::search::SearchResult, String> {
-    tauri::async_runtime::spawn_blocking(move || crate::search::search(opts))
-        .await
-        .map_err(|e| format!("搜索线程异常: {e}"))?
+pub async fn fs_search(app: tauri::AppHandle, opts: crate::search::SearchOpts) -> Result<crate::search::SearchResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::search::search_with_progress(opts, |chunk| {
+            let _ = tauri::Emitter::emit(&app, "search://chunk", chunk);
+        })
+    })
+    .await
+    .map_err(|e| format!("搜索线程异常: {e}"))?
 }
 
 #[tauri::command]

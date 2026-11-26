@@ -7,6 +7,7 @@
 //! - 新搜索自动取消旧搜索（全局代数），结果数有上限，避免卡 UI。
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -18,11 +19,59 @@ use regex::{RegexSet, RegexSetBuilder};
 use serde::{Deserialize, Serialize};
 
 const ALWAYS_SKIP: &[&str] = &[".git", ".svn", ".hg", "node_modules"];
+/// 常见构建产物 / 缓存 / 依赖目录：不直接跳过（若未在 .gitignore 中仍会被搜到），
+/// 但排入低优先级队列，确保源码小目录先出结果。
+const LOW_PRIO_DIRS: &[&str] = &[
+    "target",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    ".nuxt",
+    ".output",
+    ".turbo",
+    ".parcel-cache",
+    ".cache",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "vendor",
+    "coverage",
+    "bin",
+    "obj",
+    "pkg",
+    ".gradle",
+    "pods",
+    "deriveddata",
+    "bower_components",
+    "third_party",
+    "deps",
+    "artifacts",
+    "release",
+    "debug",
+];
+/// 常见二进制 / 媒体 / 压缩 / 模型扩展名：内容搜索时直接跳过，避免无谓 open/read。
+const SKIP_BINARY_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "avif", "tiff", "tif", "psd",
+    "mp3", "mp4", "wav", "flac", "ogg", "m4a", "aac", "avi", "mov", "mkv", "webm", "wmv",
+    "zip", "7z", "rar", "tar", "gz", "bz2", "xz", "zst",
+    "exe", "dll", "pdb", "so", "dylib", "lib", "a", "o", "obj", "class", "jar", "war",
+    "pyc", "pyo", "wasm",
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+    "ttf", "otf", "woff", "woff2", "eot",
+    "onnx", "pt", "pth", "ckpt", "safetensors", "bin", "dat",
+    "db", "sqlite", "sqlite3", "dmp", "iso", "dmg", "msi", "nupkg",
+];
+/// 单目录超过该条目数视为大目录，先挂入低优先级队列，让小目录优先出结果。
+const LARGE_DIR_ENTRIES: usize = 200;
+const LOW_PRIO_DEPTH: usize = 6;
 const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024;
 const MAX_MATCHES_PER_FILE: usize = 100;
 const MAX_LIST_FILES: usize = 300_000;
 const PREVIEW_CHARS: usize = 220;
 const FILE_LIST_TTL: Duration = Duration::from_secs(10);
+const STREAM_BATCH_FILES: usize = 8;
+const STREAM_FLUSH_MS: u64 = 40;
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -50,6 +99,9 @@ pub struct SearchOpts {
     pub use_ignore: bool,
     #[serde(default)]
     pub max_results: Option<usize>,
+    /// 前端传入后，内容搜索边查边通过事件流式推送命中结果
+    #[serde(default)]
+    pub search_id: Option<String>,
 }
 
 fn yes() -> bool {
@@ -91,6 +143,16 @@ pub struct ContentHit {
     pub more: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchChunk {
+    pub search_id: String,
+    pub hits: Vec<ContentHit>,
+    pub total_matches: usize,
+    pub searched_files: usize,
+    pub elapsed_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResult {
@@ -101,6 +163,8 @@ pub struct SearchResult {
     pub truncated: bool,
     pub cancelled: bool,
     pub elapsed_ms: u64,
+    /// 为 true 时内容结果已通过 `search://chunk` 实时推送，`content` 留空避免重复传输
+    pub streamed: bool,
 }
 
 // ---------------------------------------------------------------- glob / ignore
@@ -351,11 +415,19 @@ impl PathFilter {
 struct Job {
     dir: PathBuf,
     rel: String,
+    depth: usize,
+    low_priority: bool,
     chain: Option<Arc<IgnoreChain>>,
 }
 
+struct QueueState {
+    high: VecDeque<Job>,
+    low: VecDeque<Job>,
+    in_flight: usize,
+}
+
 struct Queue {
-    state: Mutex<(Vec<Job>, usize)>,
+    state: Mutex<QueueState>,
     cv: Condvar,
 }
 
@@ -364,48 +436,66 @@ impl Queue {
         let mut g = self.state.lock().unwrap_or_else(|p| p.into_inner());
         loop {
             if abort() {
-                g.0.clear();
+                g.high.clear();
+                g.low.clear();
                 self.cv.notify_all();
                 return None;
             }
-            if let Some(j) = g.0.pop() {
-                g.1 += 1;
+            if let Some(j) = g.high.pop_front().or_else(|| g.low.pop_front()) {
+                g.in_flight += 1;
                 return Some(j);
             }
-            if g.1 == 0 {
+            if g.in_flight == 0 {
                 self.cv.notify_all();
                 return None;
             }
             g = self.cv.wait_timeout(g, Duration::from_millis(50)).unwrap_or_else(|p| p.into_inner()).0;
         }
     }
-    fn finish(&self, more: Vec<Job>) {
+    fn finish(&self, high_more: Vec<Job>, low_more: Vec<Job>) {
         let mut g = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        g.1 -= 1;
-        let n = more.len();
-        g.0.extend(more);
-        if n > 0 || g.1 == 0 {
+        g.in_flight -= 1;
+        let n = high_more.len() + low_more.len();
+        g.high.extend(high_more);
+        g.low.extend(low_more);
+        if n > 0 || g.in_flight == 0 {
             self.cv.notify_all();
         }
     }
 }
 
-/// 并行遍历；对每个（未被忽略的）文件调用 `on_file(path, rel, name)`。
+fn is_low_prio_dir(name: &str, depth: usize) -> bool {
+    depth >= LOW_PRIO_DEPTH || LOW_PRIO_DIRS.iter().any(|d| name.eq_ignore_ascii_case(d))
+}
+
+fn is_binary_ext(name: &str) -> bool {
+    let Some((_, ext)) = name.rsplit_once('.') else { return false };
+    SKIP_BINARY_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e))
+}
+
+/// 并行遍历（小目录与浅层源码优先，大目录与产物目录低优先级排后）；
+/// 对每个（未被忽略的）文件调用 `on_file(entry, rel, name)`。
 fn walk(
     root: &Path,
     use_ignore: bool,
+    exclude: Option<&PathFilter>,
     abort: &(dyn Fn() -> bool + Sync),
-    on_file: &(dyn Fn(&Path, &str, &str) + Sync),
+    on_file: &(dyn Fn(&std::fs::DirEntry, &str, &str) + Sync),
 ) {
     let chain = if use_ignore { ancestor_chain(root) } else { None };
-    let queue = Queue { state: Mutex::new((vec![Job { dir: root.to_path_buf(), rel: String::new(), chain }], 0)), cv: Condvar::new() };
+    let mut high = VecDeque::new();
+    high.push_back(Job { dir: root.to_path_buf(), rel: String::new(), depth: 0, low_priority: false, chain });
+    let queue = Queue {
+        state: Mutex::new(QueueState { high, low: VecDeque::new(), in_flight: 0 }),
+        cv: Condvar::new(),
+    };
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 12);
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| {
                 while let Some(job) = queue.pop(abort) {
-                    let more = visit_dir(&job, use_ignore, abort, on_file);
-                    queue.finish(more);
+                    let (high_more, low_more) = visit_dir(&job, use_ignore, exclude, abort, on_file);
+                    queue.finish(high_more, low_more);
                 }
             });
         }
@@ -415,11 +505,25 @@ fn walk(
 fn visit_dir(
     job: &Job,
     use_ignore: bool,
+    exclude: Option<&PathFilter>,
     abort: &(dyn Fn() -> bool + Sync),
-    on_file: &(dyn Fn(&Path, &str, &str) + Sync),
-) -> Vec<Job> {
-    let Ok(rd) = std::fs::read_dir(&job.dir) else { return Vec::new() };
+    on_file: &(dyn Fn(&std::fs::DirEntry, &str, &str) + Sync),
+) -> (Vec<Job>, Vec<Job>) {
+    let Ok(rd) = std::fs::read_dir(&job.dir) else { return (Vec::new(), Vec::new()) };
     let entries: Vec<std::fs::DirEntry> = rd.flatten().collect();
+    // 发现当前目录本身就是大目录且尚未降级：延后到低优先级队列，优先把其他小目录扫完
+    if !job.low_priority && job.depth > 0 && entries.len() >= LARGE_DIR_ENTRIES {
+        return (
+            Vec::new(),
+            vec![Job {
+                dir: job.dir.clone(),
+                rel: job.rel.clone(),
+                depth: job.depth,
+                low_priority: true,
+                chain: job.chain.clone(),
+            }],
+        );
+    }
     let mut chain = job.chain.clone();
     if use_ignore && entries.iter().any(|e| e.file_name() == ".gitignore") {
         if let Ok(text) = std::fs::read_to_string(job.dir.join(".gitignore")) {
@@ -428,7 +532,9 @@ fn visit_dir(
             }
         }
     }
-    let mut subdirs = Vec::new();
+    let mut high_subs = Vec::new();
+    let mut low_subs = Vec::new();
+    let mut files = Vec::new();
     for e in entries {
         if abort() {
             break;
@@ -450,12 +556,32 @@ fn visit_dir(
             }
         }
         if is_dir {
-            subdirs.push(Job { dir: e.path(), rel, chain: chain.clone() });
+            // exclude 命中目录时直接剪枝整个子树
+            if let Some(ex) = exclude {
+                let dir_probe = format!("{rel}/");
+                if ex.matches(&dir_probe, &name) {
+                    continue;
+                }
+            }
+            let next_depth = job.depth + 1;
+            let low = job.low_priority || is_low_prio_dir(&name, next_depth);
+            let sub = Job { dir: e.path(), rel, depth: next_depth, low_priority: low, chain: chain.clone() };
+            if low {
+                low_subs.push(sub);
+            } else {
+                high_subs.push(sub);
+            }
         } else {
-            on_file(&e.path(), &rel, &name);
+            files.push((e, rel, name.into_owned()));
         }
     }
-    subdirs
+    for (entry, rel, name) in files {
+        if abort() {
+            break;
+        }
+        on_file(&entry, &rel, &name);
+    }
+    (high_subs, low_subs)
 }
 
 // ---------------------------------------------------------------- file-name mode
@@ -478,7 +604,7 @@ fn list_files(root: &Path, use_ignore: bool, abort: &(dyn Fn() -> bool + Sync)) 
     let out = Mutex::new(Vec::new());
     let full = AtomicBool::new(false);
     let stop = || abort() || full.load(Ordering::Relaxed);
-    walk(root, use_ignore, &stop, &|_p, rel, _n| {
+    walk(root, use_ignore, None, &stop, &|_entry, rel, _n| {
         let mut g = out.lock().unwrap_or_else(|p| p.into_inner());
         if g.len() >= MAX_LIST_FILES {
             full.store(true, Ordering::Relaxed);
@@ -505,6 +631,29 @@ fn is_boundary(prev: Option<char>, c: char) -> bool {
 
 /// 子序列模糊匹配打分；None = 不匹配。`text` 为原文，`indices` 为 char 下标。
 pub fn fuzzy_score(query: &str, text: &str) -> Option<(i64, Vec<usize>)> {
+    // 零分配 ASCII 快速预检：大仓库按文件名搜索时先过滤掉 95%+ 不可能命中的路径
+    if query.is_ascii() && text.is_ascii() {
+        let tb = text.as_bytes();
+        let mut ti = 0usize;
+        for &qb in query.as_bytes() {
+            if qb.is_ascii_whitespace() {
+                continue;
+            }
+            let ql = qb.to_ascii_lowercase();
+            let mut ok = false;
+            while ti < tb.len() {
+                if tb[ti].to_ascii_lowercase() == ql {
+                    ti += 1;
+                    ok = true;
+                    break;
+                }
+                ti += 1;
+            }
+            if !ok {
+                return None;
+            }
+        }
+    }
     let q: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).flat_map(|c| c.to_lowercase()).collect();
     if q.is_empty() {
         return Some((0, Vec::new()));
@@ -683,7 +832,14 @@ fn search_in_bytes(data: &[u8], re: &BytesRegex, max: usize) -> (Vec<LineMatch>,
     (out, more)
 }
 
-fn search_content(root: &Path, opts: &SearchOpts, abort: &(dyn Fn() -> bool + Sync), res: &mut SearchResult) -> Result<(), String> {
+fn search_content<F: Fn(SearchChunk) + Sync>(
+    root: &Path,
+    opts: &SearchOpts,
+    started: Instant,
+    abort: &(dyn Fn() -> bool + Sync),
+    on_chunk: &F,
+    res: &mut SearchResult,
+) -> Result<(), String> {
     let re = build_matcher(opts)?;
     let include = PathFilter::new(&opts.include)?;
     let exclude = PathFilter::new(&opts.exclude)?;
@@ -691,20 +847,27 @@ fn search_content(root: &Path, opts: &SearchOpts, abort: &(dyn Fn() -> bool + Sy
     let total = AtomicUsize::new(0);
     let searched = AtomicUsize::new(0);
     let full = AtomicBool::new(false);
+    let any_more = AtomicBool::new(false);
     let hits = Mutex::new(Vec::<ContentHit>::new());
+    let stream_id = opts.search_id.as_deref().filter(|s| !s.is_empty());
+    let pending = Mutex::new((Vec::<ContentHit>::new(), Instant::now(), false));
     let stop = || abort() || full.load(Ordering::Relaxed);
-    walk(root, opts.use_ignore, &stop, &|path, rel, name| {
+    walk(root, opts.use_ignore, exclude.as_ref(), &stop, &|entry, rel, name| {
+        if is_binary_ext(name) {
+            return;
+        }
         if include.as_ref().is_some_and(|f| !f.matches(rel, name)) || exclude.as_ref().is_some_and(|f| f.matches(rel, name)) {
             return;
         }
         if full.load(Ordering::Relaxed) {
             return;
         }
-        let Ok(meta) = std::fs::metadata(path) else { return };
+        let Ok(meta) = entry.metadata() else { return };
         if meta.len() > MAX_FILE_SIZE || meta.len() == 0 {
             return;
         }
-        let Ok(data) = std::fs::read(path) else { return };
+        let path = entry.path();
+        let Ok(data) = std::fs::read(&path) else { return };
         if memchr::memchr(0, &data[..data.len().min(8192)]).is_some() {
             return; // 二进制
         }
@@ -713,24 +876,71 @@ fn search_content(root: &Path, opts: &SearchOpts, abort: &(dyn Fn() -> bool + Sy
         if matches.is_empty() {
             return;
         }
+        if more {
+            any_more.store(true, Ordering::Relaxed);
+        }
         let n = matches.len();
         let before = total.fetch_add(n, Ordering::Relaxed);
         if before + n >= limit {
             full.store(true, Ordering::Relaxed);
         }
-        hits.lock().unwrap_or_else(|p| p.into_inner()).push(ContentHit {
+        let hit = ContentHit {
             path: path.to_string_lossy().to_string(),
             rel: rel.replace('/', "\\"),
             matches,
             more,
-        });
+        };
+        if let Some(sid) = stream_id {
+            let batch = {
+                let mut g = pending.lock().unwrap_or_else(|p| p.into_inner());
+                g.0.push(hit);
+                // 首条立即推，后续按小批或 40ms 节奏推，兼顾即时感与 IPC 流畅
+                if !g.2 || g.0.len() >= STREAM_BATCH_FILES || g.1.elapsed() >= Duration::from_millis(STREAM_FLUSH_MS) {
+                    g.1 = Instant::now();
+                    g.2 = true;
+                    Some(std::mem::take(&mut g.0))
+                } else {
+                    None
+                }
+            };
+            if let Some(batch) = batch {
+                if !abort() {
+                    on_chunk(SearchChunk {
+                        search_id: sid.to_string(),
+                        hits: batch,
+                        total_matches: total.load(Ordering::Relaxed),
+                        searched_files: searched.load(Ordering::Relaxed),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    });
+                }
+            }
+        } else {
+            hits.lock().unwrap_or_else(|p| p.into_inner()).push(hit);
+        }
     });
-    let mut hits = hits.into_inner().unwrap_or_else(|p| p.into_inner());
-    hits.sort_by(|a, b| a.rel.to_lowercase().cmp(&b.rel.to_lowercase()));
-    res.total_matches = hits.iter().map(|h| h.matches.len()).sum();
-    res.truncated = full.load(Ordering::Relaxed) || hits.iter().any(|h| h.more);
-    res.searched_files = searched.load(Ordering::Relaxed);
-    res.content = hits;
+    if let Some(sid) = stream_id {
+        let rest = std::mem::take(&mut pending.lock().unwrap_or_else(|p| p.into_inner()).0);
+        if !rest.is_empty() && !abort() {
+            on_chunk(SearchChunk {
+                search_id: sid.to_string(),
+                hits: rest,
+                total_matches: total.load(Ordering::Relaxed),
+                searched_files: searched.load(Ordering::Relaxed),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            });
+        }
+        res.total_matches = total.load(Ordering::Relaxed);
+        res.truncated = full.load(Ordering::Relaxed) || any_more.load(Ordering::Relaxed);
+        res.searched_files = searched.load(Ordering::Relaxed);
+        res.streamed = true;
+    } else {
+        let mut hits = hits.into_inner().unwrap_or_else(|p| p.into_inner());
+        hits.sort_by(|a, b| a.rel.to_lowercase().cmp(&b.rel.to_lowercase()));
+        res.total_matches = hits.iter().map(|h| h.matches.len()).sum();
+        res.truncated = full.load(Ordering::Relaxed) || any_more.load(Ordering::Relaxed);
+        res.searched_files = searched.load(Ordering::Relaxed);
+        res.content = hits;
+    }
     Ok(())
 }
 
@@ -742,6 +952,10 @@ pub fn cancel() {
 
 /// 阻塞执行（调用方放到 spawn_blocking 里）。新的调用会让进行中的旧搜索尽快返回 cancelled。
 pub fn search(opts: SearchOpts) -> Result<SearchResult, String> {
+    search_with_progress(opts, |_| {})
+}
+
+pub fn search_with_progress<F: Fn(SearchChunk) + Sync>(opts: SearchOpts, on_chunk: F) -> Result<SearchResult, String> {
     let my_gen = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let abort = move || GENERATION.load(Ordering::Relaxed) != my_gen;
     let started = Instant::now();
@@ -756,7 +970,7 @@ pub fn search(opts: SearchOpts) -> Result<SearchResult, String> {
     let mut res = SearchResult::default();
     if !opts.query.is_empty() {
         if opts.mode == "content" {
-            search_content(&root, &opts, &abort, &mut res)?;
+            search_content(&root, &opts, started, &abort, &on_chunk, &mut res)?;
         } else {
             search_files(&root, &opts, &abort, &mut res);
         }
@@ -848,6 +1062,7 @@ mod tests {
             exclude: String::new(),
             use_ignore: true,
             max_results: None,
+            search_id: None,
         };
         let re = build_matcher(&opts).unwrap();
         let data = "第一行\r\n  你好😀世界 世界\nend".as_bytes();
@@ -875,6 +1090,7 @@ mod tests {
             exclude: String::new(),
             use_ignore: true,
             max_results: None,
+            search_id: None,
         };
         let re = build_matcher(&opts).unwrap();
         assert_eq!(search_in_bytes(b"Foo foo FooBar", &re, 10).0.len(), 1);
@@ -917,6 +1133,7 @@ mod tests {
             exclude: String::new(),
             use_ignore: true,
             max_results: None,
+            search_id: None,
         };
         let content = |q: &str, ww: bool| search(mk(q, "content", ww)).unwrap().total_matches;
         assert_eq!(content("voice_server", false), 1, "ignored .swp must be skipped");
@@ -930,6 +1147,45 @@ mod tests {
         assert_eq!(files("voice_server"), vec!["src/voice_server.py"]);
         assert_eq!(files("_server"), vec!["src/voice_server.py"]);
         assert_eq!(files("voice＿"), vec!["src/voice_server.py"]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn streaming_and_binary_skip_and_small_dir_priority() {
+        let base = std::env::temp_dir().join(format!("shidrive-search-stream-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("dist")).unwrap();
+        std::fs::write(base.join("src/app.ts"), "export const magicNeedle = 1;\n").unwrap();
+        std::fs::write(base.join("src/logo.png"), "magicNeedle inside fake png ext").unwrap();
+        std::fs::write(base.join("dist/bundle.js"), "var magicNeedle = 2;\n").unwrap();
+        let chunks = Mutex::new(Vec::<SearchChunk>::new());
+        let opts = SearchOpts {
+            root: base.to_string_lossy().to_string(),
+            query: "magicNeedle".into(),
+            mode: "content".into(),
+            case_sensitive: true,
+            whole_word: false,
+            regex: false,
+            include: String::new(),
+            exclude: String::new(),
+            use_ignore: true,
+            max_results: None,
+            search_id: Some("test-stream-1".into()),
+        };
+        let res = search_with_progress(opts, |c| chunks.lock().unwrap().push(c)).unwrap();
+        assert!(res.streamed);
+        assert!(res.content.is_empty(), "streamed mode omits duplicate content payload");
+        assert_eq!(res.total_matches, 2, "png extension skipped, src + dist found");
+        let got: Vec<String> = chunks
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .flat_map(|c| c.hits.into_iter().map(|h| h.rel.replace('\\', "/")))
+            .collect();
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&"src/app.ts".to_string()));
+        assert!(got.contains(&"dist/bundle.js".to_string()));
+        assert!(!got.contains(&"src/logo.png".to_string()));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

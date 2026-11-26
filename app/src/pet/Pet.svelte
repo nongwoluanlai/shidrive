@@ -13,7 +13,7 @@
   import { emitSkinEvent, onSkinEvent } from "../lib/skin-fx/bus";
   import SkinCharacter from "../lib/components/SkinCharacter.svelte";
   // 麦克风在桌宠窗口里开（可见窗口的 AudioContext 才能运行；主窗口藏进托盘后录音会挂起）
-  import { vc, listenOnce, stopCapture, refreshVoice } from "../lib/assistant/voice.svelte";
+  import { vc, listenOnce, stopCapture, refreshVoice, setScreenLocked } from "../lib/assistant/voice.svelte";
   import type { PetCmd, PetState } from "../lib/assistant/pet.svelte";
   import logo from "../assets/logo.png";
 
@@ -149,6 +149,14 @@
         if (e.payload.locale === "en" || e.payload.locale === "zh") app.locale = e.payload.locale;
       }),
       listen("pet://shown", () => cmd({ kind: "ready" })),
+      listen<{ locked: boolean }>("system://lock-changed", (e) => {
+        const locked = !!e.payload?.locked;
+        if (locked) {
+          autoTalk = false;
+          autoGen++;
+        }
+        setScreenLocked(locked);
+      }),
     ];
     const offClick = onSkinEvent((ev) => { if (ev === "character.click") openInput(); });
     cmd({ kind: "ready" });

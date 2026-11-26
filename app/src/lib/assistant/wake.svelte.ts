@@ -1,9 +1,10 @@
 // 唤醒词（如「Christina」）：开启后常开麦克风，每约 0.3 秒把 16k 音频片段交给本地 sherpa-onnx 关键词检测；
 // 听到唤醒词 → 提示音 → 唤起助手（直接语音输入或只打开输入框）。全部离线，音频不离开本机。
 // 录音 / 识别 / 朗读期间不检测（避免助手自己的声音触发）；窗口在后台时按设置暂停并释放麦克风。
+import { listen } from "@tauri-apps/api/event";
 import { api } from "../ipc";
 import { t } from "../i18n";
-import { vc } from "./voice.svelte";
+import { vc, setScreenLocked } from "./voice.svelte";
 
 export const wk = $state({
   /** 麦克风已打开、正在检测 */
@@ -11,6 +12,8 @@ export const wk = $state({
   error: "",
   /** 页面可见（后台时按设置暂停） */
   visible: typeof document === "undefined" ? true : document.visibilityState === "visible",
+  /** Windows 锁屏中：强制释放麦克风与音频，不检测唤醒词 */
+  locked: false,
   /** 出错后重试的计数（变化即重新评估） */
   retry: 0,
   /** 设置页打开时只提示「听到了」，不唤起助手 */
@@ -56,13 +59,23 @@ function initVisibility() {
   if (visInit || typeof document === "undefined") return;
   visInit = true;
   document.addEventListener("visibilitychange", () => (wk.visible = document.visibilityState === "visible"));
+  void api.systemIsLocked().then((locked) => {
+    wk.locked = !!locked;
+    setScreenLocked(wk.locked);
+    if (wk.locked) stop(true);
+  }).catch(() => {});
+  void listen<{ locked: boolean }>("system://lock-changed", (e) => {
+    wk.locked = !!e.payload?.locked;
+    setScreenLocked(wk.locked);
+    if (wk.locked) stop(true);
+  });
 }
 
 /** 打开 / 关闭检测（由组件里的 $effect 根据设置与可见性调用） */
 export function setWake(on: boolean, hit: Hit) {
   initVisibility();
   onHit = hit;
-  if (on) void start();
+  if (on && !wk.locked) void start();
   else stop(true);
 }
 
@@ -75,7 +88,7 @@ function bytesToB64(bytes: Uint8Array): string {
 }
 
 async function start() {
-  if (stream || starting) return;
+  if (wk.locked || stream || starting) return;
   starting = true;
   const my = ++session;
   try {

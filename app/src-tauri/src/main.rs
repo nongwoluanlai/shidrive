@@ -27,6 +27,7 @@ mod setup;
 mod skins;
 mod toast;
 mod pet;
+mod power;
 mod web;
 
 use std::sync::Arc;
@@ -103,6 +104,9 @@ fn graceful_exit(app: &tauri::AppHandle) {
         for id in conns {
             tauri::async_runtime::block_on(mgr.disconnect(&id));
         }
+    }
+    if let Some(sleep) = app.try_state::<Arc<crate::power::SleepInhibitor>>() {
+        sleep.release_all();
     }
     // 最后显式终结子进程 Job（工作流 shell、隧道残留等；本机实测
     // kill-on-close 标志读回不符，不依赖句柄关闭语义）
@@ -268,10 +272,20 @@ fn main() {
             // MCP server for shared context + skills
             mcp::start(app.handle().clone(), db.clone(), engine.clone());
 
+            let prevent_sleep = db
+                .get_setting(power::SETTING_PREVENT_SLEEP)
+                .ok()
+                .flatten()
+                .as_deref()
+                != Some("0");
+            let sleep = power::SleepInhibitor::new(prevent_sleep);
+            power::start_lock_monitor(app.handle().clone());
+
             app.manage(db);
             app.manage(agents);
             app.manage(engine);
-            app.manage(Arc::new(crate::assistant::AssistantRuntime::new(data_dir.clone())));
+            app.manage(sleep.clone());
+            app.manage(Arc::new(crate::assistant::AssistantRuntime::new(data_dir.clone()).with_sleep(sleep)));
             app.manage(Arc::new(crate::voice::VoiceRuntime::new(data_dir.clone())));
             app.manage(crate::remote_mcp::RemoteManager::new());
             app.manage(crate::toast::ToastState::new());
@@ -419,6 +433,7 @@ fn main() {
             commands::remote_grant_resume,
             commands::remote_timer_set,
             commands::system_after_action,
+            power::system_is_locked,
             commands::remote_oauth_pending_list,
             commands::remote_oauth_decide,
             commands::remote_oauth_tokens_list,

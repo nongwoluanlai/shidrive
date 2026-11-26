@@ -32,6 +32,22 @@ export interface FileEditorState {
   dirty: boolean;
   /** collapsed => only a slim strip; open => editor visible */
   collapsed: boolean;
+  /** 原文件换行风格：textarea 会统一成 LF，保存时按此还原 */
+  eol: "\r\n" | "\n";
+}
+
+export function detectEol(text: string): "\r\n" | "\n" {
+  let crlf = 0;
+  let lf = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) {
+      if (i > 0 && text.charCodeAt(i - 1) === 13) crlf++;
+      else lf++;
+    }
+  }
+  if (crlf > 0 && crlf >= lf) return "\r\n";
+  if (lf > 0) return "\n";
+  return typeof navigator !== "undefined" && /win/i.test(navigator.platform) ? "\r\n" : "\n";
 }
 
 export interface DisplayItem {
@@ -125,7 +141,9 @@ export const app = $state({
   editorJump: null as { path: string; line: number; col: number; len: number; seq: number } | null,
   /** 全局搜索面板（Alt+F） */
   searchOpen: false,
-  searchMode: "files" as "files" | "content",
+  searchMode: "content" as "files" | "content",
+  /** 执行后动作变更序号：触发关机自动复位时通知会话页同步下拉框 */
+  afterActionRev: 0,
   /** workflows of the current project (sidebar bottom half) */
   workflows: [] as Workflow[],
   /** currently selected workflow id in the workflows view */
@@ -546,9 +564,17 @@ export function applySessionUpdate(agentType: AgentType, contextId: string | nul
 }
 
 /** Return true only for the accepted completion (after-action must fire once). */
-export function applyBindingStatus(p: TurnIdentity & { contextId: string; agentType: string; status: string }): boolean {
+export function applyBindingStatus(p: TurnIdentity & { contextId: string; agentType: string; status: string; reconciled?: boolean }): boolean {
   const key = chatKey(p.contextId, p.agentType);
-  if (p.source === "workflow" || !p.turnId || app.bindingSession[key] !== p.sessionId) return false;
+  if (p.source === "workflow") return false;
+  // 后端收尾幽灵运行态：无条件复位前端运行标志，不触发执行后动作
+  if (p.reconciled && (p.status === "completed" || p.status === "interrupted")) {
+    if (app.streaming[key] || app.activeTurn[key] || app.promptRequests[key]) {
+      finishTurn(p.agentType, p.contextId);
+    }
+    return false;
+  }
+  if (!p.turnId || app.bindingSession[key] !== p.sessionId) return false;
   if (app.promptRequests[key] && app.promptRequests[key] !== p.turnId) return false;
   if (p.status === "running") {
     app.activeTurn[key] = p;
@@ -557,8 +583,9 @@ export function applyBindingStatus(p: TurnIdentity & { contextId: string; agentT
     markTurn(key, true);
   } else if (p.status === "completed" || p.status === "interrupted") {
     const active = app.activeTurn[key];
-    if (!active || active.turnId !== p.turnId || active.connectionId !== p.connectionId) return false;
-    finishTurn(p.agentType, p.contextId, p.turnId);
+    if (active && (active.turnId !== p.turnId || active.connectionId !== p.connectionId)) return false;
+    if (!active && !app.streaming[key]) return false;
+    finishTurn(p.agentType, p.contextId, active ? p.turnId : undefined);
     return true;
   }
   return false;
@@ -684,7 +711,9 @@ export function sharedContextPrompt(contextId: string): string {
 }
 
 export function openEditor(path: string, content: string, binary: boolean) {
-  app.editor = { path, content, binary, dirty: false, collapsed: false };
+  const eol = binary ? "\n" : detectEol(content);
+  const normalized = binary ? content : content.replace(/\r\n/g, "\n");
+  app.editor = { path, content: normalized, binary, dirty: false, collapsed: false, eol };
 }
 
 export function closeEditor() {

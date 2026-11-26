@@ -96,6 +96,25 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
 
   let showNewProject = $state(false);
 
+  async function pickProjectDir(mode: "new" | "edit") {
+    const initial = (mode === "new" ? projectPath : editPath).trim() || undefined;
+    try {
+      const dir = await api.pickFolder(t("选择项目根目录"), initial);
+      if (!dir) return;
+      if (mode === "new") {
+        projectPath = dir;
+        if (!projectName.trim()) {
+          const base = dir.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "";
+          if (base) projectName = base;
+        }
+      } else {
+        editPath = dir;
+      }
+    } catch (e) {
+      toast("error", String(e));
+    }
+  }
+
   function openNewProject() {
     projectName = "";
     projectDesc = "";
@@ -431,7 +450,13 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       <header>{t("新建项目")} <button class="btn ghost sm" onclick={() => (showNewProject = false)}>✕</button></header>
       <div class="body col">
         <div class="field"><label>{t("名称 *")}</label><input bind:value={projectName} placeholder={t("例如：我的项目")} onkeydown={(e) => e.key === "Enter" && createProject()} /></div>
-        <div class="field"><label>{t("根目录")}</label><input bind:value={projectPath} placeholder="D:\path\to\project" /></div>
+        <div class="field">
+          <label>{t("根目录")}</label>
+          <div class="pathrow">
+            <input bind:value={projectPath} placeholder="D:\path\to\project" />
+            <button class="btn sm" type="button" onclick={() => void pickProjectDir("new")}><Icon name="folder" size={13} /> {t("选择目录")}</button>
+          </div>
+        </div>
         <div class="field"><label>{t("描述")}</label><textarea rows="2" bind:value={projectDesc} placeholder={t("项目简介")}></textarea></div>
       </div>
       <footer>
@@ -448,7 +473,13 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
       <header>{t("编辑项目")} <button class="btn ghost sm" onclick={() => (showEditProject = false)}>✕</button></header>
       <div class="body col">
         <div class="field"><label>{t("名称 *")}</label><input bind:value={editName} /></div>
-        <div class="field"><label>{t("根目录")}</label><input bind:value={editPath} placeholder="D:\path\to\project" /></div>
+        <div class="field">
+          <label>{t("根目录")}</label>
+          <div class="pathrow">
+            <input bind:value={editPath} placeholder="D:\path\to\project" />
+            <button class="btn sm" type="button" onclick={() => void pickProjectDir("edit")}><Icon name="folder" size={13} /> {t("选择目录")}</button>
+          </div>
+        </div>
         <div class="field"><label>{t("描述")}</label><textarea rows="2" bind:value={editDesc}></textarea></div>
       </div>
       <footer>
@@ -665,6 +696,19 @@ import { confirmDialog, promptDialog } from "../dialog.svelte";
     display: flex;
     flex-direction: column;
     gap: 12px;
+  }
+  .pathrow {
+    display: flex;
+    gap: 6px;
+    align-items: stretch;
+  }
+  .pathrow input {
+    flex: 1;
+    min-width: 0;
+  }
+  .pathrow .btn {
+    flex: none;
+    white-space: nowrap;
   }
   .note {
     color: var(--text-faint);

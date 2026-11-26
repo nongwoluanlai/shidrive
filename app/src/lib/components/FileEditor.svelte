@@ -2,13 +2,18 @@
   import { t } from "../i18n";
   // Collapsible file preview/editor pane. Save is debounced.
   import { tick, untrack } from "svelte";
-  import { app, toast } from "../state.svelte";
+  import { app, toast, openEditor } from "../state.svelte";
   import { api } from "../ipc";
   import Icon from "./Icon.svelte";
   import { LANG_LABEL, highlightToBlocks, langForPath, langLoaded, loadLang, loadLangDeep } from "../highlight";
+  import { md } from "../markdown";
 
   const ed = $derived(app.editor!);
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function applyEol(text: string, eol: "\r\n" | "\n"): string {
+    return eol === "\r\n" ? text.replace(/\r?\n/g, "\r\n") : text.replace(/\r\n/g, "\n");
+  }
 
   function queueSave() {
     if (!app.editor) return;
@@ -16,16 +21,87 @@
     if (saveTimer) clearTimeout(saveTimer);
     // snapshot at queue time: if the user opens another file before the timer
     // fires, these edits must land on the file they were typed into
-    const snap = { path: app.editor.path, content: app.editor.content };
+    const snap = { path: app.editor.path, content: app.editor.content, eol: app.editor.eol };
     saveTimer = setTimeout(async () => {
       try {
-        await api.fsWrite(snap.path, snap.content);
+        await api.fsWrite(snap.path, applyEol(snap.content, snap.eol));
         if (app.editor?.path === snap.path) app.editor.dirty = false;
       } catch (e) {
         toast("error", String(e));
       }
     }, 500);
   }
+
+  function toggleEol() {
+    if (!app.editor || app.editor.binary) return;
+    app.editor.eol = app.editor.eol === "\r\n" ? "\n" : "\r\n";
+    queueSave();
+  }
+
+  // ================= Markdown 预览 =================
+  const isMarkdown = $derived(!!ed && !ed.binary && /\.(md|markdown|mdx)$/i.test(ed.path));
+  let mdPreview = $state(false);
+  const previewHtml = $derived(isMarkdown && mdPreview ? md(ed.content) : "");
+
+  /** 文档里的相对链接以「这篇文档所在目录」为基准（而不是进程工作目录） */
+  function resolveDocLink(target: string): string {
+    // 绝对形式原样返回：网址、盘符路径、UNC
+    if (/^[a-z][a-z\d+.-]*:\/\//i.test(target) || /^[a-z]:[\\/]/i.test(target) || target.startsWith("\\\\")) return target;
+    const sep = ed.path.includes("\\") && !ed.path.includes("/") ? "\\" : "/";
+    const parts = ed.path.split(/[\\/]/);
+    parts.pop();
+    const out: string[] = parts;
+    const pieces = target.split(/[\\/]/);
+    const rooted = /^[\\/]/.test(target);
+    if (rooted) {
+      // 以 / 开头：相对盘符根（C:\a\b.md + /c.md → C:\c.md）；无盘符时是 POSIX 根，保留开头的 /
+      if (/^[a-z]:$/i.test(out[0] ?? "")) out.length = 1;
+      else if (sep === "/") { out.length = 0; out.push(""); }
+      else out.length = 0;
+    }
+    for (const piece of pieces) {
+      if (!piece || piece === ".") continue;
+      if (piece === "..") { if (out.length && out[out.length - 1] !== "..") out.pop(); continue; }
+      out.push(piece);
+    }
+    return out.join(sep);
+  }
+
+  async function onPreviewClick(e: MouseEvent) {
+    const a = (e.target as Element).closest("a, .md-file");
+    if (!a) return;
+    e.preventDefault();
+    const raw = a.getAttribute("data-path") ?? a.getAttribute("href") ?? "";
+    const hashAt = raw.indexOf("#");
+    const target = hashAt > 0 ? raw.slice(0, hashAt) : raw;
+    if (!target) return;
+    if (/^https?:\/\//i.test(target)) { void api.fsOpenDefault(target).catch((err) => toast("error", String(err))); return; }
+    const path = resolveDocLink(target);
+    try {
+      // 文档里的链接就在编辑器里打开（和搜索结果跳转一致）；不是文本文件再交给系统
+      if (app.editor?.path === path) { app.editor.collapsed = false; return; }
+      const [content, binary] = await api.fsRead(path);
+      if (binary) { void api.fsOpenDefault(path).catch(() => {}); return; }
+      openEditor(path, content, binary);
+    } catch (err) {
+      toast("error", String(err));
+    }
+  }
+
+  // ================= 行号槽 =================
+  let gutterEl: HTMLDivElement | undefined = $state();
+  const lineCount = $derived.by(() => {
+    const s = ed?.content ?? "";
+    let n = 1;
+    for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) === 10) n++;
+    return n;
+  });
+  const lineNums = $derived.by(() => {
+    const parts: string[] = [];
+    for (let i = 1; i <= lineCount; i++) parts.push(String(i));
+    return parts.join("\n");
+  });
+  const gutterCh = $derived(Math.max(3, String(lineCount).length));
 
   function relPath(p: string): string {
     const projRoot = app.projects.find((x) => x.id === app.projectId)?.root_path ?? "";
@@ -149,6 +225,12 @@
       el.style.borderStyle = "solid";
       el.style.borderColor = "transparent";
     }
+    if (gutterEl) {
+      gutterEl.style.fontFamily = cs.fontFamily;
+      gutterEl.style.fontSize = cs.fontSize;
+      gutterEl.style.lineHeight = cs.lineHeight;
+      gutterEl.style.paddingTop = cs.paddingTop;
+    }
     syncScroll();
   }
   function syncScroll() {
@@ -158,6 +240,7 @@
       el.scrollTop = taEl.scrollTop;
       el.scrollLeft = taEl.scrollLeft;
     }
+    if (gutterEl) gutterEl.scrollTop = taEl.scrollTop;
   }
   // 镜像出现/内容变化后：对齐样式与滚动，并重新标出当前项
   // 注意要等 tick()：{@html} 的 DOM 替换可能晚于本 effect，先标上的 .cur 会被新 HTML 整个冲掉
@@ -226,8 +309,13 @@
   $effect(() => {
     const j = app.editorJump;
     const path = ed?.path;
+    if (!j || j.path !== path || j.seq === lastJumpSeq) return;
+    if (mdPreview) {
+      mdPreview = false;
+      return; // 等待切回编辑态后再由本 effect 执行定位
+    }
     const el = taEl;
-    if (!j || !el || j.path !== path || j.seq === lastJumpSeq) return;
+    if (!el) return;
     lastJumpSeq = j.seq;
     void tick().then(() => {
       if (!taEl) return;
@@ -283,6 +371,10 @@
 
   async function openFind() {
     if (!ed || ed.binary) return;
+    if (mdPreview) {
+      mdPreview = false;
+      await tick();
+    }
     // 选中了单行短文本：作为查找词（与 VS Code 一致）
     if (taEl && document.activeElement === taEl) {
       const sel = taEl.value.slice(taEl.selectionStart, taEl.selectionEnd);
@@ -340,13 +432,23 @@
     }
   }
 
-  // 切换文件时保留查找框，但不沿用上一个文件的当前项
+  // 切换文件时保留查找框，但不沿用上一个文件的当前项；切文件时默认回到编辑态
   let lastPath = "";
   $effect(() => {
     const p = ed?.path ?? "";
     if (p !== lastPath) {
       lastPath = p;
       cur = -1;
+      mdPreview = false;
+    }
+  });
+  // 从预览切回编辑态时：同步行号槽/着色层样式与滚动
+  $effect(() => {
+    if (!mdPreview && taEl && gutterEl) {
+      void tick().then(() => {
+        syncMirrorStyle();
+        if (hlReady && hlEl) paintHl();
+      });
     }
   });
 
@@ -579,7 +681,23 @@
     <span class="ppath" title={ed.path}>{relPath(ed.path)}</span>
     {#if ed.dirty}<span class="badge warn">{t("未保存")}</span>{/if}
     <span class="spacer"></span>
-    {#if !ed.binary && lang}
+    {#if isMarkdown}
+      <button
+        class="btn ghost sm"
+        class:active={mdPreview}
+        title={mdPreview ? t("切换回源码编辑") : t("预览 Markdown")}
+        aria-pressed={mdPreview}
+        onclick={() => (mdPreview = !mdPreview)}
+      >{mdPreview ? t("编辑") : t("预览")}</button>
+    {/if}
+    {#if !ed.binary}
+      <button
+        class="btn ghost sm eol"
+        title={t("当前换行符：{eol}（点击切换并保存）", { eol: ed.eol === "\r\n" ? "CRLF (Windows)" : "LF (Unix)" })}
+        onclick={toggleEol}
+      >{ed.eol === "\r\n" ? "CRLF" : "LF"}</button>
+    {/if}
+    {#if !ed.binary && lang && !mdPreview}
       <!-- 语言名 + 着色开关（偏好存 localStorage，默认开） -->
       <button
         class="btn ghost sm lang"
@@ -621,27 +739,33 @@
   {/if}
   {#if ed.binary}
     <div class="empty">{t("无法预览二进制文件")}</div>
+  {:else if isMarkdown && mdPreview}
+    <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+    <div class="md-preview md" onclick={onPreviewClick}>{@html previewHtml}</div>
   {:else}
-    <div class="area" bind:this={areaEl}>
-      {#if mirrorHtml}
-        <!-- 高亮镜像：内容已逐段 HTML 转义，只插入 <mark> -->
-        <div class="mirror" class:stale bind:this={mirrorEl} aria-hidden="true">{@html mirrorHtml}</div>
-      {/if}
-      {#if hlReady}
-        <!-- 着色层：内容由 paintHl() 按块增量写入 -->
-        <div class="hl scheme-{hlScheme}" class:hidden={!hlShown} bind:this={hlEl} aria-hidden="true"></div>
-      {/if}
-      <textarea
-        class="editor-area"
-        class:hl-on={hlShown}
-        bind:this={taEl}
-        bind:value={ed.content}
-        oninput={queueSave}
-        onscroll={syncScroll}
-        oncompositionstart={() => (composing = true)}
-        oncompositionend={() => (composing = false)}
-        spellcheck="false"
-      ></textarea>
+    <div class="editor-body">
+      <div class="gutter" bind:this={gutterEl} style="min-width: calc({gutterCh}ch + 20px)" aria-hidden="true">{lineNums}</div>
+      <div class="area" bind:this={areaEl}>
+        {#if mirrorHtml}
+          <!-- 高亮镜像：内容已逐段 HTML 转义，只插入 <mark> -->
+          <div class="mirror" class:stale bind:this={mirrorEl} aria-hidden="true">{@html mirrorHtml}</div>
+        {/if}
+        {#if hlReady}
+          <!-- 着色层：内容由 paintHl() 按块增量写入 -->
+          <div class="hl scheme-{hlScheme}" class:hidden={!hlShown} bind:this={hlEl} aria-hidden="true"></div>
+        {/if}
+        <textarea
+          class="editor-area"
+          class:hl-on={hlShown}
+          bind:this={taEl}
+          bind:value={ed.content}
+          oninput={queueSave}
+          onscroll={syncScroll}
+          oncompositionstart={() => (composing = true)}
+          oncompositionend={() => (composing = false)}
+          spellcheck="false"
+        ></textarea>
+      </div>
     </div>
   {/if}
 </div>
@@ -703,9 +827,32 @@
     background: color-mix(in srgb, var(--accent) 22%, transparent);
     color: var(--accent);
   }
+  .editor-body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    overflow: hidden;
+  }
+  .gutter {
+    flex: none;
+    overflow: hidden;
+    padding: 12px 10px 28px 10px;
+    background: var(--bg-panel);
+    border-right: 1px solid var(--border-soft);
+    color: var(--text-faint);
+    font-family: var(--mono);
+    font-size: 0.86em;
+    line-height: 1.6;
+    text-align: right;
+    white-space: pre;
+    font-variant-numeric: tabular-nums;
+    user-select: none;
+    pointer-events: none;
+  }
   .area {
     position: relative;
     flex: 1;
+    min-width: 0;
     min-height: 0;
     display: flex;
     background: var(--bg);
@@ -723,8 +870,103 @@
     padding: 12px 16px;
     resize: none;
     user-select: text;
-    /* 镜像也预留同宽滚动条槽：有无滚动条时两边的换行宽度都一致 */
+    white-space: pre;
+    overflow-wrap: normal;
+    overflow: auto;
+    /* 镜像也预留同宽滚动条槽：有无滚动条时两边的宽度都一致 */
     scrollbar-gutter: stable;
+  }
+  .eol {
+    font-size: 0.76em;
+    font-family: var(--mono);
+    color: var(--text-faint);
+  }
+  .md-preview {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 16px 22px 28px;
+    user-select: text;
+    line-height: 1.7;
+    font-size: 0.94em;
+    color: var(--text);
+  }
+  .md-preview :global(h1),
+  .md-preview :global(h2),
+  .md-preview :global(h3),
+  .md-preview :global(h4) {
+    margin: 1.1em 0 0.5em;
+    line-height: 1.35;
+    font-weight: 600;
+  }
+  .md-preview :global(h1) { font-size: 1.5em; padding-bottom: 0.25em; border-bottom: 1px solid var(--border-soft); }
+  .md-preview :global(h2) { font-size: 1.25em; padding-bottom: 0.2em; border-bottom: 1px solid var(--border-soft); }
+  .md-preview :global(h3) { font-size: 1.1em; }
+  .md-preview :global(p),
+  .md-preview :global(ul),
+  .md-preview :global(ol),
+  .md-preview :global(blockquote),
+  .md-preview :global(pre),
+  .md-preview :global(table) {
+    margin: 0.6em 0;
+  }
+  .md-preview :global(ul),
+  .md-preview :global(ol) {
+    padding-left: 1.6em;
+  }
+  .md-preview :global(blockquote) {
+    padding: 4px 12px;
+    border-left: 3px solid var(--accent);
+    color: var(--text-dim);
+    background: color-mix(in srgb, var(--bg-panel) 60%, transparent);
+    border-radius: 0 4px 4px 0;
+  }
+  .md-preview :global(code) {
+    font-family: var(--mono);
+    font-size: 0.9em;
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  .md-preview :global(pre) {
+    background: var(--code-bg);
+    border: 1px solid var(--border-soft);
+    border-radius: 6px;
+    padding: 10px 12px;
+    overflow: auto;
+  }
+  .md-preview :global(pre code) {
+    background: none;
+    padding: 0;
+  }
+  .md-preview :global(table) {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.92em;
+  }
+  .md-preview :global(th),
+  .md-preview :global(td) {
+    border: 1px solid var(--border);
+    padding: 5px 10px;
+    text-align: left;
+  }
+  .md-preview :global(th) {
+    background: var(--bg-panel);
+  }
+  .md-preview :global(a),
+  .md-preview :global(.md-file) {
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  .md-preview :global(img) {
+    max-width: 100%;
+    border-radius: 6px;
+  }
+  .md-preview :global(hr) {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 1em 0;
   }
   /* 查找镜像与着色层都在 textarea 下面，textarea 必须透明。皮肤的全局规则
      body[data-skin] :is(textarea) { background-color: var(--bg-elev) } 优先级更高，
@@ -740,8 +982,8 @@
     inset: 0;
     overflow: hidden;
     scrollbar-gutter: stable;
-    white-space: pre-wrap;
-    overflow-wrap: break-word;
+    white-space: pre;
+    overflow-wrap: normal;
     color: transparent;
     pointer-events: none;
     user-select: none;
@@ -764,8 +1006,8 @@
     inset: 0;
     overflow: hidden;
     scrollbar-gutter: stable;
-    white-space: pre-wrap;
-    overflow-wrap: break-word;
+    white-space: pre;
+    overflow-wrap: normal;
     color: var(--text);
     pointer-events: none;
     user-select: none;

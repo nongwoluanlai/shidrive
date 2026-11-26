@@ -1,12 +1,13 @@
 <script lang="ts">
   import { t } from "../i18n";
-  // 全局搜索（Alt+F）：文件名快速打开 + 文件内容搜索。
-  // 搜索在后端并行执行（遵循 .gitignore、跳过二进制/大文件），新请求会取消进行中的旧请求；
-  // 前端只做防抖 + 序号校验（丢弃过期结果），列表分批渲染，结果多时也不卡。
-  import { tick } from "svelte";
+  // 全局搜索（Alt+F）：内容搜索（默认）+ 文件名快速打开。
+  // 搜索在后端并行执行（小目录优先、大目录/产物目录延后、跳过二进制与 .gitignore），
+  // 内容搜索边查边通过 search://chunk 实时推送；前端支持按文件折叠/展开，单击选中、双击或 Enter 跳转。
+  import { onMount, tick } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import { app, currentProject, openEditor, toast } from "../state.svelte";
   import { api } from "../ipc";
-  import type { SearchContentHit, SearchFileHit, SearchLineMatch, SearchResult } from "../types";
+  import type { SearchChunk, SearchContentHit, SearchFileHit, SearchLineMatch, SearchResult } from "../types";
   import Icon from "./Icon.svelte";
 
   const OPTS_KEY = "shidrive.search.opts";
@@ -27,6 +28,9 @@
   const root = $derived(currentProject()?.root_path ?? "");
   let query = $state("");
   let result = $state<SearchResult | null>(null);
+  let streamHits = $state<SearchContentHit[]>([]);
+  let streamStats = $state<{ totalMatches: number; searchedFiles: number; elapsedMs: number } | null>(null);
+  let collapsed = $state<Record<string, boolean>>({});
   let error = $state("");
   let busy = $state(false);
   let sel = $state(0);
@@ -34,24 +38,68 @@
   let inputEl = $state<HTMLInputElement | null>(null);
   let listEl = $state<HTMLDivElement | null>(null);
   let seq = 0;
+  let activeSearchId = "";
   let timer: ReturnType<typeof setTimeout> | null = null;
+
+  onMount(() => {
+    let disposed = false;
+    const unlisten = listen<SearchChunk>("search://chunk", (e) => {
+      if (disposed) return;
+      const chunk = e.payload;
+      if (!chunk || chunk.searchId !== activeSearchId) return;
+      if (chunk.hits?.length) {
+        streamHits = [...streamHits, ...chunk.hits];
+      }
+      streamStats = {
+        totalMatches: chunk.totalMatches,
+        searchedFiles: chunk.searchedFiles,
+        elapsedMs: chunk.elapsedMs,
+      };
+    });
+    return () => {
+      disposed = true;
+      void unlisten.then((fn) => fn());
+    };
+  });
+
+  const contentHits = $derived(result?.streamed || (!result && streamHits.length) ? streamHits : (result?.content ?? []));
 
   type Row =
     | { kind: "file"; hit: SearchFileHit }
     | { kind: "group"; hit: SearchContentHit }
     | { kind: "match"; hit: SearchContentHit; m: SearchLineMatch };
   const rows = $derived.by<Row[]>(() => {
-    const r = result;
-    if (!r) return [];
-    if (app.searchMode === "files") return r.files.map((hit) => ({ kind: "file", hit }) as Row);
+    if (app.searchMode === "files") {
+      if (!result) return [];
+      return result.files.map((hit) => ({ kind: "file", hit }) as Row);
+    }
+    const hits = contentHits;
+    if (!hits.length) return [];
     const out: Row[] = [];
-    for (const hit of r.content) {
+    for (const hit of hits) {
       out.push({ kind: "group", hit });
-      for (const m of hit.matches) out.push({ kind: "match", hit, m });
+      if (!collapsed[hit.path]) {
+        for (const m of hit.matches) out.push({ kind: "match", hit, m });
+      }
     }
     return out;
   });
   const shown = $derived(rows.slice(0, limit));
+  const anyCollapsed = $derived(contentHits.some((h) => !!collapsed[h.path]));
+
+  function toggleGroup(path: string, idx?: number) {
+    collapsed[path] = !collapsed[path];
+    if (idx !== undefined) sel = idx;
+  }
+  function collapseAll() {
+    const next: Record<string, boolean> = {};
+    for (const h of contentHits) next[h.path] = true;
+    collapsed = next;
+    if (sel >= rows.length) sel = Math.max(0, rows.length - 1);
+  }
+  function expandAll() {
+    collapsed = {};
+  }
 
   // 打开时：聚焦并全选上次的查询词
   $effect(() => {
@@ -71,17 +119,31 @@
     if (!app.searchOpen) return;
     if (timer) clearTimeout(timer);
     const my = ++seq;
+    activeSearchId = "";
     if (!q.trim() || !r) {
       result = null;
+      streamHits = [];
+      streamStats = null;
+      collapsed = {};
       error = "";
       busy = false;
       return;
     }
-    timer = setTimeout(() => void run(my, q, mode, r, o), mode === "files" ? 60 : 220);
+    timer = setTimeout(() => void run(my, q, mode, r, o), mode === "files" ? 60 : 200);
   });
 
   async function run(my: number, q: string, mode: "files" | "content", r: string, o: Persist) {
     busy = true;
+    const sid = mode === "content" ? `s-${my}-${Date.now()}` : "";
+    activeSearchId = sid;
+    result = null;
+    streamHits = [];
+    streamStats = null;
+    collapsed = {};
+    error = "";
+    sel = 0;
+    limit = 300;
+    if (listEl) listEl.scrollTop = 0;
     try {
       const res = await api.fsSearch({
         root: r,
@@ -93,16 +155,16 @@
         include: o.include,
         exclude: o.exclude,
         useIgnore: o.useIgnore,
+        searchId: sid || undefined,
       });
       if (my !== seq || res.cancelled) return;
       result = res;
       error = "";
-      sel = 0;
-      limit = 300;
-      if (listEl) listEl.scrollTop = 0;
     } catch (e) {
       if (my !== seq) return;
       result = null;
+      streamHits = [];
+      streamStats = null;
       error = String(e);
     } finally {
       if (my === seq) busy = false;
@@ -113,6 +175,7 @@
     app.searchOpen = false;
     if (timer) clearTimeout(timer);
     seq++;
+    activeSearchId = "";
     busy = false;
     void api.fsSearchCancel().catch(() => {});
   }
@@ -138,11 +201,13 @@
     }
   }
 
-  function activate(row: Row | undefined) {
+  function activate(row: Row | undefined, fromKeyboard = false) {
     if (!row) return;
     if (row.kind === "file") void openAt(row.hit.path);
-    else if (row.kind === "group") void openAt(row.hit.path, row.hit.matches[0]);
-    else void openAt(row.hit.path, row.m);
+    else if (row.kind === "group") {
+      if (fromKeyboard) toggleGroup(row.hit.path);
+      else void openAt(row.hit.path, row.hit.matches[0]);
+    } else void openAt(row.hit.path, row.m);
   }
 
   async function moveSel(d: number) {
@@ -156,6 +221,7 @@
 
   function onKey(e: KeyboardEvent) {
     if (e.isComposing) return;
+    const inInput = document.activeElement === inputEl;
     if (e.key === "ArrowDown") {
       e.preventDefault();
       void moveSel(1);
@@ -168,14 +234,30 @@
     } else if (e.key === "PageUp") {
       e.preventDefault();
       void moveSel(-10);
+    } else if (e.key === "ArrowLeft" && !inInput && app.searchMode === "content") {
+      const row = shown[sel];
+      if (row?.kind === "group" && !collapsed[row.hit.path]) {
+        e.preventDefault();
+        collapsed[row.hit.path] = true;
+      } else if (row?.kind === "match") {
+        e.preventDefault();
+        const gi = shown.findIndex((x) => x.kind === "group" && x.hit.path === row.hit.path);
+        if (gi >= 0) sel = gi;
+      }
+    } else if (e.key === "ArrowRight" && !inInput && app.searchMode === "content") {
+      const row = shown[sel];
+      if (row?.kind === "group" && collapsed[row.hit.path]) {
+        e.preventDefault();
+        collapsed[row.hit.path] = false;
+      }
     } else if (e.key === "Enter") {
       e.preventDefault();
-      activate(shown[sel]);
+      activate(shown[sel], true);
     } else if (e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
       close();
-    } else if (e.key === "Tab" && !e.shiftKey && !e.ctrlKey && document.activeElement === inputEl) {
+    } else if (e.key === "Tab" && !e.shiftKey && !e.ctrlKey && inInput) {
       e.preventDefault();
       setMode(app.searchMode === "files" ? "content" : "files");
     }
@@ -205,16 +287,21 @@
 
   const status = $derived.by(() => {
     if (error) return "";
-    const r = result;
-    if (!r) return "";
-    if (app.searchMode === "files")
+    if (app.searchMode === "files") {
+      const r = result;
+      if (!r) return "";
       return t("{n} 个文件", { n: r.files.length }) + (r.truncated ? t("（仅显示前 {n} 个）", { n: r.files.length }) : "") + ` · ${r.elapsedMs}ms`;
+    }
+    const r = result;
+    const st = r ?? streamStats;
+    if (!st) return busy ? t("搜索中…") : "";
+    const filesCount = contentHits.length;
     return (
-      t("{n} 处匹配 · {f} 个文件", { n: r.totalMatches, f: r.content.length }) +
-      (r.truncated ? t("（结果过多已截断）") : "") +
+      t("{n} 处匹配 · {f} 个文件", { n: st.totalMatches, f: filesCount }) +
+      (r?.truncated ? t("（结果过多已截断）") : busy ? t("（搜索中…）") : "") +
       " · " +
-      t("扫描 {n} 个文件", { n: r.searchedFiles }) +
-      ` · ${r.elapsedMs}ms`
+      t("扫描 {n} 个文件", { n: st.searchedFiles }) +
+      ` · ${st.elapsedMs}ms`
     );
   });
 </script>
@@ -223,10 +310,15 @@
   <div class="backdrop" role="presentation" onclick={close}></div>
   <div class="panel" role="dialog" aria-label={t("全局搜索")} tabindex="-1" onkeydown={onKey}>
     <div class="tabs">
-      <button class:on={app.searchMode === "files"} onclick={() => setMode("files")}>{t("文件")}</button>
       <button class:on={app.searchMode === "content"} onclick={() => setMode("content")}>{t("内容")}</button>
-      <span class="hint">{t("Alt+F / Tab 切换 · ↑↓ 选择 · Enter 打开 · Esc 关闭")}</span>
+      <button class:on={app.searchMode === "files"} onclick={() => setMode("files")}>{t("文件")}</button>
+      <span class="hint">{t("Alt+F / Tab 切换 · 单击选中 · 双击/Enter 打开 · Esc 关闭")}</span>
       <span class="spacer"></span>
+      {#if app.searchMode === "content" && contentHits.length > 0}
+        <button class="btn ghost sm foldbtn" title={anyCollapsed ? t("全部展开") : t("全部折叠")} onclick={() => (anyCollapsed ? expandAll() : collapseAll())}>
+          {anyCollapsed ? t("全部展开") : t("全部折叠")}
+        </button>
+      {/if}
       <button class="btn ghost sm" title={t("关闭 (Esc)")} onclick={close}><Icon name="close" size={12} /></button>
     </div>
     <div class="qrow">
@@ -260,25 +352,32 @@
         <p class="none err">{error}</p>
       {:else if !query.trim()}
         <p class="none">{app.searchMode === "files" ? t("输入文件名快速打开") : t("输入关键词搜索项目内所有文本文件")}</p>
-      {:else if result && !rows.length}
+      {:else if !busy && result && !rows.length}
         <p class="none">{t("没有结果")}</p>
       {/if}
       {#each shown as row, i (i)}
         {#if row.kind === "file"}
-          <button class="row file" class:sel={i === sel} onclick={() => activate(row)} title={row.hit.path}>
+          <button class="row file" class:sel={i === sel} onclick={() => (sel = i)} ondblclick={() => activate(row)} title={row.hit.path}>
             <Icon name="file" size={13} />
             <span class="name">{baseName(row.hit.rel)}</span>
             <span class="rel">{#each fileSegs(row.hit) as seg, k (k)}{#if seg.on}<b>{seg.s}</b>{:else}{seg.s}{/if}{/each}</span>
           </button>
         {:else if row.kind === "group"}
-          <button class="row group" class:sel={i === sel} onclick={() => activate(row)} title={row.hit.path}>
+          <button
+            class="row group"
+            class:sel={i === sel}
+            onclick={() => toggleGroup(row.hit.path, i)}
+            ondblclick={() => activate(row)}
+            title={row.hit.path}
+          >
+            <span class="chev">{collapsed[row.hit.path] ? "▸" : "▾"}</span>
             <Icon name="file" size={13} />
             <span class="name">{baseName(row.hit.rel)}</span>
             <span class="dir">{dirName(row.hit.rel)}</span>
             <span class="cnt">{row.hit.matches.length}{row.hit.more ? "+" : ""}</span>
           </button>
         {:else}
-          <button class="row match" class:sel={i === sel} onclick={() => activate(row)}>
+          <button class="row match" class:sel={i === sel} onclick={() => (sel = i)} ondblclick={() => activate(row)}>
             <span class="ln">{row.m.line}</span>
             <span class="pv">{row.m.preview.slice(0, row.m.pstart)}<mark>{row.m.preview.slice(row.m.pstart, row.m.pstart + row.m.plen)}</mark>{row.m.preview.slice(row.m.pstart + row.m.plen)}</span>
           </button>
@@ -456,6 +555,18 @@
   }
   .row.group .name {
     font-weight: 600;
+  }
+  .row .chev {
+    flex-shrink: 0;
+    width: 12px;
+    text-align: center;
+    color: var(--text-faint);
+    font-size: 11px;
+  }
+  .foldbtn {
+    font-size: 11px;
+    padding: 2px 6px;
+    color: var(--text-dim);
   }
   .row .cnt {
     margin-left: auto;

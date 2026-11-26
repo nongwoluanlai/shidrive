@@ -1,6 +1,6 @@
 // Wire backend events to global state. Called once from App.svelte on mount.
 import { listen } from "@tauri-apps/api/event";
-import { app, applySessionUpdate, applyBindingStatus, adoptBinding, capabilityLists, toast, chatKey, gotoSession, refreshWorkflows, pushLocal } from "./state.svelte";
+import { app, applySessionUpdate, applyBindingStatus, adoptBinding, capabilityLists, toast, chatKey, gotoSession, refreshWorkflows, pushLocal, finishTurn } from "./state.svelte";
 import type { AgentType, ElicitationRequest, GlobalLogEntry, PermissionRequest, SessionReadyInfo } from "./types";
 import { pushGlobalLog } from "./global-log.svelte";
 import { forgetWorkflow } from "./components/wf-autosave.svelte";
@@ -41,6 +41,7 @@ export function saveAfterAction(cfg: AfterActionCfg) {
   try {
     localStorage.setItem("shidrive.afterAction", JSON.stringify(cfg));
   } catch {}
+  app.afterActionRev++;
 }
 
 function fireAfterAction(contextId: string, agentType: string) {
@@ -50,8 +51,10 @@ function fireAfterAction(contextId: string, agentType: string) {
   } else if (cfg.kind === "popup") {
     void api.systemNotify(cfg.msg.trim() || DEFAULT_POPUP_MSG, contextId, agentType).catch(() => {});
   } else if (cfg.kind === "shutdown") {
+    // 触发关机后立即改回默认「声音提示」，避免忘记改回导致下次任务完成再次关机
+    saveAfterAction({ ...cfg, kind: "sound" });
     void api.systemAfterAction("shutdown", "").catch(() => {});
-    import("./state.svelte").then(({ toast }) => toast("warn", "回合已结束：已安排 30 秒后关机（cmd 执行 shutdown /a 可取消）"));
+    toast("warn", "回合已结束：已安排 30 秒后关机（cmd 执行 shutdown /a 可取消），执行后动作已恢复为默认声音提示");
   } else if (cfg.kind === "command" && cfg.cmd.trim()) {
     void api.systemAfterAction("command", cfg.cmd).catch(() => {});
   }
@@ -94,6 +97,17 @@ export async function wireEvents() {
 
   await listen<{ agentType: AgentType; state: string }>("acp://status", (e) => {
     app.agentStatus[e.payload.agentType] = e.payload.state;
+    // 适配器断开或重启：立即清理该 agent 残留的前端运行态，避免出现幽灵“运行中”
+    if (e.payload.state === "disconnected") {
+      const suffix = `:${e.payload.agentType}`;
+      for (const k of new Set([...Object.keys(app.streaming), ...Object.keys(app.activeTurn)])) {
+        if (!k.endsWith(suffix)) continue;
+        if (app.streaming[k] || app.activeTurn[k]) {
+          const ctxId = k.slice(0, -suffix.length);
+          finishTurn(e.payload.agentType, ctxId === "-" ? null : ctxId);
+        }
+      }
+    }
   });
 
   await listen<PermissionRequest>("acp://permission", (e) => {
@@ -140,7 +154,7 @@ export async function wireEvents() {
 
   await listen<{
     contextId: string; agentType: string; status: string; sessionId: string;
-    turnId: string; connectionId?: string; source?: string;
+    turnId: string; connectionId?: string; source?: string; reconciled?: boolean;
   }>("acp://binding-status", (e) => {
     if (applyBindingStatus(e.payload)) {
       app.treeRev++;

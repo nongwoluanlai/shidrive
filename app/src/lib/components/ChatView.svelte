@@ -477,6 +477,13 @@ import type { DisplayItem } from "../state.svelte";
           const sid = b?.session_id ?? null;
           adoptBinding(k, sid);
           app.bindingTitleMap[k] = b?.title ?? null;
+          // 切回上下文时对齐后端实际运行态：若前端残留 streaming 而后端已收尾，立刻复位；
+          // 若后端仍在运行则恢复停止按钮可见
+          if (b?.status === "running") {
+            app.streaming[k] = true;
+          } else if (app.streaming[k] && !app.promptRequests[k]) {
+            finishTurn(agent, ctxId);
+          }
           const boundRevision = app.bindingRev[k] ?? 0;
           const sameBinding = () => valid() && app.bindingSession[k] === sid && (app.bindingRev[k] ?? 0) === boundRevision;
           if (!app.chat[k]?.length && !app.streaming[k]) {
@@ -884,11 +891,12 @@ import type { DisplayItem } from "../state.svelte";
       if (running) {
         toast("info", t("已发送取消请求"));
       } else {
-        // 后端已无进行中的回合（适配器断开/重启后残留的状态）：直接复位界面
+        // 后端已无进行中的回合（适配器断开/重启或幽灵运行态）：直接复位界面并明确提示
         finishTurn(app.agent, ctx.id);
-        toast("info", t("会话已不在运行，已复位状态"));
+        toast("warn", t("底层已无活跃会话，已将运行状态刷新为已结束"));
       }
     } catch (e) {
+      finishTurn(app.agent, ctx.id);
       toast("error", String(e));
     }
   }
@@ -1191,6 +1199,19 @@ import type { DisplayItem } from "../state.svelte";
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
       e.preventDefault();
       openSearch();
+    } else if (
+      e.key === "Escape" &&
+      !e.isComposing &&
+      streaming &&
+      app.tab === "chat" &&
+      !searchOpen &&
+      !app.searchOpen &&
+      !app.settingsOpen &&
+      !app.overlay &&
+      !schedOpen
+    ) {
+      e.preventDefault();
+      void stop();
     }
   }
 
@@ -1262,6 +1283,10 @@ import type { DisplayItem } from "../state.svelte";
 
   // ---------- 执行后动作（回合结束后触发；配置全局生效，存 localStorage） ----------
   let afterAction = $state<AfterActionCfg>(loadAfterAction());
+  $effect(() => {
+    void app.afterActionRev;
+    afterAction = loadAfterAction();
+  });
 
   function saveAfterActionUi() {
     if (afterAction.kind === "popup" && !afterAction.msg.trim()) afterAction.msg = DEFAULT_POPUP_MSG;

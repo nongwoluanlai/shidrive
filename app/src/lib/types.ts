@@ -441,10 +441,18 @@ export interface SearchOpts {
   exclude?: string;
   useIgnore?: boolean;
   maxResults?: number;
+  searchId?: string;
 }
 export interface SearchFileHit { path: string; rel: string; score: number; indices: number[] }
 export interface SearchLineMatch { line: number; col: number; len: number; preview: string; pstart: number; plen: number }
 export interface SearchContentHit { path: string; rel: string; matches: SearchLineMatch[]; more: boolean }
+export interface SearchChunk {
+  searchId: string;
+  hits: SearchContentHit[];
+  totalMatches: number;
+  searchedFiles: number;
+  elapsedMs: number;
+}
 export interface SearchResult {
   files: SearchFileHit[];
   content: SearchContentHit[];
@@ -453,6 +461,7 @@ export interface SearchResult {
   truncated: boolean;
   cancelled: boolean;
   elapsedMs: number;
+  streamed?: boolean;
 }
 
 // ---------- 全局助手 ----------

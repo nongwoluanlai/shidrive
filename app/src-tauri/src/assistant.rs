@@ -865,11 +865,16 @@ pub struct AssistantRuntime {
     /// 正在进行的回合 id（同一时间只允许一轮）
     busy: Mutex<Option<String>>,
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    sleep: Option<Arc<crate::power::SleepInhibitor>>,
 }
 
 impl AssistantRuntime {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, busy: Mutex::new(None), cancels: Mutex::new(HashMap::new()) }
+        Self { data_dir, busy: Mutex::new(None), cancels: Mutex::new(HashMap::new()), sleep: None }
+    }
+    pub fn with_sleep(mut self, sleep: Arc<crate::power::SleepInhibitor>) -> Self {
+        self.sleep = Some(sleep);
+        self
     }
     fn default_workspace(&self) -> PathBuf {
         self.data_dir.join("assistant")
@@ -888,6 +893,7 @@ impl AssistantRuntime {
 struct BusyGuard<'a> {
     rt: &'a AssistantRuntime,
     turn: String,
+    _sleep: Option<crate::power::SleepGuard>,
 }
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
@@ -901,7 +907,8 @@ fn acquire<'a>(rt: &'a AssistantRuntime, turn: &str) -> Result<(BusyGuard<'a>, A
     *b = Some(turn.to_string());
     let flag = Arc::new(AtomicBool::new(false));
     rt.cancels.lock().unwrap().insert(turn.to_string(), flag.clone());
-    Ok((BusyGuard { rt, turn: turn.to_string() }, flag))
+    let sleep = rt.sleep.as_ref().map(|s| s.acquire());
+    Ok((BusyGuard { rt, turn: turn.to_string(), _sleep: sleep }, flag))
 }
 
 /// 确保 ACP 长期会话可用：没有 / 换了客户端 / 恢复失败时新建；返回 (sid, cwd)

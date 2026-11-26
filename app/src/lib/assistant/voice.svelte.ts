@@ -25,13 +25,38 @@ export const vc = $state({
 });
 
 let inited = false;
+let screenLocked = false;
+export function isScreenLocked(): boolean {
+  return screenLocked;
+}
+/** Windows 锁屏时立即释放录音、朗读与播放 AudioContext，避免占用音频阻止睡眠或后台误触发 */
+export function setScreenLocked(locked: boolean) {
+  screenLocked = locked;
+  if (locked) releaseAudioForLock();
+}
+export function releaseAudioForLock() {
+  stopCapture(false);
+  stopSpeaking();
+  if (actx) {
+    const a = actx;
+    actx = null;
+    void a.close().catch(() => {});
+  }
+}
+
 export async function initVoice() {
   if (!inited) {
     inited = true;
     // 第一次点击 / 按键时就把播放用的 AudioContext 准备好（WebView 的自动播放限制），后面语音唤醒等无手势的场景也能直接出声
-    const unlock = () => { void unlockAudio(); if (actx?.state === "running") for (const e of ["pointerdown", "keydown"]) removeEventListener(e, unlock, true); };
+    const unlock = () => { if (screenLocked) return; void unlockAudio(); if (actx?.state === "running") for (const e of ["pointerdown", "keydown"]) removeEventListener(e, unlock, true); };
     for (const e of ["pointerdown", "keydown"]) addEventListener(e, unlock, true);
-    void unlockAudio();
+    void api.systemIsLocked().then((locked) => {
+      setScreenLocked(!!locked);
+      if (!locked) void unlockAudio();
+    }).catch(() => { void unlockAudio(); });
+    await listen<{ locked: boolean }>("system://lock-changed", (e) => {
+      setScreenLocked(!!e.payload?.locked);
+    });
     await listen<VoiceTask>("voice://progress", (e) => {
       const task = e.payload;
       vc.tasks = { ...vc.tasks, [task.id]: task };
@@ -420,6 +445,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** 创建 / 恢复播放用的 AudioContext。没有用户手势时 resume() 可能一直挂起：最多等 timeout 毫秒，不卡住朗读队列 */
 export async function unlockAudio(timeout = 600): Promise<boolean> {
+  if (screenLocked) return false;
   try {
     const a = (actx ??= new AudioContext());
     if (a.state === "suspended") await Promise.race([a.resume().catch(() => {}), sleep(timeout)]);
@@ -530,6 +556,7 @@ function to16k(chunks: Float32Array[], total: number, inRate: number): Int16Arra
  * 返回 base64 PCM16（16k 单声道），没录到有效语音返回 null。
  */
 export async function captureSpeech(maxSeconds: number, idleSeconds = 8): Promise<string | null> {
+  if (screenLocked) return null;
   if (vc.recording) { stopCapture(true); return null; }
   stopSpeaking();
   let stream: MediaStream;

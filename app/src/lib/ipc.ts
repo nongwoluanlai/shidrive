@@ -209,6 +209,7 @@ export const api = {
   remoteTunnelStart: () => invoke<void>("remote_tunnel_start"),
   remoteTimerSet: (hours: number) => invoke<void>("remote_timer_set", { hours }),
   systemAfterAction: (kind: string, command: string) => invoke<void>("system_after_action", { kind, command }),
+  systemIsLocked: () => invoke<boolean>("system_is_locked"),
   remoteTunnelStop: () => invoke<void>("remote_tunnel_stop"),
   dataExport: () => invoke<string>("data_export"),
   dataImport: (path: string) => invoke<string>("data_import", { path }),

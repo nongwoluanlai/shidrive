@@ -142,29 +142,45 @@ impl Engine {
                     // carrying the `next_run_at` we read, so an edit or delete that raced
                     // with this tick wins and the stale copy is not executed.
                     let next = compute_next(&sched, now);
+                    let next_str = next.map(fmt_time);
                     let retire = matches!(sched, ScheduleConfig::Once { .. }) || next.is_none();
-                    let claimed = self.db.claim_scheduled_run(
-                        &w.id,
-                        w.next_run_at.as_deref(),
-                        &fmt_time(now),
-                        next.map(fmt_time).as_deref(),
-                        retire,
-                    )?;
-                    if claimed {
-                        // 调度 tick 间隔 15s：迟到超过 90s 说明错过了计划时间（应用未运行 /
-                        // 系统休眠 / 上次运行占用），这里补执行一次并记入全局日志
-                        let late = (now - due).num_seconds();
-                        let when = fmt_time(due);
-                        if late > 90 {
+                    // 调度 tick 间隔 15s：迟到超过 90s 说明错过了计划时间（应用未运行 /
+                    // 系统休眠 / 上次运行占用），仅记录日志并推进下次计划，不再补执行。
+                    let late = (now - due).num_seconds();
+                    let when = fmt_time(due);
+                    if late > 90 {
+                        let skipped = self.db.skip_scheduled_run(
+                            &w.id,
+                            w.next_run_at.as_deref(),
+                            next_str.as_deref(),
+                            retire,
+                        )?;
+                        if skipped {
+                            let tail = if retire {
+                                "已跳过不补执行并停用".to_string()
+                            } else if let Some(ns) = &next_str {
+                                format!("已跳过不补执行（下次 {ns}）")
+                            } else {
+                                "已跳过不补执行".to_string()
+                            };
                             crate::glog::warn(
                                 "schedule",
-                                format!("定时工作流「{}」错过计划时间 {when}（迟到 {}），已补执行", w.name, fmt_late(late)),
+                                format!("定时工作流「{}」错过计划时间 {when}（迟到 {}），{tail}", w.name, fmt_late(late)),
                             );
-                        } else {
-                            crate::glog::info("schedule", format!("定时工作流「{}」已触发（计划时间 {when}）", w.name));
                         }
-                        if self.spawn_run(&w, "schedule").is_none() {
-                            crate::glog::warn("schedule", format!("定时工作流「{}」启动失败（已在运行或建档失败）", w.name));
+                    } else {
+                        let claimed = self.db.claim_scheduled_run(
+                            &w.id,
+                            w.next_run_at.as_deref(),
+                            &fmt_time(now),
+                            next_str.as_deref(),
+                            retire,
+                        )?;
+                        if claimed {
+                            crate::glog::info("schedule", format!("定时工作流「{}」已触发（计划时间 {when}）", w.name));
+                            if self.spawn_run(&w, "schedule").is_none() {
+                                crate::glog::warn("schedule", format!("定时工作流「{}」启动失败（已在运行或建档失败）", w.name));
+                            }
                         }
                     }
                 }
@@ -247,6 +263,7 @@ impl Engine {
         let run_id2 = run_id.clone();
         let trigger = trigger.to_string();
         tauri::async_runtime::spawn(async move {
+            let _sleep = tauri::Manager::try_state::<Arc<crate::power::SleepInhibitor>>(&eng.app).map(|s| s.acquire());
             let _ = eng.app.emit(EVT_WF_STATUS, json!({ "runId": run_id2, "workflowId": wf.id, "status": "running" }));
             // 执行过程中任何 panic（例如模板/第三方库异常）都不能跳过下面的收尾：
             // 否则 active 条目永不释放，该工作流会一直显示「正在运行」直到重启。

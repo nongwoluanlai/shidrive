@@ -551,6 +551,24 @@ impl Db {
         })
     }
 
+    /// 跳过错过的定时槽位：仅推进 `next_run_at`（或停用一次性任务），不改动 `last_run_at`。
+    pub fn skip_scheduled_run(
+        &self,
+        id: &str,
+        expected_next: Option<&str>,
+        next_run_at: Option<&str>,
+        retire: bool,
+    ) -> Result<bool, String> {
+        self.with(|c| {
+            let n = c.execute(
+                "UPDATE workflows SET next_run_at=?2, enabled=CASE WHEN ?3 THEN 0 ELSE enabled END
+                 WHERE id=?1 AND enabled=1 AND trigger_type='schedule' AND next_run_at IS ?4",
+                params![id, if retire { None } else { next_run_at }, retire, expected_next],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
     pub fn delete_workflow(&self, id: &str) -> Result<(), String> {
         self.with(|c| {
             c.execute("DELETE FROM workflows WHERE id=?1", params![id])?;
@@ -832,6 +850,34 @@ impl Db {
     /// No turn survives a restart: a "running" left by a crash/kill would block the UI forever.
     pub fn reset_running_bindings(&self) -> Result<usize, String> {
         self.with(|c| Ok(c.execute("UPDATE agent_bindings SET status='interrupted' WHERE status='running'", [])?))
+    }
+
+    /// 重置指定 agent 所有处于 running 的绑定，并返回受影响的 (context_id, session_id) 列表。
+    pub fn reset_running_bindings_for_agent(&self, agent_type: &str, new_status: &str) -> Result<Vec<(String, Option<String>)>, String> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT context_id, session_id FROM agent_bindings WHERE agent_type=?1 AND status='running'")?;
+            let rows = st
+                .query_map(params![agent_type], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !rows.is_empty() {
+                c.execute(
+                    "UPDATE agent_bindings SET status=?2 WHERE agent_type=?1 AND status='running'",
+                    params![agent_type, new_status],
+                )?;
+            }
+            Ok(rows)
+        })
+    }
+
+    /// 查询全部处于 running 的绑定 (context_id, agent_type, session_id)。
+    pub fn list_running_bindings(&self) -> Result<Vec<(String, String, Option<String>)>, String> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT context_id, agent_type, session_id FROM agent_bindings WHERE status='running'")?;
+            let rows = st
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
     }
 
     /// `touch`: 是否刷新 updated_at。会话「更新时间」只在发送消息 / 回复结束时变化，
@@ -1835,6 +1881,36 @@ mod tests {
         let after = db.get_workflow(&w2.id).unwrap().unwrap();
         assert!(after.enabled);
         assert_eq!(after.next_run_at.as_deref(), Some("later"));
+
+        // 跳过错过的定时任务：推进 next_run_at / 停用一次性任务，但不覆盖 last_run_at
+        assert!(db.skip_scheduled_run(&w2.id, Some("later"), Some("even-later"), false).unwrap());
+        let skipped = db.get_workflow(&w2.id).unwrap().unwrap();
+        assert_eq!(skipped.last_run_at.as_deref(), Some("now"), "skip must preserve last_run_at");
+        assert_eq!(skipped.next_run_at.as_deref(), Some("even-later"));
+        assert!(skipped.enabled);
+        assert!(!db.skip_scheduled_run(&w2.id, Some("later"), Some("bad"), false).unwrap());
+        assert!(db.skip_scheduled_run(&w2.id, Some("even-later"), None, true).unwrap());
+        let retired = db.get_workflow(&w2.id).unwrap().unwrap();
+        assert!(!retired.enabled);
+        assert_eq!(retired.next_run_at, None);
+        assert_eq!(retired.last_run_at.as_deref(), Some("now"));
+    }
+
+    #[test]
+    fn reset_running_bindings_for_agent_only_touches_target_agent() {
+        let db = fixture_db();
+        let p = db.create_project("p", "", "").unwrap();
+        let c1 = db.create_context(&p.id, "c1").unwrap();
+        let c2 = db.create_context(&p.id, "c2").unwrap();
+        db.set_binding_session(&c1.id, "pi", Some("s1"), None, None).unwrap();
+        db.set_binding_status(&c1.id, "pi", "running", true).unwrap();
+        db.set_binding_session(&c2.id, "codex", Some("s2"), None, None).unwrap();
+        db.set_binding_status(&c2.id, "codex", "running", true).unwrap();
+
+        let reset = db.reset_running_bindings_for_agent("pi", "interrupted").unwrap();
+        assert_eq!(reset, vec![(c1.id.clone(), Some("s1".to_string()))]);
+        assert_eq!(db.get_binding(&c1.id, "pi").unwrap().unwrap().status, "interrupted");
+        assert_eq!(db.get_binding(&c2.id, "codex").unwrap().unwrap().status, "running");
     }
 
     #[test]
